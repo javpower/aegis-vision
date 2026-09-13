@@ -1,0 +1,72 @@
+# configs/seg_harness.toml —— 实例分割：汽车零部件 4 类真实数据
+# 数据：E:/xunlian/yolo_dataset（Ultralytics YOLO-seg 目录格式，
+#       images/<split> + labels/<split> 多边形标注；526 train / 93 val，2219 实例）
+# 类别：0 线束 / 1 锁体 / 2 限位器 / 3 防撞块
+# 预训练：yolov8n 骨干 stem（layer_map 映射，见 configs/yolov8n_stem_map.toml）
+# 用法（GPU，cu128 libtorch）：.\target-cuda\release\av-runtime.exe train -c configs/seg_harness.toml
+run_id = "seg-harness-pretrain"
+seed = 7
+device = "cuda:0"
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "seg"
+head = "yolact"                    # 原型掩码 + 每实例系数
+loss_weight = 1.0
+num_classes = 4
+img_size = 640                     # 原图 2448x2048，letterbox 到 640
+num_protos = 32
+loss_bce_weight = 1.0
+loss_dice_weight = 1.0
+
+[data]
+pipeline = "dir"
+workers = 8
+prefetch = 4
+# 数据管线 v2：auto → 526×640²×3×4B ≈ 2.6GB ≤ 4GiB 预算 → 显存驻留 + GPU 增强
+# （改 "ram" 用内存缓存 + rayon 并行，"off" 回历史全分辨率路径）
+cache = "auto"
+
+[data.sources.train]
+dir = "E:/xunlian/yolo_dataset"
+[[data.sources.train.tasks]]
+kind = "seg"
+format = "coco_seg"
+[data.sources.train.tasks.augment]
+flip = 0.5                         # 水平翻转，掩码坐标同步镜像
+hsv = [0.01, 0.01, 0.01]
+scale_jitter = [0.9, 1.1]
+close_last_epochs = 15             # 收尾 15ep 关增强做干净收敛
+
+[data.sources.val]                 # 同根目录，split 缺省 "val"（images/val + labels/val）
+dir = "E:/xunlian/yolo_dataset"
+
+[train]
+epochs = 120                       # 实测 ~4.75min/epoch（CPU 编码瓶颈，GPU 利用率低），120ep≈9.5h
+batch_size = 16
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 5e-4 }
+warmup_epochs = 5
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["mask_miou", "recall@0.5", "precision@0.5"]  # p@0.5 自 v0.2.1 起随 seg 评测落日志
+
+[pretrain]
+enable = true
+weight_path = "data/pretrain/yolov8n_backbone.safetensors"
+load_only_backbone = true          # 只写名字含 "backbone" 的目标变量（层已映射到 backbone.*）
+freeze_backbone = false
+layer_map = "configs/yolov8n_stem_map.toml"
+
+[panel]
+enabled = false
+port = 8080

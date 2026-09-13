@@ -1,0 +1,54 @@
+# configs/seg_coco8.toml —— 实例分割：coco8-seg 真实数据（Ultralytics COCO 分割格式）
+# 数据准备：data/coco8-seg（images/<split> + labels/<split>/*.txt 多边形标注）
+# 用法：cargo run -p av-runtime -- train -c configs/seg_coco8.toml
+run_id = "seg-coco8"
+seed = 7
+device = "cuda:0"                  # 无 CUDA 自动回退 CPU
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "seg"
+head = "yolact"                    # 实时档：原型掩码 + 每实例系数（direct 精度档 M4 落地）
+loss_weight = 1.0
+num_classes = 80                   # coco8-seg 标注沿用 COCO 原 80 类 id
+img_size = 320
+num_protos = 32
+loss_bce_weight = 1.0
+loss_dice_weight = 1.0
+
+[data]
+pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/coco8-seg"             # images/<split> + labels/<split>
+[[data.sources.train.tasks]]
+kind = "seg"
+format = "coco_seg"
+
+[data.sources.val]                 # 缺省使用同一根目录的 val split
+dir = "data/coco8-seg"
+
+[train]
+epochs = 200
+batch_size = 4
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 10
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["mask_miou", "recall@0.5"]
+
+[panel]
+enabled = false
+port = 8080

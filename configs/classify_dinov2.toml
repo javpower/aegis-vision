@@ -1,0 +1,53 @@
+# configs/classify_dinov2.toml —— DINOv2 ViT-S/14 骨干分类：ImageNette 微调
+# 用法：av train -c configs/classify_dinov2.toml
+# 前置：data/pretrain/dinov2_small.safetensors（下载：tools/export/export_dinov2.py，
+#       HF 直连不通自动回退 hf-mirror.com）
+# 数据：data/imagenette2-160/{train,val}/<wnid>/*.JPEG（ImageNet 10 类子集，160px 版）
+# 基线：同数据 simple-cnn（64px，20 epochs）val top1 = 0.623；DINOv2 预训练微调预期 0.85+
+run_id = "classify-dinov2"
+seed = 42
+device = "cuda:0"                  # 无 CUDA 自动回退 CPU（CPU 上 ViT-S@448 微调很慢）
+output_dir = "runs"
+
+[model]
+backbone = { family = "dinov2", depth = 1.0, width = 1.0, pretrained = "data/pretrain/dinov2_small.safetensors" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "classify"
+num_classes = 10                   # ImageNette 固定 10 类（wnid 排序 → 0..9）
+img_size = 448                     # 14×32：patch 网格 32×32，同时满足项目 32 对齐约定
+
+[data]
+pipeline = "dir"                   # ImageFolder 目录源（<split>/<wnid>/*.JPEG）
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/imagenette2-160"
+split = "train"
+
+[data.sources.val]
+dir = "data/imagenette2-160"
+split = "val"
+
+[train]
+# train 9469 图 bs16 ≈ 592 步/epoch；448px ViT-S 微调 6 epochs（GPU 数十分钟级）
+epochs = 6
+batch_size = 16
+accumulate_steps = 4               # 有效批 64（ViT 微调惯例有效批 32~64）
+optimizer = { type = "adamw", lr = 5e-5, weight_decay = 5e-4 }   # ViT 微调低 lr 惯例
+warmup_epochs = 1
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false                        # amp 按 M7 落地，fp32 训练
+deterministic = false
+ema_decay = 0.999
+grad_clip = 1.0                    # ViT 微调惯例 clip 1.0
+
+[eval]
+interval_epochs = 1                # 每 epoch 看 val top1（约 3.9k 图推理可控）
+protocols = ["top1"]
+
+[panel]
+enabled = false
+port = 8080

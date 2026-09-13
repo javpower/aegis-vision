@@ -1,0 +1,70 @@
+# configs/seg_harness_resnet18.toml —— 精度实验臂：ResNet18+ImageNet 预训练骨干
+# 与 configs/seg_harness.toml 同数据同协议（4 类零部件 526/93，120ep），
+# 唯一变量 = 骨干容量（simple-cnn <0.1M → resnet18 11M）+ ImageNet 归一化域。
+# 数据管线 v2 全量生效（auto → 显存驻留 + GPU 增强）。
+run_id = "seg-harness-csp"
+seed = 7
+device = "cuda:0"
+output_dir = "runs"
+
+[model]
+# YOLOv8 正式骨干（CSP-ELAN）：width/depth 必须为 0.25/0.33（yolov8n nano
+# 形状兼容，完整骨干权重 162 张量经单条映射全量导入）
+backbone = { family = "csp-elan", depth = 0.33, width = 0.25, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "seg"
+head = "yolact"
+loss_weight = 1.0
+num_classes = 4                    # 0 线束 / 1 锁体 / 2 限位器 / 3 防撞块
+img_size = 640
+num_protos = 32
+loss_bce_weight = 1.0
+loss_dice_weight = 1.0
+
+[data]
+pipeline = "dir"
+workers = 8
+prefetch = 4
+cache = "auto"                     # → gpu（画布堆 ~2.6GB ≤ 4GiB 预算）
+
+[data.sources.train]
+dir = "E:/xunlian/yolo_dataset"
+[[data.sources.train.tasks]]
+kind = "seg"
+format = "coco_seg"
+[data.sources.train.tasks.augment]
+flip = 0.5
+hsv = [0.01, 0.01, 0.01]
+scale_jitter = [0.9, 1.1]
+close_last_epochs = 15
+
+[data.sources.val]
+dir = "E:/xunlian/yolo_dataset"
+
+[train]
+epochs = 120
+batch_size = 16
+optimizer = { type = "adamw", lr = 3e-4, weight_decay = 5e-4 }  # YOLO COCO 预训练微调：小 lr 保 BN/特征分布
+warmup_epochs = 3
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["mask_miou", "recall@0.5", "precision@0.5"]
+
+[pretrain]
+enable = true
+weight_path = "data/pretrain/yolov8n_backbone_full.safetensors"
+load_only_backbone = true
+freeze_backbone = false
+layer_map = "configs/cspelan_yolov8n_map.toml"
+
+[panel]
+enabled = false
+port = 8080

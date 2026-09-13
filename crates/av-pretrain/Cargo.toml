@@ -1,0 +1,28 @@
+[package]
+name = "av-pretrain"
+version.workspace = true
+edition.workspace = true
+description = "AegisVision 预训练权重层：原生权重格式（哈希校验+元信息）与外部 PyTorch safetensors 导入适配"
+license.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/av-pretrain"
+# readme 不做 workspace 继承：workspace 级 readme 路径相对 workspace 根解析，
+# 会落到成员包根之外导致 cargo package 告警；各 crate 放自己的薄 README。
+readme = "README.md"
+keywords = ["deep-learning", "weights", "safetensors", "transfer-learning", "checkpoint"]
+categories = ["science", "encoding"]
+
+[features]
+default = ["torch"]
+# 张量层（tch/libtorch），与 av-core 同款特性门控：
+# manifest 读写 + blake3 哈希校验是纯逻辑，--no-default-features 可用。
+torch = ["dep:tch", "tch/download-libtorch"]
+
+[dependencies]
+av-core = { workspace = true }
+tch = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+blake3 = { workspace = true }
+regex = { workspace = true }

@@ -1,0 +1,64 @@
+# configs/detect_coco8_matrix_arm3_resnet_imagenet.toml —— 预训练 A/B 矩阵臂 A3
+# coco8 检测：resnet18 + ImageNet 预训练（处理「预训练权重」变量）。与 A2 逐字段
+# 一致，仅多 [pretrain] 段：torchvision ResNet18 ImageNet 权重（122 张量导出）
+# 经 resnet18_map 一条前缀映射全量导入骨干 100 个变量（20 conv + 40 BN 参数
+# + 40 BN 统计量），头按检测任务重训。
+# 权重导出：python tools/export/export_resnet18.py --dst data/pretrain/resnet18_imagenet.safetensors
+run_id = "detect-coco8-matrix-arm3-resnet-imagenet"
+seed = 3
+device = "cpu"
+output_dir = "runs"
+
+[model]
+backbone = { family = "resnet18", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "detect"
+head = "yolo"
+loss_weight = 1.0
+assigner = "tal"
+obb_mode = false
+num_classes = 80
+img_size = 320
+
+[data]
+pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/coco8"
+[[data.sources.train.tasks]]
+kind = "detect"
+format = "yolo"
+
+[data.sources.val]
+dir = "data/coco8"
+
+[train]
+epochs = 60
+batch_size = 4
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 5
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 20
+protocols = ["mean_iou", "recall@0.5"]
+
+[panel]
+enabled = false
+port = 8080
+
+# ---- 预训练权重导入（torchvision ResNet18 ImageNet，本臂的核心差异）----
+[pretrain]
+enable = true
+weight_path = "data/pretrain/resnet18_imagenet.safetensors"
+load_only_backbone = true          # 只匹配名字含 "backbone" 的目标变量（头按任务重训）
+freeze_backbone = false            # 骨干可训（FrozenBN 语义见 backbone_resnet 模块注释）
+layer_map = "configs/resnet18_map.toml"   # torchvision 名 → backbone. 前缀（一条映射）

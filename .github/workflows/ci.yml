@@ -1,0 +1,35 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # 主力：纯 Rust 逻辑全量测试（快、免费，PLAN §9 CI 矩阵）
+  test-pure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --no-default-features -- -D warnings
+      - run: cargo test --workspace --no-default-features
+
+  # torch 侧：默认 feature 已含 download-libtorch，CI 零配置锚定 CPU libtorch（PLAN §2.2）
+  check-torch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check -p av-core
+      - run: cargo check -p av-tasks
+
+  # Windows CUDA 冒烟：仅编译（PLAN §9）
+  smoke-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --workspace --no-default-features

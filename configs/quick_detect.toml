@@ -1,0 +1,14 @@
+# quick_detect.toml —— 最快上手路径：内置合成数据 20 epochs，无需任何数据集，CPU 约半分钟
+# 下一步：av train -c configs/quick_detect.toml；真实数据请用 av init --task detect --data <目录> 生成配置
+run_id = "quick-detect"
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+[[model.tasks]]
+kind = "detect"
+num_classes = 2
+[data]
+pipeline = "synthetic"
+[train]
+epochs = 20
+amp = false

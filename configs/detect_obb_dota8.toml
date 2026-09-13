@@ -1,0 +1,55 @@
+# configs/detect_obb_dota8.toml —— OBB 旋转框检测：dota8 真实航拍数据（DOTA 格式）
+# 数据准备：data/dota8（https://ultralytics.com/assets/dota8.zip 解压）
+# 用法：av train -c configs/detect_obb_dota8.toml
+run_id = "obb-dota8"
+seed = 5
+device = "cuda:0"                  # 无 CUDA 自动回退 CPU
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "detect"
+head = "yolo"
+loss_weight = 1.0
+assigner = "tal"
+obb_mode = true                    # 旋转框模式：角度分支 + KFIoU + 旋转 NMS
+num_classes = 15                   # DOTA v1.0 共 15 类
+img_size = 640
+
+[data]
+pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/dota8"
+split = "train"                    # DOTA 格式：images/<split> + labels/<split>
+[[data.sources.train.tasks]]
+kind = "detect"
+format = "dota"
+
+[data.sources.val]
+dir = "data/dota8"
+split = "val"
+
+[train]
+epochs = 400
+batch_size = 4
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 20
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["obb_miou", "recall@0.5"]
+
+[panel]
+enabled = false
+port = 8080

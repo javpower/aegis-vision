@@ -1,0 +1,13 @@
+# configs/cspelan_yolov8n_map.toml —— ultralytics YOLOv8 → csp-elan 骨干层映射
+#
+# csp-elan 骨干（backbone_cspelan.rs）层名 = ultralytics 层名 `model.N.*` +
+# `backbone.` 前缀，conv/bn 参数与 BN 统计量全部同名对齐，故单条前缀映射
+# 即可全量导入官方 yolov8n.pt 的完整骨干（层 0-9 含 SPPF）。
+#
+# `*.num_batches_tracked`（tch 无对应变量）落 unexpected（部分加载 + 完整报告）。
+# 前提：实验配置 width = 0.25 / depth = 0.33（nano 形状兼容硬约束）。
+
+[[entries]]
+from = '^model\.'
+to = 'backbone.'
+transpose = false

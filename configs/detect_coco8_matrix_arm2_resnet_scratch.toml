@@ -1,0 +1,55 @@
+# configs/detect_coco8_matrix_arm2_resnet_scratch.toml —— 预训练 A/B 矩阵臂 A2
+# coco8 检测：resnet18 从零（隔离「骨干结构」变量）。与 A1 除 backbone.family
+# 外逐字段一致；与 A3 差异仅在 [pretrain]（ImageNet 权重导入与否）。
+# 检测骨干 = av-tasks::backbone_resnet（torchvision 同构），金字塔 stride 4/8/16
+# 通道 64/128/256（layer1/2/3）直接喂 DetectHead。
+run_id = "detect-coco8-matrix-arm2-resnet-scratch"
+seed = 3
+device = "cpu"
+output_dir = "runs"
+
+[model]
+backbone = { family = "resnet18", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "detect"
+head = "yolo"
+loss_weight = 1.0
+assigner = "tal"
+obb_mode = false
+num_classes = 80
+img_size = 320
+
+[data]
+pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/coco8"
+[[data.sources.train.tasks]]
+kind = "detect"
+format = "yolo"
+
+[data.sources.val]
+dir = "data/coco8"
+
+[train]
+epochs = 60
+batch_size = 4
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 5
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 20
+protocols = ["mean_iou", "recall@0.5"]
+
+[panel]
+enabled = false
+port = 8080

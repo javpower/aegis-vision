@@ -1,0 +1,55 @@
+# configs/classify_resnet18.toml —— ResNet18 骨干分类 + torchvision ImageNet 预训练导入
+# 用法：av train -c configs/classify_resnet18.toml
+#
+# 权重导出（一次性，E:/libs/yolo-bench venv）：
+#   python tools/export/export_resnet18.py --dst data/pretrain/resnet18_imagenet.safetensors
+#
+# torchvision resnet18 的 100 个骨干张量（20 conv + 40 BN 参数 + 40 BN 统计量）
+# 与 AV 骨干逐一同名（+backbone. 前缀），配 resnet18_map 一条前缀映射即全量导入；
+# fc.* 与 num_batches_tracked 落 unexpected（部分加载 + 完整报告，行业惯例）。
+run_id = "classify-resnet18"
+seed = 7
+device = "cpu"                     # CPU 可跑；有 CUDA 可改 "cuda:0"
+output_dir = "runs"
+
+[model]
+backbone = { family = "resnet18", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "classify"
+num_classes = 4
+img_size = 64
+
+[data]
+pipeline = "synthetic"             # 内置合成源，开箱即训；真实数据换 pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[train]
+# ResNet18 CPU 64x64 比 simple-cnn 慢一个量级；演示导入链路 3 epoch 足够
+epochs = 3
+batch_size = 16
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }   # 预训练微调用小 lr
+warmup_epochs = 0
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 1
+protocols = ["top1"]
+
+[panel]
+enabled = false
+port = 8080
+
+# ---- 预训练权重导入（torchvision ResNet18 ImageNet，本配置的核心段）----
+[pretrain]
+enable = true
+weight_path = "data/pretrain/resnet18_imagenet.safetensors"
+load_only_backbone = true          # 只匹配名字含 "backbone" 的目标变量（头按任务重训）
+freeze_backbone = false            # true 时 backbone requires_grad=false（FrozenBN 式微调）
+layer_map = "configs/resnet18_map.toml"   # torchvision 名 → backbone. 前缀（一条映射）

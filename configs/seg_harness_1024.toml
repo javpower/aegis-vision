@@ -1,0 +1,69 @@
+# configs/seg_harness_1024.toml —— 分辨率实验臂：img_size 640 → 1024
+# 原图 2448×2048 压到 640 时小目标（限位器/防撞块）像素极少；1024 保留 2.6 倍
+# 线性细节。代价：画布堆 6.6GB 超 4GiB 显存预算 → auto 自动落 ram 缓存
+# （rayon 并行 + 双缓冲预取照常生效），激活显存约 ×2.6。
+# 其余与 configs/seg_harness.toml 同协议，唯一变量 = img_size + batch 减半。
+run_id = "seg-harness-1024"
+seed = 7
+device = "cuda:0"
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "seg"
+head = "yolact"
+loss_weight = 1.0
+num_classes = 4
+img_size = 1024
+num_protos = 32
+loss_bce_weight = 1.0
+loss_dice_weight = 1.0
+
+[data]
+pipeline = "dir"
+workers = 8
+prefetch = 4
+cache = "auto"                     # → ram（1024² 画布堆 ~6.6GB 超显存预算，自动降级）
+
+[data.sources.train]
+dir = "E:/xunlian/yolo_dataset"
+[[data.sources.train.tasks]]
+kind = "seg"
+format = "coco_seg"
+[data.sources.train.tasks.augment]
+flip = 0.5
+hsv = [0.01, 0.01, 0.01]
+scale_jitter = [0.9, 1.1]
+close_last_epochs = 15
+
+[data.sources.val]
+dir = "E:/xunlian/yolo_dataset"
+
+[train]
+epochs = 120
+batch_size = 8                     # 1024px 激活显存 ×2.6，batch 减半保稳
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 5e-4 }
+warmup_epochs = 5
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["mask_miou", "recall@0.5", "precision@0.5"]
+
+[pretrain]
+enable = true
+weight_path = "data/pretrain/yolov8n_backbone.safetensors"
+load_only_backbone = true
+freeze_backbone = false
+layer_map = "configs/yolov8n_stem_map.toml"
+
+[panel]
+enabled = false
+port = 8080

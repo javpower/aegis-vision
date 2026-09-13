@@ -1,0 +1,65 @@
+# configs/resnet18_ab_pretrain_frozen.toml —— 预训练 A/B 第二期补充臂（冻结骨干）
+# coco8 检测 120ep：resnet18 + ImageNet 预训练 + ImageNet 归一化输入，但
+# freeze_backbone = true——conv 与 BN 全部冻结（requires_grad=false，优化器跳过），
+# BN 恒 eval（引擎 bn_train_mode 联动：冻结骨干 ⇒ set_train(false) 恒成立，
+# running 统计量不被 batch=4 的噪声批统计冲刷），只训检测头。
+# 第一期遗留清单第 4 条的实测（BENCHMARK「预训练 A/B 矩阵」：冻结 backbone 只训头
+# 时预训练特征应有显著正贡献）。与 resnet18_ab_pretrain.toml 仅差 freeze_backbone。
+run_id = "resnet18-ab-pretrain-frozen"
+seed = 3
+device = "cpu"
+output_dir = "runs"
+
+[model]
+backbone = { family = "resnet18", depth = 1.0, width = 1.0, pretrained = "none", imagenet_norm = true }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "detect"
+head = "yolo"
+loss_weight = 1.0
+assigner = "tal"
+obb_mode = false
+num_classes = 80
+img_size = 320
+
+[data]
+pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/coco8"
+[[data.sources.train.tasks]]
+kind = "detect"
+format = "yolo"
+
+[data.sources.val]
+dir = "data/coco8"
+
+[train]
+epochs = 120
+batch_size = 4
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 5
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 20
+protocols = ["mean_iou", "recall@0.5"]
+
+[panel]
+enabled = false
+port = 8080
+
+# ---- 预训练权重导入（torchvision ResNet18 ImageNet）----
+[pretrain]
+enable = true
+weight_path = "data/pretrain/resnet18_imagenet.safetensors"
+load_only_backbone = true          # 只匹配名字含 "backbone" 的目标变量（头按任务重训）
+freeze_backbone = true             # 冻结 conv+BN（Detectron/mmdet FrozenBN 微调配方；引擎联动 BN 恒 eval）
+layer_map = "configs/resnet18_map.toml"   # torchvision 名 → backbone. 前缀（一条映射）

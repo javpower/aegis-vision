@@ -1,0 +1,48 @@
+# AegisVision .gitignore（开源就绪）
+# 原则：入库 = 源码 + 配置 + 文档 + 构建定义；不入库 = 一切可再生产物与第三方数据
+
+# ---- Rust 构建产物（含各代理/实验的隔离 target 目录）----
+/target
+/target-*/
+
+# ---- 训练产物（权重/指标可由配置复现）----
+/runs/
+/runs-*/
+runs-panel2/
+
+# ---- 数据集与预训练权重（第三方数据 + 可再生产物；获取方式见 docs/USAGE.md §3/§6）----
+/data/
+
+# ---- Python（导出/基准侧车脚本的环境产物）----
+__pycache__/
+*.pyc
+.venv/
+
+# ---- 临时与日志 ----
+*.log
+/logs/
+
+# ---- 编辑器与操作系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- 第三方 crate 参考源码与压缩包（ex_* 为解包产物，可再下载）----
+/ex_burn-*/
+/*.crate
+
+# ---- 实验草稿 ----
+/scratch-*/
+
+# ---- 根目录预训练权重 ----
+/*.pt
+
+# ---- 杂项 ----
+*.orig
+Cargo.lock.orig
+
+# ---- setup-env.ps1/.sh 自动下载的 libtorch（2.8GB，可再生产物）----
+/.libtorch/
+/scripts/env.local.ps1
+/scripts/env.local.sh

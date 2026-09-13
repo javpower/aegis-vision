@@ -1,0 +1,27 @@
+[package]
+name = "av-core"
+version.workspace = true
+edition.workspace = true
+description = "AegisVision 公共抽象层：六大核心 trait、配置 schema、几何工具、插件注册表"
+license.workspace = true
+authors.workspace = true
+# readme 不做 workspace 继承：workspace 级 readme 路径相对 workspace 根解析，
+# 会落到成员包根之外导致 cargo package 告警；各 crate 放自己的薄 README。
+readme = "README.md"
+keywords = ["deep-learning", "yolo", "configuration", "geometry", "traits"]
+categories = ["science", "algorithms"]
+
+[features]
+default = ["torch"]
+# 张量层（tch/libtorch）。download-libtorch 并入默认：无 LIBTORCH 环境时自动下载
+# 配对 CPU 版实现零配置编译；已设 LIBTORCH 时优先使用本地安装（CUDA 变体自选）。
+# 无 libtorch 的纯逻辑构建：--no-default-features
+torch = ["dep:tch", "tch/download-libtorch"]
+
+[dependencies]
+tch = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }

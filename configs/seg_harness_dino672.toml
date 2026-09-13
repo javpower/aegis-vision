@@ -1,0 +1,61 @@
+# configs/seg_harness_dino.toml —— 预训练对比臂：DINOv2 ViT-S/14 骨干
+# 注意：img_size 须为 14 与 32 的公倍数（本项目取 448）；权重经骨干内
+# load_dinov2_weights 导入（pos_embed 插值 + QKV 融合），不用引擎 [pretrain] 段。
+# 与其他臂的唯一差异 = 骨干 + 分辨率（448 vs 640，DINOv2 patch 网格约束所致）。
+run_id = "seg-harness-dino672"
+seed = 7
+device = "cuda:0"
+output_dir = "runs"
+
+[model]
+backbone = { family = "dinov2", depth = 1.0, width = 1.0, pretrained = "data/pretrain/dinov2_small.safetensors" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "seg"
+head = "yolact"
+loss_weight = 1.0
+num_classes = 4
+img_size = 672                     # 14×48，且 672/32=21：patch 网格合法，分辨率反超 640 臂
+num_protos = 32
+loss_bce_weight = 1.0
+loss_dice_weight = 1.0
+
+[data]
+pipeline = "dir"
+workers = 8
+prefetch = 4
+cache = "ram"                      # 并行期让出显存给 csp-elan 臂（CPU rayon 编码照常）
+
+[data.sources.train]
+dir = "E:/xunlian/yolo_dataset"
+[[data.sources.train.tasks]]
+kind = "seg"
+format = "coco_seg"
+[data.sources.train.tasks.augment]
+flip = 0.5
+hsv = [0.01, 0.01, 0.01]
+scale_jitter = [0.9, 1.1]
+close_last_epochs = 15
+
+[data.sources.val]
+dir = "E:/xunlian/yolo_dataset"
+
+[train]
+epochs = 120
+batch_size = 4                     # 与 csp-elan 臂并行：低显存档（注意力激活 ~3GB）
+optimizer = { type = "adamw", lr = 1e-4, weight_decay = 5e-4 }  # ViT 微调小 lr
+warmup_epochs = 3
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["mask_miou", "recall@0.5", "precision@0.5"]
+
+[panel]
+enabled = false
+port = 8080

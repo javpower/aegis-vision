@@ -1,0 +1,25 @@
+# configs/resnet18_map.toml —— torchvision ResNet18 → AV resnet18 骨干层映射
+#
+# ResNet18 骨干（av-tasks::backbone_resnet）按 torchvision 同名结构装配，AV 变量名
+# = torchvision 层名 + "backbone." 前缀，conv/bn 参数与 BN 统计量全部同名对齐，
+# 故只需一条捕获引用映射：
+#
+#   conv1.weight                      → backbone.conv1.weight          [64,3,7,7]
+#   bn1.running_mean                  → backbone.bn1.running_mean      [64]
+#   layer1.0.conv1.weight             → backbone.layer1.0.conv1.weight [64,64,3,3]
+#   layer2.0.downsample.1.running_var → backbone.layer2.0.downsample.1.running_var [128]
+#   layer4.1.bn2.bias                 → backbone.layer4.1.bn2.bias     [512]
+#
+# BN 统计量（running_mean/running_var）无需特殊处理：tch 0.24 nn::batch_norm2d 把
+# 它们创建为 VarStore 命名变量（no_train），与普通权重走同一条 [pretrain] 导入链路。
+#
+# transpose 全部 false：torchvision conv 权重 [out,in,kh,kw] 与 tch 变量同约定。
+#
+# fc.*（1000 类 ImageNet 分类头，任务头按数据集重训）与 *.num_batches_tracked
+# （tch 无对应变量）不匹配映射且同名直配无目标 → AdaptReport 以 unexpected 呈现。
+# 代码内等价预设：av_pretrain::weight_adapter::resnet18_preset()。
+
+[[entries]]
+from = '^(conv1|bn1|layer[1-4])\.(.+)$'
+to = 'backbone.$1.$2'
+transpose = false

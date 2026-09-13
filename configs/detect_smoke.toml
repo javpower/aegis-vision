@@ -1,0 +1,43 @@
+# configs/detect_smoke.toml —— 检测端到端冒烟：内置合成数据，开箱即训
+# 用法：av train -c configs/detect_smoke.toml
+run_id = "detect-smoke"
+seed = 11
+device = "cuda:0"                  # 无 CUDA 自动回退 CPU
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "detect"
+head = "yolo"                      # v0.1 引擎走 anchor-free 单点分配；TAL/CIoU/DFL 按 M2 替换
+loss_weight = 1.0
+assigner = "tal"
+obb_mode = false
+num_classes = 2
+img_size = 64
+
+[data]
+pipeline = "synthetic"
+workers = 1
+prefetch = 1
+
+[train]
+epochs = 150
+batch_size = 16
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 0
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 1
+protocols = ["mean_iou", "recall@0.5"]
+
+[panel]
+enabled = false
+port = 8080

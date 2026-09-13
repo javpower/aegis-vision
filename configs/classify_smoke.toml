@@ -1,0 +1,39 @@
+# configs/classify_smoke.toml —— 分类端到端冒烟：内置合成数据，开箱即训
+# 用法：av train -c configs/classify_smoke.toml
+run_id = "classify-smoke"
+seed = 7
+device = "cuda:0"                  # 无 CUDA 自动回退 CPU
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "classify"
+num_classes = 4
+img_size = 64
+
+[data]
+pipeline = "synthetic"             # 内置合成源，无需外部数据集
+workers = 1
+prefetch = 1
+
+[train]
+epochs = 40
+batch_size = 16
+optimizer = { type = "adamw", lr = 3e-3, weight_decay = 1e-4 }
+warmup_epochs = 0
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false                        # v0.1 合成冒烟走 fp32；amp 按 M7 落地
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 1
+protocols = ["top1"]
+
+[panel]
+enabled = false
+port = 8080

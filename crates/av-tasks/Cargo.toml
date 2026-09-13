@@ -1,0 +1,18 @@
+[package]
+name = "av-tasks"
+version.workspace = true
+edition.workspace = true
+description = "AegisVision 五任务内置实现：classify / detect / obb / seg / keypoint"
+license.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["deep-learning", "yolo", "detection", "classification", "training"]
+categories = ["science", "algorithms"]
+
+[features]
+default = ["torch"]
+torch = ["av-core/torch", "dep:tch"]
+
+[dependencies]
+av-core = { workspace = true }
+tch = { workspace = true, optional = true }

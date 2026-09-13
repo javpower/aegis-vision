@@ -1,0 +1,55 @@
+# configs/detect_coco8_matrix_arm1_simplecnn_scratch.toml —— 预训练 A/B 矩阵臂 A1
+# coco8 检测：simple-cnn 从零（对照臂）。与 A2/A3（detect_coco8_matrix_arm2_*
+# / arm3_*）除 backbone.family 与 [pretrain] 外逐字段一致（同 seed/epochs/超参），
+# A/B 结论见 BENCHMARK.md「预训练 A/B 矩阵」。
+# 集成测试：av-runtime tests::pretrain_ab_matrix_coco8_detect_three_arms。
+run_id = "detect-coco8-matrix-arm1-simplecnn-scratch"
+seed = 3
+device = "cpu"
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "detect"
+head = "yolo"
+loss_weight = 1.0
+assigner = "tal"
+obb_mode = false
+num_classes = 80                   # COCO 80 类（coco8 标注沿用原类 id）
+img_size = 320
+
+[data]
+pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/coco8"                 # images/<split> + labels/<split>
+[[data.sources.train.tasks]]
+kind = "detect"
+format = "yolo"
+
+[data.sources.val]                 # 缺省使用同一根目录的 val split
+dir = "data/coco8"
+
+[train]
+epochs = 60
+batch_size = 4
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 5
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 20
+protocols = ["mean_iou", "recall@0.5"]
+
+[panel]
+enabled = false
+port = 8080

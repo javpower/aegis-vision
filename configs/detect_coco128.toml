@@ -1,0 +1,57 @@
+# configs/detect_coco128.toml —— 真实数据（Ultralytics coco128，COCO 2017 前 128 图，YOLO 格式）
+# 数据准备：data/coco128（scripts/get-data.ps1 或手动下载解压）
+# 用法：av train -c configs/detect_coco128.toml
+run_id = "detect-coco128"
+seed = 3
+device = "cuda:0"                  # 无 CUDA 自动回退 CPU
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "detect"
+head = "yolo"
+loss_weight = 1.0
+assigner = "tal"
+obb_mode = false
+num_classes = 80
+img_size = 320
+
+[data]
+pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/coco128"
+split = "train2017"                # coco128 的 split 名
+[[data.sources.train.tasks]]
+kind = "detect"
+format = "yolo"
+
+# val 源缺省：同一根目录下 val split（coco128 无独立 val，训练时用 train 集自身做
+# 过拟合验收更诚实；val split 不存在会报错——这里显式指向 train2017 做冒烟）
+[data.sources.val]
+dir = "data/coco128"
+split = "train2017"
+
+[train]
+epochs = 300
+batch_size = 16
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 10
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["mean_iou", "recall@0.5"]
+
+[panel]
+enabled = false
+port = 8080

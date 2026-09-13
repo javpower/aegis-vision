@@ -1,0 +1,52 @@
+# configs/classify_imagenette.toml —— 分类真实数据：ImageNette（ImageNet 10 类子集，160px 版）
+# 用法：av train -c configs/classify_imagenette.toml
+# 数据：data/imagenette2-160/{train,val}/<wnid>/*.JPEG（ImageNet 标准目录结构）
+run_id = "classify-imagenette"
+seed = 42
+device = "cuda:0"                  # 无 CUDA 自动回退 CPU（本仓库默认 CPU libtorch）
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "classify"
+num_classes = 10                   # ImageNette 固定 10 类（wnid 排序 → 0..9）
+img_size = 64                      # 32 的倍数约束下取 64：全 train 集（约 9.5k 图）预解码约 0.5GB 内存
+# data_dir = "data/imagenette2-160"  # 可选：缺省回落 data.sources.train.dir（下方）
+
+[data]
+pipeline = "dir"                   # ImageFolder 目录源（<split>/<wnid>/*.JPEG）
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/imagenette2-160"
+split = "train"                    # 缺省即 "train"，显式写出便于阅读
+
+[data.sources.val]
+dir = "data/imagenette2-160"
+split = "val"
+
+[train]
+# train 9469 图 bs64 ≈ 148 步/epoch。实测（release，CPU）：20 epochs 全程含
+# 预解码与 val 评测约 45 秒——远快于早期预估，无需降 epochs；debug 构建慢约一个量级。
+epochs = 20
+batch_size = 64
+accumulate_steps = 1
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 5e-4 }
+warmup_epochs = 1
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false                        # CPU 训练走 fp32；amp 按 M7 落地
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 2                # val 全量（约 3.9k 图）评测有成本，按间隔执行
+protocols = ["top1"]
+
+[panel]
+enabled = false
+port = 8080

@@ -1,0 +1,61 @@
+# configs/seg_harness_resnet18.toml —— 精度实验臂：ResNet18+ImageNet 预训练骨干
+# 与 configs/seg_harness.toml 同数据同协议（4 类零部件 526/93，120ep），
+# 对照臂：resnet18 从零（与 seg-harness-r18 同架构同协议，隔离预训练权重变量）。
+# 数据管线 v2 全量生效（auto → 显存驻留 + GPU 增强）。
+run_id = "seg-harness-r18-none"
+seed = 7
+device = "cuda:0"
+output_dir = "runs"
+
+[model]
+backbone = { family = "resnet18", depth = 1.0, width = 1.0, pretrained = "none", imagenet_norm = true }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "seg"
+head = "yolact"
+loss_weight = 1.0
+num_classes = 4                    # 0 线束 / 1 锁体 / 2 限位器 / 3 防撞块
+img_size = 640
+num_protos = 32
+loss_bce_weight = 1.0
+loss_dice_weight = 1.0
+
+[data]
+pipeline = "dir"
+workers = 8
+prefetch = 4
+cache = "auto"                     # → gpu（画布堆 ~2.6GB ≤ 4GiB 预算）
+
+[data.sources.train]
+dir = "E:/xunlian/yolo_dataset"
+[[data.sources.train.tasks]]
+kind = "seg"
+format = "coco_seg"
+[data.sources.train.tasks.augment]
+flip = 0.5
+hsv = [0.01, 0.01, 0.01]
+scale_jitter = [0.9, 1.1]
+close_last_epochs = 15
+
+[data.sources.val]
+dir = "E:/xunlian/yolo_dataset"
+
+[train]
+epochs = 120
+batch_size = 16
+optimizer = { type = "adamw", lr = 3e-4, weight_decay = 5e-4 }  # ImageNet 预训练微调：降 lr 防 BN/特征漂移
+warmup_epochs = 3
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["mask_miou", "recall@0.5", "precision@0.5"]
+
+[panel]
+enabled = false
+port = 8080

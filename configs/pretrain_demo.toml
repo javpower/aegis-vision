@@ -1,0 +1,63 @@
+# configs/pretrain_demo.toml —— [pretrain] 预训练权重导入示例
+# 用法：av train -c configs/pretrain_demo.toml
+#
+# 数据侧用内置合成源（开箱即训）；[pretrain] 段演示导入真实 YOLOv8n 骨干权重：
+#   python tools/export/export_state_dict.py \
+#       --src yolov8n.pt \
+#       --dst data/pretrain/yolov8n_backbone.safetensors \
+#       --backbone-prefix "model.0.,model.1.,model.2.,model.3."
+#
+# 说明：yolov8n 的 stem conv（model.0/1/3.conv.weight）与 AV simple-cnn 的
+# backbone.c1/c2/c3.weight 形状恰好同构，配 layer_map 可真实载入 3 层；
+# 不配 layer_map 时为同名直配，报告将显示全部 unexpected（读取+校验+报告链路演示）。
+run_id = "pretrain-demo"
+seed = 7
+device = "cpu"                     # 演示配置固定 CPU（无 CUDA 环境也零告警）
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "classify"
+num_classes = 4
+img_size = 64
+
+[data]
+pipeline = "synthetic"
+workers = 1
+prefetch = 1
+
+[train]
+epochs = 5
+batch_size = 16
+optimizer = { type = "adamw", lr = 3e-3, weight_decay = 1e-4 }
+warmup_epochs = 0
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 1
+protocols = ["top1"]
+
+[panel]
+enabled = false
+port = 8080
+
+# ---- 预训练权重导入（本示例的核心段；抄进你的配置时按需修改）----
+[pretrain]
+enable = true
+weight_path = "data/pretrain/yolov8n_backbone.safetensors"   # safetensors 文件或 avpretrain 目录
+load_only_backbone = true       # 只匹配名字含 "backbone" 的目标变量（头按任务重训）
+freeze_backbone = false         # true 时 backbone requires_grad=false，优化器自然跳过
+# layer_map = "layer_map.toml"  # 层映射（外部层名 → AV 变量名），文件格式：
+#   [[entries]]
+#   from = '^model\.0\.conv\.'   # 正则（支持 $1 捕获引用；非法正则回退字面前缀）
+#   to = 'backbone.c1.'          # 替换文本
+#   transpose = false            # 2 维源张量转置后比对（nn.Linear [out,in] 约定差异兜底）
+# 原生 avpretrain 目录（如 runs/<run>/best.ckpt 补 manifest.json）无需 layer_map：
+#   cargo test -p av-pretrain   # 或用 av_pretrain::av_weight::export_pretrain_dir 一站式导出

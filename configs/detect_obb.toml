@@ -1,0 +1,63 @@
+# configs/detect_obb.toml —— 检测 + OBB 双开模板（PLAN 附录 A），可直接 av train -c 使用
+run_id = ""                        # 留空自动生成哈希；指定则续跑/复现
+seed = 42
+device = "cuda:0"
+output_dir = "runs"
+
+[model]
+backbone = { family = "csp-elan", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "pan", channels = [128, 256, 512] }
+
+[[model.tasks]]                    # 任务数组：想多任务就继续往下加
+kind = "detect"
+head = "yolo"                      # yolo | rfdetr
+loss_weight = 1.0
+assigner = "tal"
+obb_mode = false
+
+[[model.tasks]]
+kind = "obb"
+head = "yolo"
+loss_weight = 1.0
+angle = "le90"                     # le90 | le135 | opencv
+rot_nms = "probiou"                # probiou | polygon
+
+[data]
+pipeline = "avpack"                # avpack | dir
+workers = 8                        # 解码线程
+prefetch = 4                       # 预取批数（有界队列）
+
+[data.sources.train]
+avpack = "data/train.avpack"
+[[data.sources.train.tasks]]
+kind = "obb"
+format = "dota"                    # dota | coco | yolo_txt
+[data.sources.train.tasks.augment] # TOML 行内表不允许跨行，增强项用子表
+mosaic = 1.0
+mixup = 0.1
+hsv = [0.015, 0.7, 0.4]
+scale_jitter = [0.5, 2.0]
+close_last_epochs = 10
+
+[data.sources.val]
+avpack = "data/val.avpack"
+
+[train]
+epochs = 300
+batch_size = 16
+accumulate_steps = 1
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 5e-4 }
+warmup_epochs = 3
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = true
+deterministic = false
+ema_decay = 0.9999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["dota-voc07", "coco-map"]
+
+[panel]
+enabled = true
+port = 8080

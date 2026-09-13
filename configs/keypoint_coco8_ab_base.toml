@@ -1,0 +1,53 @@
+# configs/keypoint_coco8_ab_base.toml —— 数据增强 A/B 基线臂（无增强）
+# 与 configs/keypoint_coco8.toml 完全同配置（augment 全零 = 历史行为），
+# 仅改 run_id 落独立 runs 目录，避免覆盖历史基线产物。
+# A/B 结论见 BENCHMARK.md「数据增强 A/B」。
+run_id = "keypoint-coco8-ab-base"
+seed = 7
+device = "cpu"                     # 320 输入小模型 CPU 可训（无 CUDA 也能复现）
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "keypoint"
+decode = "direct"                  # 直接回归档（stride 8 每 cell：cls+box+K×(dx,dy)+可见性）
+loss_weight = 1.0
+num_keypoints = 17                 # COCO 17 点模板
+img_size = 320
+loss_oks_weight = 1.0              # (1 − mean OKS) 可微项权重（0 = 纯 L1 偏移回归）
+
+[data]
+pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/coco8-pose"            # images/<split> + labels/<split>
+[[data.sources.train.tasks]]
+kind = "keypoint"
+format = "coco_pose"
+
+[data.sources.val]                 # 缺省使用同一根目录的 val split
+dir = "data/coco8-pose"
+
+[train]
+epochs = 200
+batch_size = 4
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 10
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["pck@0.5", "oks"]
+
+[panel]
+enabled = false
+port = 8080

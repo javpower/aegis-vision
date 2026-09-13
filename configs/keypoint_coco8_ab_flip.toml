@@ -1,0 +1,56 @@
+# configs/keypoint_coco8_ab_flip.toml —— 数据增强 A/B 消融臂（仅水平翻转）
+# 与基线臂唯一差异：训练源任务挂 augment.flip = 0.5（无 HSV / 尺度抖动），
+# 用于隔离几何翻转的单项贡献。主 A/B 结论见 BENCHMARK.md「数据增强 A/B」。
+run_id = "keypoint-coco8-ab-flip"
+seed = 7
+device = "cpu"
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "keypoint"
+decode = "direct"
+loss_weight = 1.0
+num_keypoints = 17
+img_size = 320
+loss_oks_weight = 1.0
+
+[data]
+pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/coco8-pose"
+[[data.sources.train.tasks]]
+kind = "keypoint"
+format = "coco_pose"
+
+[data.sources.train.tasks.augment]
+flip = 0.5
+close_last_epochs = 20
+
+[data.sources.val]
+dir = "data/coco8-pose"
+
+[train]
+epochs = 200
+batch_size = 4
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 10
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["pck@0.5", "oks"]
+
+[panel]
+enabled = false
+port = 8080

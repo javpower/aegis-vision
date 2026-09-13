@@ -1,0 +1,42 @@
+[package]
+name = "av-runtime"
+version.workspace = true
+edition.workspace = true
+description = "AegisVision 训练/推理引擎、CLI 与观测面板"
+license.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["deep-learning", "yolo", "machine-learning", "detection", "cli"]
+categories = ["science", "multimedia::images", "command-line-utilities"]
+
+[features]
+default = ["torch", "panel"]
+torch = ["av-core/torch", "av-tasks/torch", "av-pretrain/torch", "dep:tch"]
+panel = ["dep:axum", "dep:tokio"]
+
+[dependencies]
+av-core = { workspace = true }
+av-tasks = { workspace = true }
+av-plugins = { workspace = true }
+av-pretrain = { workspace = true }
+blake3 = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+image = { workspace = true }
+rayon = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true, optional = true }
+# SSE 轮询需要 time feature（在 workspace 基础 feature 之上追加，feature 可加不可减）
+tokio = { workspace = true, optional = true, features = ["time"] }
+# panel SSE 的 EventStream 手写 poll_next 需要 Stream trait（futures-core 已在
+# 依赖树内——axum 传递依赖，锁 0.3.34；此处仅显式声明，零新增下载）
+futures-core = "0.3"
+tch = { workspace = true, optional = true }
+
+[dev-dependencies]
+# 面板 SSE 集成测试用裸 TCP 收发，需要 AsyncRead/WriteExt（io-util 仅测试期启用）
+tokio = { workspace = true, features = ["io-util"] }

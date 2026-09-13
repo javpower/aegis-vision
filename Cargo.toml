@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# 双许可（SPDX 表达式）：crates.io 页面据此展示许可证，无需 license-file
+license = "MIT OR Apache-2.0"
+authors = ["AegisVision Contributors"]
+# 仓库公开后取消下一行注释，并在四个 crate 中以 repository.workspace = true 继承：
+# repository = "https://github.com/aegisvision/aegis-vision"
+
+[workspace.dependencies]
+av-core = { path = "crates/av-core", default-features = false }
+av-tasks = { path = "crates/av-tasks", default-features = false }
+av-plugins = { path = "crates/av-plugins" }
+av-runtime = { path = "crates/av-runtime" }
+av-pretrain = { path = "crates/av-pretrain", default-features = false }
+
+# ---- 深度学习底座（PLAN §2.2：每个 tch 版本硬绑定一个 libtorch 版本，用 "=" 锁死）----
+# 锁 0.24.0（libtorch 2.11.0，MSVC C++17 可编译；2026-09-12 实验二逐版本筛选出的
+# Windows 最高可用配对，0.26/libtorch 2.13 胶水在 MSVC 14.44 下仍编译失败）。
+# libtorch 2.11 的 cu128 发行版原生含 RTX 5060 Ti（sm_120/Blackwell）内核，GPU 实测
+# 通过（docs/gpu.md 实验二）；注意 Windows/MSVC 下进程启动需显式
+# LoadLibrary("torch_cuda.dll")，否则 CUDA 后端不注册（见 docs/gpu.md §5）。
+tch = "=0.24.0"
+ndarray = "0.16"
+
+# ---- 数据与并行 ----
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+rayon = "1.10"
+crossbeam-channel = "0.5"
+memmap2 = "0.9"
+walkdir = "2"
+
+# ---- 配置与 CLI ----
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+
+# ---- 错误与日志 ----
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ---- 面板与可追溯 ----
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+blake3 = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.inference]
+inherits = "release"
+panic = "abort"

@@ -1,0 +1,53 @@
+# configs/detect_coco8.toml —— 真实数据（Ultralytics coco8，YOLO 格式）端到端
+# 数据准备：scripts/get-data.ps1 或手动下载解压到 data/coco8
+# 用法：av train -c configs/detect_coco8.toml
+run_id = "detect-coco8"
+seed = 3
+device = "cuda:0"                  # 无 CUDA 自动回退 CPU
+output_dir = "runs"
+
+[model]
+backbone = { family = "simple-cnn", depth = 1.0, width = 1.0, pretrained = "none" }
+neck = { type = "identity", channels = [] }
+
+[[model.tasks]]
+kind = "detect"
+head = "yolo"
+loss_weight = 1.0
+assigner = "tal"
+obb_mode = false
+num_classes = 80                   # COCO 80 类（coco8 标注沿用原类 id）
+img_size = 320
+
+[data]
+pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "data/coco8"                 # images/<split> + labels/<split>
+[[data.sources.train.tasks]]
+kind = "detect"
+format = "yolo"
+
+[data.sources.val]                 # 缺省使用同一根目录的 val split
+dir = "data/coco8"
+
+[train]
+epochs = 400
+batch_size = 4
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 10
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = false
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 10
+protocols = ["mean_iou", "recall@0.5"]
+
+[panel]
+enabled = false
+port = 8080

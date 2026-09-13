@@ -1,0 +1,34 @@
+[package]
+name = "av-burn"
+version.workspace = true
+edition.workspace = true
+description = "AegisVision burn 框架技术验证 spike：CSP-ELAN 骨干 + YOLACT 式分割头（wgpu 后端）"
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+# wgpu 只做编译验证（显存被实验占用，禁止 GPU 训练）；默认仅 ndarray 后端，
+# 测试一律在 ndarray 上跑（验收标准 1），wgpu 随本 feature 编译期验证（验收标准 2）。
+default = []
+wgpu = ["dep:burn-wgpu"]   # 0.21 的 Wgpu 类型默认已含 burn-fusion 融合 + autotune
+
+[dependencies]
+# 只依赖 av-core（default-features = false 避免 tch/libtorch）+ image + burn；
+# 禁止依赖 av-runtime / av-tasks（绑 tch）——letterbox / 栅格化逻辑按语义自实现。
+av-core = { workspace = true, default-features = false }
+image = { workspace = true }
+
+# ---- burn 0.21.0：按子 crate 直接依赖，不用 umbrella `burn` ----
+# 原因（实测）：umbrella `burn` 的依赖锁图必含可选的 burn-tch（torch-sys ^0.22），
+# 与工作区 av-runtime 的 tch 0.24（torch-sys 0.24）在 `links = "tch"` 上冲突，
+# 导致整个工作区解析失败（隔离探针 crate 复现）。子 crate 组合不含 burn-tch，
+# 与 tch 0.24 在同一工作区解析/编译均通过。版本号与 `cargo add burn` 最新稳定一致。
+burn-core = { version = "0.21.0", default-features = false, features = ["std"] }
+burn-nn = "0.21.0"
+burn-optim = "0.21.0"
+# ndarray = 冒烟测试/单测后端；autodiff = 训练必需（ndarray 不自带反传）。
+burn-ndarray = "0.21.0"
+burn-autodiff = "0.21.0"
+# wgpu = GPU 编译验证（经 av-burn 的 wgpu feature 打开）。
+burn-wgpu = { version = "0.21.0", optional = true }
