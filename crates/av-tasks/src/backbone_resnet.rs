@@ -57,7 +57,7 @@ use tch::Tensor;
 
 use av_core::config::BackboneCfg;
 use av_core::error::{AvError, AvResult};
-use av_core::traits::{BaseBackbone, BackboneSpec, FeatureMap, FeaturePyramid, LevelSpec};
+use av_core::traits::{BackboneSpec, BaseBackbone, FeatureMap, FeaturePyramid, LevelSpec};
 
 /// 注册表族名（av-tasks::register_builtin 登记）。
 pub const FAMILY_NAME: &str = "resnet18";
@@ -95,7 +95,12 @@ impl BasicBlock {
             in_ch,
             out_ch,
             3,
-            nn::ConvConfig { stride, padding: 1, bias: false, ..Default::default() },
+            nn::ConvConfig {
+                stride,
+                padding: 1,
+                bias: false,
+                ..Default::default()
+            },
         );
         let bn1 = nn::batch_norm2d(p / "bn1", out_ch, Default::default());
         let conv2 = nn::conv2d(
@@ -103,7 +108,11 @@ impl BasicBlock {
             out_ch,
             out_ch,
             3,
-            nn::ConvConfig { padding: 1, bias: false, ..Default::default() },
+            nn::ConvConfig {
+                padding: 1,
+                bias: false,
+                ..Default::default()
+            },
         );
         let bn2 = nn::batch_norm2d(p / "bn2", out_ch, Default::default());
         let downsample = if stride != 1 || in_ch != out_ch {
@@ -113,14 +122,24 @@ impl BasicBlock {
                 in_ch,
                 out_ch,
                 1,
-                nn::ConvConfig { stride, bias: false, ..Default::default() },
+                nn::ConvConfig {
+                    stride,
+                    bias: false,
+                    ..Default::default()
+                },
             );
             let bn = nn::batch_norm2d(&ds / "1", out_ch, Default::default());
             Some((conv, bn))
         } else {
             None
         };
-        Self { conv1, bn1, conv2, bn2, downsample }
+        Self {
+            conv1,
+            bn1,
+            conv2,
+            bn2,
+            downsample,
+        }
     }
 
     fn forward(&self, x: &Tensor, train: bool) -> Tensor {
@@ -161,7 +180,12 @@ impl ResNetBackbone {
                 cfg.width
             )));
         }
-        let stem = nn::ConvConfig { stride: 2, padding: 3, bias: false, ..Default::default() };
+        let stem = nn::ConvConfig {
+            stride: 2,
+            padding: 3,
+            bias: false,
+            ..Default::default()
+        };
         let conv1 = nn::conv2d(p / "conv1", 3, STAGE_CHANNELS[0], 7, stem);
         let bn1 = nn::batch_norm2d(p / "bn1", STAGE_CHANNELS[0], Default::default());
         let mut layers: [Vec<BasicBlock>; 4] = Default::default();
@@ -173,12 +197,22 @@ impl ResNetBackbone {
             for b in 0..BLOCKS_PER_STAGE {
                 let bp = &lp / &b.to_string();
                 // 每 stage 首块下采样（stage0 stride=1 无空间下采样）
-                blocks.push(BasicBlock::new(&bp, in_ch, out_ch, if b == 0 { stride } else { 1 }));
+                blocks.push(BasicBlock::new(
+                    &bp,
+                    in_ch,
+                    out_ch,
+                    if b == 0 { stride } else { 1 },
+                ));
                 in_ch = out_ch;
             }
             layers[stage] = blocks;
         }
-        Ok(Self { conv1, bn1, layers, train: Cell::new(false) })
+        Ok(Self {
+            conv1,
+            bn1,
+            layers,
+            train: Cell::new(false),
+        })
     }
 
     /// 切换训练/推理语义（见模块注释「train 标志」）。
@@ -238,16 +272,27 @@ impl BaseBackbone for ResNetBackbone {
 
     fn forward_pooled(&self, x: &Tensor) -> AvResult<Tensor> {
         let (_l1, _l2, _l3, l4) = self.forward_all(x, self.train.get());
-        let pooled = l4.adaptive_avg_pool2d([1, 1]).reshape([-1, POOLED_CHANNELS]);
+        let pooled = l4
+            .adaptive_avg_pool2d([1, 1])
+            .reshape([-1, POOLED_CHANNELS]);
         Ok(pooled)
     }
 
     fn spec(&self) -> BackboneSpec {
         BackboneSpec {
             levels: vec![
-                LevelSpec { stride: 4, channels: STAGE_CHANNELS[0] as usize },
-                LevelSpec { stride: 8, channels: STAGE_CHANNELS[1] as usize },
-                LevelSpec { stride: 16, channels: STAGE_CHANNELS[2] as usize },
+                LevelSpec {
+                    stride: 4,
+                    channels: STAGE_CHANNELS[0] as usize,
+                },
+                LevelSpec {
+                    stride: 8,
+                    channels: STAGE_CHANNELS[1] as usize,
+                },
+                LevelSpec {
+                    stride: 16,
+                    channels: STAGE_CHANNELS[2] as usize,
+                },
             ],
         }
     }
@@ -267,7 +312,10 @@ mod tests {
     #[test]
     fn rejects_width_scaling() {
         let vs = nn::VarStore::new(Device::Cpu);
-        let cfg = BackboneCfg { width: 0.5, ..Default::default() };
+        let cfg = BackboneCfg {
+            width: 0.5,
+            ..Default::default()
+        };
         let err = match ResNetBackbone::new(&(vs.root() / "backbone"), &cfg) {
             Err(e) => e,
             Ok(_) => panic!("width = 0.5 应被拒绝"),
@@ -288,14 +336,22 @@ mod tests {
         assert_eq!(channels, vec![64, 128, 256], "ResNet18 layer1/2/3 真实宽度");
         // stride 契约对输入分辨率成立：64/4=16, 64/8=8, 64/16=4
         for (level, expect) in pyramid.levels.iter().zip([16i64, 8, 4]) {
-            assert_eq!(level.tensor.size()[2], expect, "stride {} 空间尺寸", level.stride);
+            assert_eq!(
+                level.tensor.size()[2],
+                expect,
+                "stride {} 空间尺寸",
+                level.stride
+            );
         }
         let pooled = backbone.forward_pooled(&x).unwrap();
         assert_eq!(pooled.size(), vec![2, backbone.pooled_channels()]);
         assert_eq!(backbone.pooled_channels(), POOLED_CHANNELS);
         // spec 与 stride_channels 一致（装配期校验依据）
         for lv in backbone.spec().levels {
-            assert_eq!(backbone.stride_channels(lv.stride).unwrap(), lv.channels as i64);
+            assert_eq!(
+                backbone.stride_channels(lv.stride).unwrap(),
+                lv.channels as i64
+            );
         }
     }
 
@@ -308,8 +364,17 @@ mod tests {
         let backbone = resnet18_backbone(&vs);
         let x = Tensor::randn([2, 3, 320, 320], (Kind::Float, Device::Cpu));
         let pyramid = backbone.forward_features(&x).unwrap();
-        for (level, (ch, hw)) in pyramid.levels.iter().zip([(64i64, 80i64), (128, 40), (256, 20)]) {
-            assert_eq!(level.tensor.size(), vec![2, ch, hw, hw], "stride {}", level.stride);
+        for (level, (ch, hw)) in pyramid
+            .levels
+            .iter()
+            .zip([(64i64, 80i64), (128, 40), (256, 20)])
+        {
+            assert_eq!(
+                level.tensor.size(),
+                vec![2, ch, hw, hw],
+                "stride {}",
+                level.stride
+            );
         }
     }
 
@@ -345,7 +410,10 @@ mod tests {
             .collect();
         got.sort();
         expected.sort();
-        assert_eq!(got, expected, "变量名必须与 torchvision 层名逐一同名（+前缀）");
+        assert_eq!(
+            got, expected,
+            "变量名必须与 torchvision 层名逐一同名（+前缀）"
+        );
     }
 
     /// BN 统计量是 VarStore 命名变量（no_train）：weight_adapter/engine 写回
@@ -355,7 +423,9 @@ mod tests {
         let vs = nn::VarStore::new(Device::Cpu);
         let backbone = resnet18_backbone(&vs);
         assert!(vs.variables().contains_key("backbone.bn1.running_mean"));
-        assert!(vs.variables().contains_key("backbone.layer2.0.downsample.1.running_var"));
+        assert!(vs
+            .variables()
+            .contains_key("backbone.layer2.0.downsample.1.running_var"));
 
         let x = Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu));
         let out1 = backbone.forward_pooled(&x).unwrap();
@@ -364,12 +434,17 @@ mod tests {
         let shift = Tensor::ones([64i64], (Kind::Float, Device::Cpu)) * 5.0;
         tch::no_grad(|| {
             let mut vars = vs.variables();
-            let mut rm = vars.remove("backbone.bn1.running_mean").expect("统计量应存在");
+            let mut rm = vars
+                .remove("backbone.bn1.running_mean")
+                .expect("统计量应存在");
             rm.copy_(&shift);
         });
         let out2 = backbone.forward_pooled(&x).unwrap();
         let diff = (&out2 - &out1).abs().max().double_value(&[]);
-        assert!(diff > 1e-3, "改写 running_mean 必须改变推理输出（diff={diff}）");
+        assert!(
+            diff > 1e-3,
+            "改写 running_mean 必须改变推理输出（diff={diff}）"
+        );
 
         // eval 确定性：同输入两次前向逐位一致
         let out3 = backbone.forward_pooled(&x).unwrap();
@@ -423,7 +498,11 @@ mod tests {
         backbone.set_train(false);
         let e3 = tch::no_grad(|| backbone.forward_pooled(&x).unwrap());
         let e4 = tch::no_grad(|| backbone.forward_pooled(&x).unwrap());
-        assert_eq!((&e3 - &e4).abs().max().double_value(&[]), 0.0, "回 eval 应恢复确定性");
+        assert_eq!(
+            (&e3 - &e4).abs().max().double_value(&[]),
+            0.0,
+            "回 eval 应恢复确定性"
+        );
         let e3_vs_e1 = tch::no_grad(|| (&e3 - &e1).abs().max().double_value(&[]));
         assert!(
             e3_vs_e1 > 1e-6,
@@ -440,8 +519,14 @@ mod tests {
         tch::no_grad(|| {
             bn.running_mean.copy_(&Tensor::from_slice(&[1.0f32, -2.0]));
             bn.running_var.copy_(&Tensor::from_slice(&[4.0f32, 0.25]));
-            bn.ws.as_mut().unwrap().copy_(&Tensor::from_slice(&[2.0f32, 3.0]));
-            bn.bs.as_mut().unwrap().copy_(&Tensor::from_slice(&[0.5f32, -1.0]));
+            bn.ws
+                .as_mut()
+                .unwrap()
+                .copy_(&Tensor::from_slice(&[2.0f32, 3.0]));
+            bn.bs
+                .as_mut()
+                .unwrap()
+                .copy_(&Tensor::from_slice(&[0.5f32, -1.0]));
         });
         let x = Tensor::randn([2, 2, 3, 3], (Kind::Float, Device::Cpu));
         let y = bn.forward_t(&x, false);

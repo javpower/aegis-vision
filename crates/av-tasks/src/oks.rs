@@ -70,7 +70,12 @@ pub fn oks_scalar(pred: &[[f32; 3]], gt: &[[f32; 3]], scale: f32) -> f32 {
 /// scale/sigma 均 > 0 无除零；G=0 或全不可见由调用方保证不调用
 /// （内部 clamp_min 兜底为损失 1 的常数，反传零梯度不断图）。
 #[cfg(feature = "torch")]
-pub fn oks_loss(pred: &tch::Tensor, gt: &tch::Tensor, vis: &tch::Tensor, scale: &tch::Tensor) -> tch::Tensor {
+pub fn oks_loss(
+    pred: &tch::Tensor,
+    gt: &tch::Tensor,
+    vis: &tch::Tensor,
+    scale: &tch::Tensor,
+) -> tch::Tensor {
     use tch::Kind;
     let size = pred.size();
     let (g, k) = (size[0], size[1]);
@@ -86,7 +91,9 @@ pub fn oks_loss(pred: &tch::Tensor, gt: &tch::Tensor, vis: &tch::Tensor, scale: 
     let d2 = (d.select(2, 0) * d.select(2, 0) + d.select(2, 1) * d.select(2, 1)).reshape([g, k, 1]);
     let e = (&d2 / &denom).neg().exp().reshape([g, k]); // [G,K]（显式回压，防 [G,K,1]×[G,K] 静默广播）
     let num = (e * vis).sum_dim_intlist(&[1i64][..], false, Kind::Float); // [G]
-    let den = vis.sum_dim_intlist(&[1i64][..], false, Kind::Float).clamp_min(1.0);
+    let den = vis
+        .sum_dim_intlist(&[1i64][..], false, Kind::Float)
+        .clamp_min(1.0);
     let oks_mean = (&num / &den).mean(Kind::Float);
     // 损失 = 1 − mean OKS（标量在左的 `1.0 - &t` 会踩 E0282，改写为右乘加）
     oks_mean * -1.0 + 1.0
@@ -109,8 +116,7 @@ mod tests {
         // pred 偏移 (2, 0)：OKS = exp(−4 / (2·32²·0.026²))
         let off = [[12.0f32, 10.0, 2.0]];
         let oks = oks_scalar(&off, &gt, 32.0);
-        let expected =
-            (-(4.0f64) / (2.0 * 32.0 * 32.0 * 0.026 * 0.026)).exp() as f32;
+        let expected = (-(4.0f64) / (2.0 * 32.0 * 32.0 * 0.026 * 0.026)).exp() as f32;
         assert!(
             (oks - expected).abs() < 1e-3,
             "已知偏移 OKS 应为 {expected}，got {oks}"
@@ -160,12 +166,10 @@ mod tests {
         .to_kind(Kind::Float)
         .reshape([2i64, 2, 2])
         .set_requires_grad(true);
-        let gt = Tensor::from_slice(&[
-            10.0f32, 10.0, 50.0, 50.0, 10.0, 10.0, 50.0, 50.0,
-        ])
-        .to_device(Device::Cpu)
-        .to_kind(Kind::Float)
-        .reshape([2i64, 2, 2]);
+        let gt = Tensor::from_slice(&[10.0f32, 10.0, 50.0, 50.0, 10.0, 10.0, 50.0, 50.0])
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Float)
+            .reshape([2i64, 2, 2]);
         let vis = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 1.0])
             .to_device(Device::Cpu)
             .reshape([2i64, 2]);

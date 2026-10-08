@@ -9,7 +9,7 @@ use tch::Tensor;
 
 use av_core::config::BackboneCfg;
 use av_core::error::{AvError, AvResult};
-use av_core::traits::{BaseBackbone, BackboneSpec, FeatureMap, FeaturePyramid, LevelSpec};
+use av_core::traits::{BackboneSpec, BaseBackbone, FeatureMap, FeaturePyramid, LevelSpec};
 
 pub const FAMILY_NAME: &str = "simple-cnn";
 
@@ -75,9 +75,7 @@ impl BaseBackbone for SimpleCnnBackbone {
 
     fn forward_pooled(&self, x: &Tensor) -> AvResult<Tensor> {
         let (_, _, _, d) = self.forward_all(x);
-        let pooled = d
-            .adaptive_avg_pool2d([1, 1])
-            .reshape([-1, self.width * 8]);
+        let pooled = d.adaptive_avg_pool2d([1, 1]).reshape([-1, self.width * 8]);
         Ok(pooled)
     }
 

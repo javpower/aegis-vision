@@ -63,9 +63,7 @@ pub mod wgpu_check {
     pub type WgpuTrainB = Autodiff<Wgpu>;
 
     /// nano 配置装配（编译期验证模块/BN/conv 在 Wgpu 后端可初始化）。
-    pub fn build_model(
-        device: &WgpuDevice,
-    ) -> av_core::AvResult<SegNet<WgpuTrainB>> {
+    pub fn build_model(device: &WgpuDevice) -> av_core::AvResult<SegNet<WgpuTrainB>> {
         SegNet::new(
             &SegNetCfg {
                 width: 0.25,
@@ -80,8 +78,7 @@ pub mod wgpu_check {
     }
 
     /// 装配 AdamW（含梯度范数裁剪），验证优化器对 Wgpu 后端泛型检查。
-    pub fn build_optimizer(
-    ) -> impl burn_optim::Optimizer<SegNet<WgpuTrainB>, WgpuTrainB> {
+    pub fn build_optimizer() -> impl burn_optim::Optimizer<SegNet<WgpuTrainB>, WgpuTrainB> {
         crate::train::make_optimizer(&crate::train::TrainCfg {
             lr: 0.01,
             lr_min: 0.001,

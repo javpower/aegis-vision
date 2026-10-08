@@ -26,9 +26,8 @@ use av_core::error::{AvError, AvResult};
 
 /// 读取 safetensors 文件为命名张量列表（包装 tch 0.17 原生 API，不自解析格式）。
 pub fn read_safetensors_all(path: &Path) -> AvResult<Vec<(String, tch::Tensor)>> {
-    tch::Tensor::read_safetensors(path).map_err(|e| {
-        AvError::train(format!("读取 safetensors {} 失败: {e}", path.display()))
-    })
+    tch::Tensor::read_safetensors(path)
+        .map_err(|e| AvError::train(format!("读取 safetensors {} 失败: {e}", path.display())))
 }
 
 // ---------------------------------------------------------------------------
@@ -64,12 +63,10 @@ pub struct LayerMap {
 impl LayerMap {
     /// 从 TOML 文件加载层映射。
     pub fn from_toml_path(p: &Path) -> AvResult<Self> {
-        let s = std::fs::read_to_string(p).map_err(|e| {
-            AvError::config(format!("读取层映射 {} 失败: {e}", p.display()))
-        })?;
-        toml::from_str(&s).map_err(|e| {
-            AvError::config(format!("层映射 {} 解析失败: {e}", p.display()))
-        })
+        let s = std::fs::read_to_string(p)
+            .map_err(|e| AvError::config(format!("读取层映射 {} 失败: {e}", p.display())))?;
+        toml::from_str(&s)
+            .map_err(|e| AvError::config(format!("层映射 {} 解析失败: {e}", p.display())))
     }
 }
 
@@ -188,7 +185,10 @@ pub fn adapt(
 }
 
 /// 返回 (目标名, 是否转置)；无命中返回 None。
-fn map_name(compiled: &[(Option<regex::Regex>, &LayerMapping)], name: &str) -> Option<(String, bool)> {
+fn map_name(
+    compiled: &[(Option<regex::Regex>, &LayerMapping)],
+    name: &str,
+) -> Option<(String, bool)> {
     for (re, e) in compiled {
         match re {
             Some(re) => {
@@ -337,7 +337,10 @@ mod tests {
                 "model.0.conv.weight".into(),
                 f32_tensor(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]),
             ),
-            ("model.0.conv.bias".into(), f32_tensor(&[7.0, 8.0, 9.0], &[3])),
+            (
+                "model.0.conv.bias".into(),
+                f32_tensor(&[7.0, 8.0, 9.0], &[3]),
+            ),
             ("extra.unknown".into(), f32_tensor(&[42.0], &[1])),
             (
                 "model.1.conv.weight".into(),
@@ -373,7 +376,12 @@ mod tests {
         assert_eq!(report.loaded[0].shape, vec![3, 2]);
 
         // 转置数值手算：t[i][j] = s[j][i]；s = [[1,2,3],[4,5,6]] → t = [[1,4],[2,5],[3,6]]
-        let w = &report.tensors.iter().find(|(n, _)| n == "backbone.c1.weight").unwrap().1;
+        let w = &report
+            .tensors
+            .iter()
+            .find(|(n, _)| n == "backbone.c1.weight")
+            .unwrap()
+            .1;
         assert_eq!(w.size(), vec![3, 2]);
         let expect = [[1.0f32, 4.0], [2.0, 5.0], [3.0, 6.0]];
         for (i, row) in expect.iter().enumerate() {
@@ -474,7 +482,11 @@ mod tests {
     #[test]
     fn report_is_serializable() {
         let sources = vec![("a.w".into(), f32_tensor(&[1.0], &[1]))];
-        let report = adapt(sources, &LayerMap::default(), &[("a.w".to_string(), vec![1])]);
+        let report = adapt(
+            sources,
+            &LayerMap::default(),
+            &[("a.w".to_string(), vec![1])],
+        );
         let s = serde_json::to_string(&report).expect("应可序列化");
         assert!(s.contains("\"loaded\"") && s.contains("\"missing\""));
         assert!(!s.contains("tensors"), "张量数据不应进入序列化输出");
@@ -488,16 +500,18 @@ mod tests {
         assert!(!map.entries.is_empty());
         // 全部条目必须编译为合法正则（否则运行期静默回退字面前缀）
         for e in &map.entries {
-            assert!(
-                regex::Regex::new(&e.from).is_ok(),
-                "非法正则: {}",
-                e.from
-            );
+            assert!(regex::Regex::new(&e.from).is_ok(), "非法正则: {}", e.from);
         }
         let targets = vec![
-            ("backbone.blocks.0.attn.proj.weight".to_string(), vec![384, 384]),
+            (
+                "backbone.blocks.0.attn.proj.weight".to_string(),
+                vec![384, 384],
+            ),
             ("backbone.blocks.11.ls2.gamma".to_string(), vec![384]),
-            ("backbone.patch_embed.proj.weight".to_string(), vec![384, 3, 14, 14]),
+            (
+                "backbone.patch_embed.proj.weight".to_string(),
+                vec![384, 3, 14, 14],
+            ),
             ("backbone.norm.bias".to_string(), vec![384]),
             ("backbone.blocks.5.mlp.fc1.bias".to_string(), vec![1536]),
         ];
@@ -566,8 +580,14 @@ mod tests {
             ("backbone.conv1.weight".to_string(), vec![64, 3, 7, 7]),
             ("backbone.bn1.weight".to_string(), vec![64]),
             ("backbone.bn1.running_mean".to_string(), vec![64]),
-            ("backbone.layer1.0.conv1.weight".to_string(), vec![64, 64, 3, 3]),
-            ("backbone.layer2.0.downsample.1.running_var".to_string(), vec![128]),
+            (
+                "backbone.layer1.0.conv1.weight".to_string(),
+                vec![64, 64, 3, 3],
+            ),
+            (
+                "backbone.layer2.0.downsample.1.running_var".to_string(),
+                vec![128],
+            ),
             ("backbone.layer4.1.bn2.bias".to_string(), vec![512]),
         ];
         let report = adapt(sources, &map, &targets);
@@ -581,8 +601,7 @@ mod tests {
             .iter()
             .any(|u| u.contains("num_batches_tracked")));
         assert_eq!(
-            report.loaded[0].target,
-            "backbone.conv1.weight",
+            report.loaded[0].target, "backbone.conv1.weight",
             "映射后目标名必须与 AV 变量名逐字一致"
         );
     }

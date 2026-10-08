@@ -321,8 +321,8 @@ pub fn load_named(dir: &Path, vars: &mut [(String, tch::Tensor)]) -> AvResult<()
                 AvError::train(format!(
                     "读取张量 {name} 失败: {e}（{} 不存在或损坏？）",
                     f.display()
-                )
-            )})?;
+                ))
+            })?;
             // 结构变更（模型/权重不同构）时给可读错误，而不是让 libtorch 在 copy_ panic
             if loaded.size() != t.size() {
                 return Err(AvError::train(format!(
@@ -348,9 +348,8 @@ pub fn read_all_named(
         .iter()
         .map(|info| {
             let f = dir.join(&info.file);
-            let t = tch::Tensor::load(&f).map_err(|e| {
-                AvError::train(format!("读取张量 {} 失败: {e}", info.name))
-            })?;
+            let t = tch::Tensor::load(&f)
+                .map_err(|e| AvError::train(format!("读取张量 {} 失败: {e}", info.name)))?;
             Ok((info.name.clone(), t))
         })
         .collect()
@@ -359,16 +358,13 @@ pub fn read_all_named(
 #[cfg(all(test, feature = "torch"))]
 mod tests {
     use super::*;
-    use tch::Tensor;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tch::Tensor;
 
     fn temp_dir(tag: &str) -> PathBuf {
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "av-pretrain-test-{tag}-{}-{n}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("av-pretrain-test-{tag}-{}-{n}", std::process::id()))
     }
 
     fn sample_vars() -> Vec<(String, tch::Tensor)> {
@@ -378,7 +374,10 @@ mod tests {
                 "backbone.c1.weight".into(),
                 Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).reshape([2i64, 2]),
             ),
-            ("backbone.c1.bias".into(), Tensor::from_slice(&[0.5f32, -0.5])),
+            (
+                "backbone.c1.bias".into(),
+                Tensor::from_slice(&[0.5f32, -0.5]),
+            ),
             (
                 "head.fc.weight".into(),
                 Tensor::from_slice(&[1i64, 2, 3]).to_kind(Kind::Int),
@@ -436,7 +435,10 @@ mod tests {
         let err = load_named(&dir, &mut wrong).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("backbone.c1.weight"), "got: {msg}");
-        assert!(msg.contains("[3, 2]") && msg.contains("[2, 2]"), "got: {msg}");
+        assert!(
+            msg.contains("[3, 2]") && msg.contains("[2, 2]"),
+            "got: {msg}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -457,9 +459,15 @@ mod tests {
         let err = verify_hashes(&dir, &m).unwrap_err();
         assert_eq!(err.mismatches.len(), 2, "应一次报出全部问题: {err:?}");
         let names: Vec<&str> = err.mismatches.iter().map(|x| x.name.as_str()).collect();
-        assert!(names.contains(&"backbone.c1.bias"), "应定位到被篡改变量: {err}");
+        assert!(
+            names.contains(&"backbone.c1.bias"),
+            "应定位到被篡改变量: {err}"
+        );
         assert!(names.contains(&"head.fc.weight"), "应定位到缺失变量: {err}");
-        assert!(err.to_string().contains("backbone_c1_bias"), "错误信息应含文件路径");
+        assert!(
+            err.to_string().contains("backbone_c1_bias"),
+            "错误信息应含文件路径"
+        );
         // 未篡改变量不在报告中
         assert!(!names.contains(&"backbone.c1.weight"));
 

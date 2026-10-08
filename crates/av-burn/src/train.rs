@@ -9,9 +9,9 @@
 //!   与 torch 的全局范数裁剪的差异记录在 PROGRESS.md 遗留问题）。
 
 use burn_core::module::AutodiffModule;
+use burn_core::tensor::backend::AutodiffBackend;
 use burn_core::tensor::ElementConversion;
 use burn_core::tensor::Tensor;
-use burn_core::tensor::backend::AutodiffBackend;
 use burn_optim::grad_clipping::GradientClippingConfig;
 use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 
@@ -92,7 +92,10 @@ mod tests {
     fn cosine_lr_endpoints_and_monotonic() {
         let c = cfg();
         assert!((cosine_lr(&c, 0) - 0.01).abs() < 1e-12, "step 0 = lr0");
-        assert!((cosine_lr(&c, 100) - 0.001).abs() < 1e-12, "step T = lr_min");
+        assert!(
+            (cosine_lr(&c, 100) - 0.001).abs() < 1e-12,
+            "step T = lr_min"
+        );
         // 中点：½(1+cos(π/2)) = ½ → lr = lr_min + (lr0-lr_min)/2
         let mid = cosine_lr(&c, 50);
         assert!((mid - (0.001 + 0.009 / 2.0)).abs() < 1e-12);

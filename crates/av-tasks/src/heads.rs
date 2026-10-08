@@ -72,7 +72,9 @@ impl LevelHead {
     /// 返回 (cls logits [N,C,H,W], box DFL 分布 [N, 4*REG_MAX, H,W], tθ raw [N,1,H,W])。
     /// 通道布局：边 k 的 bin b 在通道 k*REG_MAX + b；非 OBB 模式 tθ 为 None。
     fn forward(&self, feat: &Tensor) -> (Tensor, Tensor, Option<Tensor>) {
-        let cls = self.cls_out.forward(&self.cls2.forward(&self.cls1.forward(feat).relu()).relu());
+        let cls = self
+            .cls_out
+            .forward(&self.cls2.forward(&self.cls1.forward(feat).relu()).relu());
         let box_hidden = self.box2.forward(&self.box1.forward(feat).relu()).relu();
         let box_dist = self.box_out.forward(&box_hidden);
         let theta = self.theta_out.as_ref().map(|t| t.forward(&box_hidden));

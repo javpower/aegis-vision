@@ -31,11 +31,11 @@ pub mod kfiou;
 /// 实例分割 MaskBranch（PLAN §4.3：原型掩码 + 每实例系数）。
 #[cfg(feature = "torch")]
 pub mod mask;
+#[cfg(feature = "torch")]
+pub mod models;
 /// OKS 关键点相似度：常数表 + 标量评测版 + 可微张量损失版（PLAN §4.4）。
 #[cfg(feature = "torch")]
 pub mod oks;
-#[cfg(feature = "torch")]
-pub mod models;
 
 #[cfg(feature = "torch")]
 pub mod prelude {

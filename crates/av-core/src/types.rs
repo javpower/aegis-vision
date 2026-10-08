@@ -86,7 +86,11 @@ mod tests {
     fn detection_restore_maps_back() {
         let lb = letterbox(1000, 1000, 500, 32);
         // 关键点先做正向映射（模拟预处理），再断言还原回原图坐标
-        let mapped_kp = [80.0 * lb.scale + lb.pad_left, 90.0 * lb.scale + lb.pad_top, 2.0];
+        let mapped_kp = [
+            80.0 * lb.scale + lb.pad_left,
+            90.0 * lb.scale + lb.pad_top,
+            2.0,
+        ];
         let mut det = Detection {
             bbox: lb.map_box(Aabb::new(50.0, 60.0, 150.0, 160.0)),
             score: 0.9,

@@ -145,7 +145,11 @@ mod tests {
     #[test]
     fn kfiou_identical_boxes_is_zero() {
         let a = b5(3.0, 7.0, 10.0, 6.0, 0.3);
-        for tr in [KfTransform::Log1p, KfTransform::Sqrt1p, KfTransform::Identity] {
+        for tr in [
+            KfTransform::Log1p,
+            KfTransform::Sqrt1p,
+            KfTransform::Identity,
+        ] {
             let l = scalar(&kfiou_element(&a, &a, tr));
             assert!(l.abs() < 1e-6, "{tr:?}: got {l}");
         }

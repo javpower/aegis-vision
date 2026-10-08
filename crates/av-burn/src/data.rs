@@ -42,7 +42,10 @@ pub fn rasterize_polygon(points: &[[f32; 2]], w: usize, h: usize) -> Vec<u8> {
         return mask;
     }
     let min_y = points.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
-    let max_y = points.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max);
+    let max_y = points
+        .iter()
+        .map(|p| p[1])
+        .fold(f32::NEG_INFINITY, f32::max);
     for y in 0..h {
         let cy = y as f32 + 0.5;
         if cy < min_y || cy > max_y {
@@ -130,7 +133,10 @@ pub fn load_cocoseg_dir(root: &Path, split: &str, img_size: u32) -> AvResult<Vec
         .collect();
     paths.sort();
     if paths.is_empty() {
-        return Err(AvError::data(format!("数据集图片目录为空: {}", img_dir.display())));
+        return Err(AvError::data(format!(
+            "数据集图片目录为空: {}",
+            img_dir.display()
+        )));
     }
 
     let mw = (img_size / 4) as usize;
@@ -153,8 +159,10 @@ pub fn load_cocoseg_dir(root: &Path, split: &str, img_size: u32) -> AvResult<Vec
         let mut labels = Vec::new();
         if lbl_path.exists() {
             for line in std::fs::read_to_string(&lbl_path)?.lines() {
-                let vals: Vec<f32> =
-                    line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                let vals: Vec<f32> = line
+                    .split_whitespace()
+                    .filter_map(|t| t.parse().ok())
+                    .collect();
                 // 多边形 = 1 类别 + 2n 坐标，n >= 3 → 至少 7 个值；5 值行为纯检测框，跳过
                 if vals.len() < 7 {
                     continue;
@@ -177,7 +185,12 @@ pub fn load_cocoseg_dir(root: &Path, split: &str, img_size: u32) -> AvResult<Vec
                 labels.push(vals[0] as u32);
             }
         }
-        out.push(SegImageSample { pixels, masks, labels, img_size });
+        out.push(SegImageSample {
+            pixels,
+            masks,
+            labels,
+            img_size,
+        });
     }
     Ok(out)
 }
@@ -216,13 +229,19 @@ mod tests {
         assert_eq!(mask[flat(1, 2)], 1);
         assert_eq!(mask[flat(2, 2)], 0, "右边界像素中心不落入");
         assert_eq!(mask[flat(1, 3)], 0, "尖端行窄于 1 像素，中心采样为空");
-        assert_eq!(mask.iter().map(|&v| v as usize).sum::<usize>(), 3, "恰好 3 像素");
+        assert_eq!(
+            mask.iter().map(|&v| v as usize).sum::<usize>(),
+            3,
+            "恰好 3 像素"
+        );
     }
 
     /// 退化输入：点数 < 3 返回全零；画布外多边形返回全零。
     #[test]
     fn rasterize_polygon_degenerate_inputs() {
-        assert!(rasterize_polygon(&[[0.0, 0.0], [1.0, 1.0]], 4, 4).iter().all(|&v| v == 0));
+        assert!(rasterize_polygon(&[[0.0, 0.0], [1.0, 1.0]], 4, 4)
+            .iter()
+            .all(|&v| v == 0));
         let outside = [[100.0, 100.0], [120.0, 100.0], [110.0, 120.0]];
         assert!(rasterize_polygon(&outside, 4, 4).iter().all(|&v| v == 0));
     }
@@ -245,7 +264,10 @@ mod tests {
         // G 通道：内容区为 0（红色），补边区为 114/255（灰）
         let g_plane = &pixels[n..2 * n];
         assert!((g_plane[16 * 32 + 16] - 0.0).abs() < 1e-6, "内容区 G=0");
-        assert!((g_plane[0] - 114.0 / 255.0).abs() < 1e-6, "补边区 G=114/255");
+        assert!(
+            (g_plane[0] - 114.0 / 255.0).abs() < 1e-6,
+            "补边区 G=114/255"
+        );
         // B 通道同 G（灰与红均无蓝差异？灰含蓝：同 G 断言）
         let b_plane = &pixels[2 * n..3 * n];
         assert!((b_plane[16 * 32 + 16] - 0.0).abs() < 1e-6, "内容区 B=0");

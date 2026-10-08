@@ -14,8 +14,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::extract::{Path as AxPath, State};
-use axum::response::Html;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::Html;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::Value;
@@ -204,7 +204,9 @@ es.onerror=()=>status('SSE 断开——浏览器将自动重连…');
 }
 
 async fn api_runs(State(ctx): State<Ctx>) -> Json<Value> {
-    Json(serde_json::json!({ "runs": list_runs(&ctx).into_iter().map(|(id, _)| id).collect::<Vec<_>>() }))
+    Json(
+        serde_json::json!({ "runs": list_runs(&ctx).into_iter().map(|(id, _)| id).collect::<Vec<_>>() }),
+    )
 }
 
 // ---------------------------------------------------------------------------

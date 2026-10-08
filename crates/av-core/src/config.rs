@@ -944,3 +944,55 @@ mod tests {
         assert!(!cfg.pretrain.freeze_backbone);
     }
 }
+
+/// 解析 Ultralytics 标准 `data.yaml`（path/train/val/names 四键）：
+/// 返回 (数据集根, 训练图目录, 验证图目录, 类别名)。names 支持
+/// `['A', 'B']` 与 `[A, B]` 两种写法。解析失败/缺键报数据错误——
+/// 显式失败优于静默错位。
+pub fn parse_data_yaml(
+    path: &std::path::Path,
+) -> AvResult<(std::path::PathBuf, String, String, Vec<String>)> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| AvError::data(format!("读 data.yaml 失败 {}: {e}", path.display())))?;
+    let mut kv: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (k, v) = line
+            .split_once(':')
+            .ok_or_else(|| AvError::data(format!("data.yaml 行缺少冒号: {line}")))?;
+        kv.insert(k.trim().to_string(), v.trim().to_string());
+    }
+    let need = |k: &str| -> AvResult<String> {
+        kv.get(k)
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| AvError::data(format!("data.yaml 缺少字段: {k}")))
+    };
+    let root = std::path::PathBuf::from(need("path")?);
+    let train = need("train")?;
+    let val = need("val")?;
+    let names_raw = need("names")?;
+    let names: Vec<String> = names_raw
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Err(AvError::data("data.yaml names 为空"));
+    }
+    // 相对 path 时 train/val 相对 root 解析；绝对（含盘符）原样保留
+    let join = |p: &str| -> std::path::PathBuf {
+        let pp = std::path::Path::new(p);
+        if pp.is_absolute() {
+            pp.to_path_buf()
+        } else {
+            root.join(pp)
+        }
+    };
+    Ok((root, train, val, names))
+}

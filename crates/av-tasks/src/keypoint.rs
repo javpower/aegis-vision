@@ -69,7 +69,8 @@ impl KeypointHead {
     /// 入参 stride 8 特征 [N, in_c, H/8, W/8] → [N, 5+3K, H/8, W/8] 原始输出
     /// （通道布局见模块文档；解码/损失在 [`crate::models::KeypointModel`]）。
     pub fn forward(&self, f8: &Tensor) -> Tensor {
-        self.out.forward(&self.c2.forward(&self.c1.forward(f8).relu()).relu())
+        self.out
+            .forward(&self.c2.forward(&self.c1.forward(f8).relu()).relu())
     }
 }
 

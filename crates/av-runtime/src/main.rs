@@ -43,11 +43,27 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
-    /// 训练（引擎 M1/M2 落地；当前支持 --dry-run 校验配置）
+    /// 训练：给 --data 即一条命令训练（数据目录或 Ultralytics data.yaml，
+    /// 类数自动探测，其余超参走内置默认）；给 -c 则按配置文件训练
     Train {
-        /// TOML 配置文件
+        /// TOML 配置文件（与 --data 二选一）
         #[arg(short, long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
+        /// 数据集：目录（images/labels 布局）或 data.yaml
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// 任务类型（--data 模式；当前 detect）
+        #[arg(long, default_value = "detect")]
+        task: String,
+        /// 输入边长（--data 模式）
+        #[arg(long, default_value_t = 640)]
+        imgsz: u32,
+        /// 训练轮数（--data 模式）
+        #[arg(long, default_value_t = 100)]
+        epochs: u32,
+        /// 批大小（--data 模式；0 = 按设备自动：cuda 8 / cpu 4）
+        #[arg(long, default_value_t = 0)]
+        batch: u32,
         /// 从 runs/<run_id>/last.pt 续训（M7 生效）
         #[arg(long)]
         resume: bool,
@@ -152,30 +168,24 @@ fn main() -> Result<()> {
         } => cmd_init(task, data.as_deref(), out.as_deref(), classes),
         Command::Train {
             config,
+            data,
+            task,
+            imgsz,
+            epochs,
+            batch,
             resume,
             overrides,
             dry_run,
-        } => cmd_train(&config, resume, &overrides, dry_run),
-        Command::Infer {
-            weights,
-            config,
-            input,
-            conf,
-            iou,
-            slice,
-            slice_window,
-            slice_overlap,
-            save_viz,
-        } => cmd_infer(
-            &weights,
+        } => cmd_train(
             config.as_deref(),
-            &input,
-            conf,
-            iou,
-            slice,
-            slice_window,
-            slice_overlap,
-            save_viz.as_deref(),
+            data.as_deref(),
+            &task,
+            imgsz,
+            epochs,
+            batch,
+            resume,
+            &overrides,
+            dry_run,
         ),
         Command::Pack { src, out } => {
             let (count, bytes) =
@@ -217,8 +227,23 @@ fn milestone_of(cmd: &Command) -> &'static str {
     }
 }
 
-fn cmd_train(config_path: &Path, resume: bool, overrides: &[String], dry_run: bool) -> Result<()> {
-    let mut cfg = load_config(config_path)?;
+#[cfg(feature = "torch")]
+fn cmd_train(
+    config_path: Option<&Path>,
+    data: Option<&Path>,
+    task: &str,
+    imgsz: u32,
+    epochs: u32,
+    batch: u32,
+    resume: bool,
+    overrides: &[String],
+    dry_run: bool,
+) -> Result<()> {
+    let mut cfg = match (config_path, data) {
+        (Some(p), _) => load_config(p)?,
+        (None, Some(d)) => synthesize_config(d, task, imgsz, epochs, batch)?,
+        (None, None) => bail!("--data 与 -c 至少提供一个（--data 走一条命令训练）"),
+    };
     apply_overrides(&mut cfg, overrides)?;
     // 训练前的数据侧预检（CLI 层，库不改）：把「目录不存在 / 类数不匹配」拦在
     // 整集预解码之前，错误信息带下一步动作。
@@ -229,6 +254,147 @@ fn cmd_train(config_path: &Path, resume: bool, overrides: &[String], dry_run: bo
         return Ok(());
     }
     run_train(&cfg, resume)
+}
+
+/// 一条命令训练的配置合成：目录或 data.yaml → RunConfig。
+/// 默认装配 = csp-elan（YOLOv8n 同构）+ TAL 检测头 + mosaic/flip/hsv 增强 +
+/// AdamW/余弦退火 + AMP + 内容贴片缓存；类数从标注自动探测。
+#[cfg(feature = "torch")]
+fn synthesize_config(
+    data: &Path,
+    task: &str,
+    imgsz: u32,
+    epochs: u32,
+    batch: u32,
+) -> Result<RunConfig> {
+    use av_core::config::{
+        parse_data_yaml, AugmentCfg, DataConfig, DataPipeline, DataSourceCfg, DataSources,
+        ModelConfig, OptimizerCfg, SchedulerCfg, SourceTaskCfg, TaskCfg, TaskKind, TrainConfig,
+    };
+    if task != "detect" {
+        bail!("--data 一条命令训练当前支持 detect（其余任务用 -c 配置文件）");
+    }
+    // run_id 取数据集目录名（data.yaml 时取其父目录，比文件名 "data" 更有辨识度）
+    let run_id = data
+        .parent()
+        .and_then(|p| p.file_name())
+        .or_else(|| data.file_stem())
+        .and_then(|s| s.to_str())
+        .unwrap_or("yolo")
+        .to_string();
+    let lower = data
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let (train_src, val_src, num_classes) = if matches!(lower.as_str(), "yaml" | "yml") {
+        let (root, train, val, names) = parse_data_yaml(data)?;
+        let source = |split: String, aug: bool| DataSourceCfg {
+            dir: Some(root.clone()),
+            split: Some(split),
+            tasks: if aug {
+                vec![SourceTaskCfg {
+                    kind: TaskKind::Detect,
+                    format: Some("yolo".into()),
+                    augment: AugmentCfg {
+                        mosaic: 1.0,
+                        flip: 0.5,
+                        hsv: [0.1, 0.1, 0.1],
+                        scale_jitter: Some([0.9, 1.1]),
+                        close_last_epochs: 15,
+                        ..AugmentCfg::default()
+                    },
+                }]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        };
+        (source(train, true), source(val, false), names.len() as u32)
+    } else {
+        let n = scan_max_class_id(&data.join("labels/train"))
+            .or_else(|| scan_max_class_id(&data.join("labels")))
+            .map(|m| m + 1)
+            .ok_or_else(|| anyhow::anyhow!("未在 {} 下找到标注（labels/train）", data.display()))?;
+        let source = |aug: bool| DataSourceCfg {
+            dir: Some(data.to_path_buf()),
+            tasks: if aug {
+                vec![SourceTaskCfg {
+                    kind: TaskKind::Detect,
+                    format: Some("yolo".into()),
+                    augment: AugmentCfg {
+                        mosaic: 1.0,
+                        flip: 0.5,
+                        hsv: [0.1, 0.1, 0.1],
+                        scale_jitter: Some([0.9, 1.1]),
+                        close_last_epochs: 15,
+                        ..AugmentCfg::default()
+                    },
+                }]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        };
+        (source(true), source(false), n)
+    };
+    let batch = if batch == 0 {
+        if tch::Device::cuda_if_available() == tch::Device::Cpu {
+            4
+        } else {
+            8
+        }
+    } else {
+        batch
+    };
+    Ok(RunConfig {
+        run_id: format!("av-{run_id}"),
+        model: ModelConfig {
+            tasks: vec![TaskCfg::Detect(av_core::config::DetectCfg {
+                num_classes: num_classes as usize,
+                img_size: imgsz,
+                ..Default::default()
+            })],
+            ..Default::default()
+        },
+        data: DataConfig {
+            pipeline: DataPipeline::Dir,
+            sources: DataSources {
+                train: train_src,
+                val: val_src,
+            },
+            ..Default::default()
+        },
+        train: TrainConfig {
+            epochs,
+            batch_size: batch,
+            optimizer: OptimizerCfg {
+                lr: 1e-3,
+                ..OptimizerCfg::default()
+            },
+            scheduler: SchedulerCfg::default(),
+            warmup_epochs: 5.0,
+            amp: true,
+            grad_clip: 10.0,
+            ..TrainConfig::default()
+        },
+        ..RunConfig::default()
+    })
+}
+
+#[cfg(not(feature = "torch"))]
+fn cmd_train(
+    _config_path: Option<&Path>,
+    _data: Option<&Path>,
+    _task: &str,
+    _imgsz: u32,
+    _epochs: u32,
+    _batch: u32,
+    _resume: bool,
+    _overrides: &[String],
+    _dry_run: bool,
+) -> Result<()> {
+    bail!("本二进制未启用 torch feature，无法训练")
 }
 
 #[cfg(feature = "torch")]

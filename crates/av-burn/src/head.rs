@@ -20,7 +20,7 @@
 use burn_core as burn;
 use burn_core::module::Module;
 use burn_core::tensor::backend::Backend;
-use burn_core::tensor::{Tensor, activation::relu};
+use burn_core::tensor::{activation::relu, Tensor};
 use burn_nn::modules::conv::{Conv2d, Conv2dConfig};
 use burn_nn::modules::interpolate::{Interpolate2d, Interpolate2dConfig, InterpolateMode};
 use burn_nn::PaddingConfig2d;

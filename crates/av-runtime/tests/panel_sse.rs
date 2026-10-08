@@ -167,6 +167,15 @@ async fn api_runs_lists_in_progress_runs() {
     std::fs::write(run_dir.join("config.snapshot.toml"), "# snapshot").unwrap();
 
     let addr = spawn_server(runs).await;
-    let text = http_roundtrip(addr, "/api/runs", |t| t.contains('}'), Duration::from_secs(10)).await;
-    assert!(text.contains("run-wip"), "训练中的 run 必须出现在列表: {text}");
+    let text = http_roundtrip(
+        addr,
+        "/api/runs",
+        |t| t.contains('}'),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        text.contains("run-wip"),
+        "训练中的 run 必须出现在列表: {text}"
+    );
 }

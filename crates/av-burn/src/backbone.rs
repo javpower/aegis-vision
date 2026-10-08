@@ -30,7 +30,7 @@ use av_core::error::{AvError, AvResult};
 use burn_core as burn;
 use burn_core::module::Module;
 use burn_core::tensor::backend::Backend;
-use burn_core::tensor::{Tensor, activation::silu, module::max_pool2d};
+use burn_core::tensor::{activation::silu, module::max_pool2d, Tensor};
 use burn_nn::modules::conv::{Conv2d, Conv2dConfig};
 use burn_nn::modules::norm::{BatchNorm, BatchNormConfig};
 use burn_nn::PaddingConfig2d;
@@ -130,7 +130,9 @@ impl<B: Backend> C2f<B> {
         Self {
             cv1: ConvBnSilu::new(c1, 2 * hidden, 1, 1, device),
             cv2: ConvBnSilu::new((2 + n) * hidden, c2, 1, 1, device),
-            m: (0..n).map(|_| Bottleneck::new(hidden, shortcut, device)).collect(),
+            m: (0..n)
+                .map(|_| Bottleneck::new(hidden, shortcut, device))
+                .collect(),
         }
     }
 
@@ -217,37 +219,41 @@ impl<B: Backend> CspElanBackbone<B> {
                 cfg.width, cfg.depth
             )));
         }
-        let ch: Vec<usize> =
-            BASE_CHANNELS.iter().map(|&c| scale_channels(c, cfg.width)).collect();
-        let repeats: Vec<usize> =
-            BASE_REPEATS.iter().map(|&n| scale_repeats(n, cfg.depth)).collect();
+        let ch: Vec<usize> = BASE_CHANNELS
+            .iter()
+            .map(|&c| scale_channels(c, cfg.width))
+            .collect();
+        let repeats: Vec<usize> = BASE_REPEATS
+            .iter()
+            .map(|&n| scale_repeats(n, cfg.depth))
+            .collect();
         let conv = |i: usize, o: usize, k: usize, s: usize| {
             CspLayer::Conv(ConvBnSilu::new(i, o, k, s, device))
         };
-        let c2f = |ci: usize, co: usize, n: usize| {
-            CspLayer::C2f(C2f::new(ci, co, n, true, device))
-        };
+        let c2f = |ci: usize, co: usize, n: usize| CspLayer::C2f(C2f::new(ci, co, n, true, device));
         // 层 0-9（ultralytics yolov8.yaml backbone 列），索引即层号。
         let layers = vec![
-            conv(3, ch[0], 3, 2),         // 0：P1/2
-            conv(ch[0], ch[1], 3, 2),     // 1：P2/4
-            c2f(ch[1], ch[1], repeats[0]), // 2
-            conv(ch[1], ch[2], 3, 2),     // 3：P3/8
-            c2f(ch[2], ch[2], repeats[1]), // 4 → P3 抽头
-            conv(ch[2], ch[3], 3, 2),     // 5：P4/16
-            c2f(ch[3], ch[3], repeats[2]), // 6 → P4 抽头
-            conv(ch[3], ch[4], 3, 2),     // 7：P5/32
-            c2f(ch[4], ch[4], repeats[3]), // 8
+            conv(3, ch[0], 3, 2),                            // 0：P1/2
+            conv(ch[0], ch[1], 3, 2),                        // 1：P2/4
+            c2f(ch[1], ch[1], repeats[0]),                   // 2
+            conv(ch[1], ch[2], 3, 2),                        // 3：P3/8
+            c2f(ch[2], ch[2], repeats[1]),                   // 4 → P3 抽头
+            conv(ch[2], ch[3], 3, 2),                        // 5：P4/16
+            c2f(ch[3], ch[3], repeats[2]),                   // 6 → P4 抽头
+            conv(ch[3], ch[4], 3, 2),                        // 7：P5/32
+            c2f(ch[4], ch[4], repeats[3]),                   // 8
             CspLayer::Sppf(Sppf::new(ch[4], ch[4], device)), // 9 → P5 抽头
         ];
-        Ok(Self { layers, p3_ch: ch[2], p4_ch: ch[3], p5_ch: ch[4] })
+        Ok(Self {
+            layers,
+            p3_ch: ch[2],
+            p4_ch: ch[3],
+            p5_ch: ch[4],
+        })
     }
 
     /// 全层前向，返回 (P3, P4, P5)。
-    pub fn forward_features(
-        &self,
-        x: Tensor<B, 4>,
-    ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
+    pub fn forward_features(&self, x: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
         let mut cur = x;
         let mut p3 = None;
         let mut p4 = None;
@@ -280,7 +286,10 @@ mod tests {
     use crate::NdArrayB;
 
     fn nano() -> BackboneCfg {
-        BackboneCfg { width: 0.25, depth: 0.33 }
+        BackboneCfg {
+            width: 0.25,
+            depth: 0.33,
+        }
     }
 
     /// 通道缩放手算对照：ultralytics make_divisible(ch × width, 8)，下限 8。
@@ -312,7 +321,10 @@ mod tests {
         let device = burn_ndarray::NdArrayDevice::Cpu;
         let b = CspElanBackbone::<NdArrayB>::new(&nano(), &device).unwrap();
         assert_eq!(b.pyramid_channels(), (64, 128, 256));
-        let bad = BackboneCfg { width: 0.0, depth: 0.33 };
+        let bad = BackboneCfg {
+            width: 0.0,
+            depth: 0.33,
+        };
         assert!(CspElanBackbone::<NdArrayB>::new(&bad, &device).is_err());
     }
 
