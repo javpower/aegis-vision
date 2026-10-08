@@ -64,8 +64,7 @@ pub fn iou_xyxy(a: [f32; 4], b: [f32; 4]) -> f32 {
     let iw = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
     let ih = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
     let inter = iw * ih;
-    let union =
-        (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter;
+    let union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter;
     if union <= 0.0 {
         0.0
     } else {
@@ -101,16 +100,23 @@ pub fn assign_single_image(
     // top-k 不超过候选 anchor（cell）总数上限
     let k = cfg.topk.clamp(1, n_cells);
     let mut best: Vec<Option<PosCell>> = vec![None; n_cells];
+    // 候选缓冲跨 gt 复用（640 输入下每 gt 扫 8 千 cell，逐 gt 重新分配是纯浪费）
+    let mut cand: Vec<(f32, usize)> = Vec::new();
 
     for (g, gt) in gt_boxes.iter().enumerate() {
         let scores = gt_scores.get(g).copied().unwrap_or(&[]);
         let score = |c: usize| scores.get(c).copied().unwrap_or(0.0);
 
-        // 候选过滤：中心在 gt 内 且 预测框与 gt 有正重叠
-        let mut cand: Vec<(f32, usize)> = Vec::new();
+        // 候选过滤：中心在 gt 内 且 预测框与 gt 有正重叠。
+        // 先跑 4 次比较的 center_in_box（绝大多数 cell 直接淘汰），
+        // 再算贵的 IoU——顺序交换语义不变，每步省数千次多边形面积乘加。
+        cand.clear();
         for (c, pb) in pred_boxes.iter().enumerate() {
+            if !center_in_box(cell_centers[c], *gt) {
+                continue;
+            }
             let iou = iou_xyxy(*pb, *gt);
-            if iou <= 0.0 || !center_in_box(cell_centers[c], *gt) {
+            if iou <= 0.0 {
                 continue;
             }
             let m = alignment_metric(score(c), iou, cfg.alpha, cfg.beta);
@@ -142,7 +148,7 @@ pub fn assign_single_image(
         });
         cand.truncate(k);
         let max_m = cand.first().map(|(m, _)| *m).unwrap_or(0.0);
-        for (m, c) in cand {
+        for &(m, c) in &cand {
             let w = if max_m > 1e-12 {
                 (m / max_m).clamp(0.0, 1.0)
             } else {
@@ -202,8 +208,16 @@ mod tests {
     #[test]
     fn iou_hand_computed() {
         // inter=1, union=4+4-1=7
-        assert!(approx(iou_xyxy([0., 0., 2., 2.], [1., 1., 3., 3.]), 1.0 / 7.0, 1e-6));
-        assert!(approx(iou_xyxy([0., 0., 4., 4.], [0., 0., 4., 4.]), 1.0, 1e-6));
+        assert!(approx(
+            iou_xyxy([0., 0., 2., 2.], [1., 1., 3., 3.]),
+            1.0 / 7.0,
+            1e-6
+        ));
+        assert!(approx(
+            iou_xyxy([0., 0., 4., 4.], [0., 0., 4., 4.]),
+            1.0,
+            1e-6
+        ));
         assert_eq!(iou_xyxy([0., 0., 1., 1.], [2., 2., 3., 3.]), 0.0);
         // 退化框
         assert_eq!(iou_xyxy([0., 0., 0., 0.], [0., 0., 4., 4.]), 0.0);
@@ -216,14 +230,14 @@ mod tests {
         let centers = grid8();
         let gt = [[8.0f32, 0.0, 24.0, 16.0]];
         let pred = [
-            [8., 0., 24., 16.], // c0：IoU=1 但中心在外 → 排除
-            [8., 0., 24., 16.], // c1：IoU=1
-            [8., 0., 24., 16.], // c2：IoU=1
-            [8., 0., 24., 16.], // c3：中心在外 → 排除
-            [8., 0., 24., 16.], // c4：中心在外 → 排除
+            [8., 0., 24., 16.],  // c0：IoU=1 但中心在外 → 排除
+            [8., 0., 24., 16.],  // c1：IoU=1
+            [8., 0., 24., 16.],  // c2：IoU=1
+            [8., 0., 24., 16.],  // c3：中心在外 → 排除
+            [8., 0., 24., 16.],  // c4：中心在外 → 排除
             [12., 4., 20., 12.], // c5：IoU=64/256=0.25
             [12., 4., 20., 12.], // c6：IoU=0.25
-            [8., 0., 24., 16.], // c7：中心在外 → 排除
+            [8., 0., 24., 16.],  // c7：中心在外 → 排除
         ];
         let scores: &[&[f32]] = &[&[0.99, 0.9, 0.8, 0.0, 0.0, 0.9, 0.8, 0.0]];
 
@@ -284,8 +298,8 @@ mod tests {
         let gts = [[8.0f32, 0.0, 24.0, 16.0], [16.0, 8.0, 32.0, 24.0]];
         let pred = [
             [0., 0., 1., 1.],
-            [8., 0., 24., 16.],  // c1：A 内，IoU_A=1
-            [8., 0., 24., 16.],  // c2：A 内，IoU_A=1
+            [8., 0., 24., 16.], // c1：A 内，IoU_A=1
+            [8., 0., 24., 16.], // c2：A 内，IoU_A=1
             [0., 0., 1., 1.],
             [0., 0., 1., 1.],
             [12., 4., 20., 12.], // c5：A 内，IoU_A=0.25

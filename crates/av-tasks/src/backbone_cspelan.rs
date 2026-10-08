@@ -48,7 +48,7 @@ use tch::Tensor;
 
 use av_core::config::BackboneCfg;
 use av_core::error::{AvError, AvResult};
-use av_core::traits::{BaseBackbone, BackboneSpec, FeatureMap, FeaturePyramid, LevelSpec};
+use av_core::traits::{BackboneSpec, BaseBackbone, FeatureMap, FeaturePyramid, LevelSpec};
 
 /// 注册表族名（av-tasks::register_builtin 登记；config.rs 默认值即此）。
 pub const FAMILY_NAME: &str = "csp-elan";
@@ -87,7 +87,7 @@ impl ConvBnSilu {
                 k,
                 nn::ConvConfig {
                     stride,
-                    padding: (k / 2) as i64,
+                    padding: k / 2,
                     bias: false,
                     ..Default::default()
                 },
@@ -95,15 +95,16 @@ impl ConvBnSilu {
             bn: nn::batch_norm2d(
                 p / "bn",
                 out_ch,
-                nn::BatchNormConfig { eps: 1e-3, ..Default::default() },
+                nn::BatchNormConfig {
+                    eps: 1e-3,
+                    ..Default::default()
+                },
             ),
         }
     }
 
     fn forward(&self, x: &Tensor, train: bool) -> Tensor {
-        self.bn
-            .forward_t(&self.conv.forward(x), train)
-            .silu()
+        self.bn.forward_t(&self.conv.forward(x), train).silu()
     }
 }
 
@@ -232,24 +233,29 @@ impl CspElanBackbone {
                 cfg.width, cfg.depth
             )));
         }
-        let ch: Vec<i64> = BASE_CHANNELS.iter().map(|&c| scale_channels(c, cfg.width)).collect();
-        let repeats: Vec<i64> = BASE_REPEATS.iter().map(|&n| scale_repeats(n, cfg.depth)).collect();
+        let ch: Vec<i64> = BASE_CHANNELS
+            .iter()
+            .map(|&c| scale_channels(c, cfg.width))
+            .collect();
+        let repeats: Vec<i64> = BASE_REPEATS
+            .iter()
+            .map(|&n| scale_repeats(n, cfg.depth))
+            .collect();
         let conv = |pp: nn::Path, i: i64, o: i64, k: i64, s: i64| {
             CspLayer::Conv(ConvBnSilu::new(&pp, i, o, k, s))
         };
         // 层 0-9（ultralytics yolov8.yaml backbone 列），索引即变量名数字。
-        let c2f = |pp: nn::Path, ci: i64, co: i64, n: i64| {
-            CspLayer::C2f(C2f::new(&pp, ci, co, n, true))
-        };
+        let c2f =
+            |pp: nn::Path, ci: i64, co: i64, n: i64| CspLayer::C2f(C2f::new(&pp, ci, co, n, true));
         let layers = vec![
-            conv(p / "0", 3, ch[0], 3, 2),                              // P1/2
-            conv(p / "1", ch[0], ch[1], 3, 2),                          // P2/4
+            conv(p / "0", 3, ch[0], 3, 2),     // P1/2
+            conv(p / "1", ch[0], ch[1], 3, 2), // P2/4
             c2f(p / "2", ch[1], ch[1], repeats[0]),
-            conv(p / "3", ch[1], ch[2], 3, 2),                          // P3/8
+            conv(p / "3", ch[1], ch[2], 3, 2), // P3/8
             c2f(p / "4", ch[2], ch[2], repeats[1]),
-            conv(p / "5", ch[2], ch[3], 3, 2),                          // P4/16
+            conv(p / "5", ch[2], ch[3], 3, 2), // P4/16
             c2f(p / "6", ch[3], ch[3], repeats[2]),
-            conv(p / "7", ch[3], ch[4], 3, 2),                          // P5/32
+            conv(p / "7", ch[3], ch[4], 3, 2), // P5/32
             c2f(p / "8", ch[4], ch[4], repeats[3]),
             CspLayer::Sppf(Sppf::new(&(p / "9"), ch[4], ch[4])),
         ];
@@ -325,9 +331,18 @@ impl BaseBackbone for CspElanBackbone {
     fn spec(&self) -> BackboneSpec {
         BackboneSpec {
             levels: vec![
-                LevelSpec { stride: 8, channels: self.p3_ch as usize },
-                LevelSpec { stride: 16, channels: self.p4_ch as usize },
-                LevelSpec { stride: 32, channels: self.p5_ch as usize },
+                LevelSpec {
+                    stride: 8,
+                    channels: self.p3_ch as usize,
+                },
+                LevelSpec {
+                    stride: 16,
+                    channels: self.p4_ch as usize,
+                },
+                LevelSpec {
+                    stride: 32,
+                    channels: self.p5_ch as usize,
+                },
             ],
         }
     }
@@ -342,7 +357,11 @@ mod tests {
     fn nano(vs: &nn::VarStore) -> CspElanBackbone {
         CspElanBackbone::new(
             &(vs.root() / "backbone"),
-            &BackboneCfg { width: 0.25, depth: 0.33, ..Default::default() },
+            &BackboneCfg {
+                width: 0.25,
+                depth: 0.33,
+                ..Default::default()
+            },
         )
         .expect("csp-elan nano 装配应成功")
     }
@@ -357,7 +376,11 @@ mod tests {
         assert_eq!(b.stride_channels(16).unwrap(), 128);
         assert_eq!(b.stride_channels(32).unwrap(), 256);
         assert!(b.stride_channels(4).is_err(), "P2（stride 4）不在金字塔");
-        let bad = BackboneCfg { width: 0.0, depth: 0.33, ..Default::default() };
+        let bad = BackboneCfg {
+            width: 0.0,
+            depth: 0.33,
+            ..Default::default()
+        };
         assert!(CspElanBackbone::new(&(vs.root() / "backbone"), &bad).is_err());
     }
 
@@ -379,7 +402,13 @@ mod tests {
         // spec 与实际一致
         let spec = b.spec();
         assert_eq!(spec.levels.len(), 3);
-        assert_eq!(spec.levels[2], LevelSpec { stride: 32, channels: 256 });
+        assert_eq!(
+            spec.levels[2],
+            LevelSpec {
+                stride: 32,
+                channels: 256
+            }
+        );
     }
 
     /// 变量名与 ultralytics 逐字对齐（`backbone.` 前缀 + 同名层）——预训练

@@ -41,6 +41,7 @@
 
 use std::cell::RefCell;
 
+use rayon::prelude::*;
 use tch::nn;
 use tch::{Device, Kind, Tensor};
 
@@ -53,19 +54,23 @@ use av_core::types::{nms, Detection};
 
 use crate::assigner::{self, TalConfig};
 use crate::backbone::SimpleCnnBackbone;
-use crate::backbone_dino::{DinoV2Backbone, FAMILY_NAME as DINO_FAMILY};
 use crate::backbone_cspelan::{CspElanBackbone, FAMILY_NAME as CSP_FAMILY};
-use crate::backbone_resnet::{FAMILY_NAME as RESNET_FAMILY, ResNetBackbone};
+use crate::backbone_dino::{DinoV2Backbone, FAMILY_NAME as DINO_FAMILY};
+use crate::backbone_resnet::{ResNetBackbone, FAMILY_NAME as RESNET_FAMILY};
 use crate::heads::{ClassifyHead, DetectHead, REG_MAX};
 use crate::keypoint::KeypointHead;
 use crate::kfiou::{kfiou_element, KfTransform};
-use crate::mask::{dice_loss, mask_iou, MaskBranch};
+#[cfg(test)]
+use crate::mask::mask_iou;
+use crate::mask::{dice_loss, MaskBranch, MaskSummary};
 use crate::oks::sigma_table;
 use crate::rot_nms::{envelope_half_extents, rotate_nms, RotNmsMetric};
 
 /// 训练批数据（v0.1 合成数据源 / YOLO 目录数据源产出）。
 pub enum TrainBatch {
-    Classify { labels: Tensor },
+    Classify {
+        labels: Tensor,
+    },
     /// 每图若干绝对像素 xyxy 框 + 对应类别（真实数据一图多框）
     Detect {
         boxes: Vec<Vec<[f32; 4]>>,
@@ -104,6 +109,9 @@ pub struct SegInstance {
 }
 
 /// 推理产物。
+// Keypoint 变体复用 Vec<Vec<Detection>>；Seg 变体含逐实例掩码向量，尺寸差异
+// 来自任务语义本身，推理期单次构造
+#[allow(clippy::large_enum_variant)]
 pub enum PredictOutput {
     Classify {
         labels: Vec<u32>,
@@ -121,6 +129,9 @@ pub enum PredictOutput {
     },
 }
 
+// 任务模型尺寸差异大（SegModel 含原型分支），装箱会波及全部 match 调用点——
+// 该枚举训练/推理各构造一次，尺寸差异无热路径影响
+#[allow(clippy::large_enum_variant)]
 pub enum TaskModel {
     Classify(ClassifyModel),
     Detect(DetectModel),
@@ -212,6 +223,8 @@ fn build_classify_backbone(
 /// 输出 stride 4/8/16 三级金字塔，[`DetectHead`] 的每层输入通道由
 /// [`DetectBackbone::stride_channels`] 给出（resnet18 = 64/128/256，即
 /// layer1/2/3 真实宽度）。同 [`ClassifyBackbone`]：小枚举直取，不走 dyn。
+// 变体尺寸差异来自骨干宽度本身（CspElan ≫ SimpleCnn），建模期单次构造
+#[allow(clippy::large_enum_variant)]
 enum DetectBackbone {
     SimpleCnn(SimpleCnnBackbone),
     ResNet18(ResNetBackbone),
@@ -249,7 +262,10 @@ impl DetectBackbone {
 /// 检测骨干装配：按 `backbone.family` 分发（"resnet18" → ResNetBackbone，
 /// 其余维持 simple-cnn 既有行为）。层名 = torchvision 名 + `backbone.` 前缀，
 /// 预训练导入走引擎通用 [pretrain] 通道（load_only_backbone 同语义命中）。
-fn build_detect_backbone(p: &nn::Path, cfg: &av_core::config::BackboneCfg) -> AvResult<DetectBackbone> {
+fn build_detect_backbone(
+    p: &nn::Path,
+    cfg: &av_core::config::BackboneCfg,
+) -> AvResult<DetectBackbone> {
     match cfg.family.as_str() {
         RESNET_FAMILY => Ok(DetectBackbone::ResNet18(ResNetBackbone::new(p, cfg)?)),
         CSP_FAMILY => Ok(DetectBackbone::CspElan(CspElanBackbone::new(p, cfg)?)),
@@ -397,14 +413,20 @@ pub const MAX_SEGS_PER_IMAGE: usize = 100;
 /// `nms_iou` 的候选被抑制（不同类别互不抑制）。抽出为独立函数以便
 /// 手工实例的确定性单测（predict 内的随机权重路径不可复现）。
 pub fn mask_nms(mut insts: Vec<SegInstance>, nms_iou: f32) -> Vec<SegInstance> {
-    insts.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    // total_cmp：全序比较，NaN 分数不再 panic（decode 侧已过滤 NaN，此处双保险）
+    insts.sort_by(|a, b| b.score.total_cmp(&a.score));
     insts.truncate(MAX_SEGS_PER_IMAGE);
     let mut kept: Vec<SegInstance> = Vec::new();
+    // 外接框摘要随 kept 同步维护：分离框对免整画布 IoU 扫描（数值逐位一致，
+    // 见 MaskSummary::iou）；满 100 实例时 O(n²) 对的画布扫描是 NMS 大头
+    let mut kept_sum: Vec<MaskSummary> = Vec::new();
     for cand in insts {
-        let suppressed = kept.iter().any(|kp| {
-            kp.label == cand.label && mask_iou(&kp.mask, &cand.mask) >= nms_iou
+        let cand_sum = MaskSummary::of(&cand.mask);
+        let suppressed = kept.iter().zip(&kept_sum).any(|(kp, ks)| {
+            kp.label == cand.label && ks.iou(&kp.mask, &cand_sum, &cand.mask) >= nms_iou
         });
         if !suppressed {
+            kept_sum.push(cand_sum);
             kept.push(cand);
         }
     }
@@ -423,8 +445,7 @@ pub fn build_model(p: &nn::Path, cfg: &RunConfig) -> AvResult<TaskModel> {
         TaskCfg::Classify(c) => {
             // 骨干按 family 分发（"dinov2" → DINOv2 ViT-S/14 + 官方预训练导入，
             // 其余维持 simple-cnn 既有行为）
-            let backbone =
-                build_classify_backbone(&(p / "backbone"), &backbone_cfg, c.img_size)?;
+            let backbone = build_classify_backbone(&(p / "backbone"), &backbone_cfg, c.img_size)?;
             let head = ClassifyHead::new(
                 &(p / "head"),
                 backbone.pooled_channels(),
@@ -446,8 +467,10 @@ pub fn build_model(p: &nn::Path, cfg: &RunConfig) -> AvResult<TaskModel> {
             let backbone = build_detect_backbone(&(p / "backbone"), &backbone_cfg)?;
             // 每层通道数由骨干 stride → 通道映射给出（P2 = stride_channels(4)；
             // resnet18 = 64/128/256，simple-cnn 按宽度缩放）
-            let channels: AvResult<Vec<i64>> =
-                head_levels.iter().map(|&s| backbone.stride_channels(s)).collect();
+            let channels: AvResult<Vec<i64>> = head_levels
+                .iter()
+                .map(|&s| backbone.stride_channels(s))
+                .collect();
             let channels = channels?;
             // OBB 与普通检测共用检测头代码，只在角度分支与损失/后处理处分叉（PLAN §4.2）
             let head = DetectHead::with_mode(
@@ -466,7 +489,7 @@ pub fn build_model(p: &nn::Path, cfg: &RunConfig) -> AvResult<TaskModel> {
                 loss_w_cls: d.loss_cls_weight as f64,
                 loss_w_ciou: d.loss_ciou_weight as f64,
                 loss_w_dfl: d.loss_dfl_weight as f64,
-                obb: d.obb_mode.then(|| ObbParams {
+                obb: d.obb_mode.then_some(ObbParams {
                     // DetectCfg 无 angle 字段，obb_mode 走默认 le90（[-π/2, π/2)，长边域）
                     angle_domain: AngleDomain::Le90,
                 }),
@@ -571,6 +594,19 @@ fn tensor_to_vec_i64(t: &Tensor) -> Vec<i64> {
     dst
 }
 
+/// 张量 → Vec<u8>（CPU，二值掩码下载用：u8 相比 f32 下载量缩 4 倍）。
+fn tensor_to_vec_u8(t: &Tensor) -> Vec<u8> {
+    let t = t
+        .to_device(Device::Cpu)
+        .to_kind(Kind::Uint8)
+        .contiguous()
+        .reshape([-1]);
+    let n = t.size()[0] as usize;
+    let mut dst = vec![0u8; n];
+    t.copy_data(&mut dst, n);
+    dst
+}
+
 fn pyramid_level(
     py: &av_core::traits::FeaturePyramid,
     stride: i64,
@@ -642,8 +678,7 @@ fn dfl_project(dist: &Tensor) -> Tensor {
     let (n, h, w) = (size[0], size[2], size[3]);
     let device = dist.device();
     let prob = dist.reshape([n, 4, REG_MAX, h, w]).softmax(2, Kind::Float);
-    let bins = Tensor::arange(REG_MAX, (Kind::Float, device))
-        .reshape([1i64, 1, REG_MAX, 1, 1]);
+    let bins = Tensor::arange(REG_MAX, (Kind::Float, device)).reshape([1i64, 1, REG_MAX, 1, 1]);
     let expect = (&prob * &bins).sum_dim_intlist(&[2i64][..], false, Kind::Float);
     expect - (DFL_SHIFT as f64)
 }
@@ -675,7 +710,12 @@ fn decode_pred_xyxy(box_raw: &Tensor, s: f32) -> Tensor {
     let bw = b.select(1, 2).unsqueeze(1);
     let bh = b.select(1, 3).unsqueeze(1);
     Tensor::cat(
-        &[&(&cx - &bw / 2.0), &(&cy - &bh / 2.0), &(&cx + &bw / 2.0), &(&cy + &bh / 2.0)],
+        &[
+            &(&cx - &bw / 2.0),
+            &(&cy - &bh / 2.0),
+            &(&cx + &bw / 2.0),
+            &(&cy + &bh / 2.0),
+        ],
         1,
     )
 }
@@ -772,8 +812,8 @@ fn dfl_element(dist: &Tensor, target: &Tensor, pos_w: &Tensor) -> Tensor {
         let tr_idx = trf.select(1, k).to_kind(Kind::Int64).unsqueeze(1);
         let ce_l = side.gather(1, &tl_idx, false).neg(); // −log p(tl)
         let ce_r = side.gather(1, &tr_idx, false).neg(); // −log p(tr)
-        let term = (wl.select(1, k).unsqueeze(1) * &ce_l + wr.select(1, k).unsqueeze(1) * &ce_r)
-            * pos_w;
+        let term =
+            (wl.select(1, k).unsqueeze(1) * &ce_l + wr.select(1, k).unsqueeze(1) * &ce_r) * pos_w;
         total = Some(match total {
             None => term,
             Some(t) => t + term,
@@ -794,6 +834,9 @@ struct LevelSnap {
     /// [n][g][cells] gt 类别 sigmoid 分数
     scores: Vec<Vec<Vec<f32>>>,
 }
+
+/// 逐图快照解码产物：(预测框 [cells,4], 每 gt 一行的类分数平面)。
+type SnapPerImage = (Vec<[f32; 4]>, Vec<Vec<f32>>);
 
 fn snapshot_level(
     cls: &Tensor,
@@ -819,42 +862,37 @@ fn snapshot_level(
     let bx_v = tensor_to_vec_f32(&bx);
     let sig_v = tensor_to_vec_f32(&sig);
     let bidx = |ni: usize, k: usize, hi: usize, wi: usize| ((ni * 4 + k) * h + hi) * w + wi;
-    let sidx = |ni: usize, ci: usize, hi: usize, wi: usize| {
-        ((ni * c_len + ci) * h + hi) * w + wi
-    };
-    let mut pred_boxes = vec![vec![[0f32; 4]; cells]; n];
-    let mut scores: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n];
-    for ni in 0..n {
-        for hi in 0..h {
-            for wi in 0..w {
-                let cell = hi * w + wi;
-                let tx = bx_v[bidx(ni, 0, hi, wi)];
-                let ty = bx_v[bidx(ni, 1, hi, wi)];
-                let tw = bx_v[bidx(ni, 2, hi, wi)];
-                let th = bx_v[bidx(ni, 3, hi, wi)];
-                let cx = (wi as f32 + 0.5 + tx.tanh()) * stride;
-                let cy = (hi as f32 + 0.5 + ty.tanh()) * stride;
-                let bw = tw.exp() * stride;
-                let bh = th.exp() * stride;
-                pred_boxes[ni][cell] = [
-                    cx - bw / 2.0,
-                    cy - bh / 2.0,
-                    cx + bw / 2.0,
-                    cy + bh / 2.0,
-                ];
-            }
-        }
-        for g in 0..gt_labels[ni].len() {
-            let label = gt_labels[ni][g] as usize;
-            let mut row = vec![0f32; cells];
+    // 逐图解码彼此独立，rayon 按图并行（保序 collect 与串行逐位一致）。
+    let per_image: Vec<SnapPerImage> = (0..n)
+        .into_par_iter()
+        .map(|ni| {
+            let mut pb = vec![[0f32; 4]; cells];
             for hi in 0..h {
                 for wi in 0..w {
-                    row[hi * w + wi] = sig_v[sidx(ni, label, hi, wi)];
+                    let cell = hi * w + wi;
+                    let tx = bx_v[bidx(ni, 0, hi, wi)];
+                    let ty = bx_v[bidx(ni, 1, hi, wi)];
+                    let tw = bx_v[bidx(ni, 2, hi, wi)];
+                    let th = bx_v[bidx(ni, 3, hi, wi)];
+                    let cx = (wi as f32 + 0.5 + tx.tanh()) * stride;
+                    let cy = (hi as f32 + 0.5 + ty.tanh()) * stride;
+                    let bw = tw.exp() * stride;
+                    let bh = th.exp() * stride;
+                    pb[cell] = [cx - bw / 2.0, cy - bh / 2.0, cx + bw / 2.0, cy + bh / 2.0];
                 }
             }
-            scores[ni].push(row);
-        }
-    }
+            // 类分数行 = sig 平面 [ni,label] 的连续段（[N,C,H,W] 行主序，
+            // 固定 (ni,channel) 时下标恰为 base + hi*w + wi）——memcpy 一次
+            // 到位，替代逐 cell 下标读
+            let mut sc = Vec::with_capacity(gt_labels[ni].len());
+            for &label in gt_labels[ni].iter() {
+                let base = (ni * c_len + label as usize) * cells;
+                sc.push(sig_v[base..base + cells].to_vec());
+            }
+            (pb, sc)
+        })
+        .collect();
+    let (pred_boxes, scores): (Vec<_>, Vec<_>) = per_image.into_iter().unzip();
     LevelSnap {
         stride,
         h,
@@ -881,7 +919,9 @@ impl ClassifyModel {
             let logits = self.logits(x)?;
             let labels = logits.argmax(-1, false);
             let probs = logits.softmax(-1, Kind::Float);
-            let conf = probs.gather(-1, &labels.reshape([-1, 1]), false).reshape([-1]);
+            let conf = probs
+                .gather(-1, &labels.reshape([-1, 1]), false)
+                .reshape([-1]);
             let labels = tensor_to_vec_i64(&labels);
             Ok((
                 labels.into_iter().map(|v| v as u32).collect(),
@@ -891,10 +931,16 @@ impl ClassifyModel {
     }
 }
 
+/// 检测头每层原始输出：(stride, cls logits [N,C,H,W], box DFL 分布 [N,4R,H,W], 积分框 [N,4,H,W])。
+type LevelRaw = Vec<(i64, Tensor, Tensor, Tensor)>;
+
+/// OBB 头每层原始输出：(stride, cls, box 积分 [N,4,H,W], tθ raw [N,1,H,W], DFL 分布)。
+type ObbLevelRaw = Vec<(i64, Tensor, Tensor, Tensor, Tensor)>;
+
 impl DetectModel {
     /// 每层 (stride, cls logits [N,C,H,W], box DFL 分布 [N,4R,H,W], 积分框 [N,4,H,W])。
     /// 层级循环以 head_levels 为准（默认 [8,16]，P2 场景 [4,8,16]）。
-    fn forward_levels(&self, x: &Tensor) -> AvResult<Vec<(i64, Tensor, Tensor, Tensor)>> {
+    fn forward_levels(&self, x: &Tensor) -> AvResult<LevelRaw> {
         let py = self.backbone.forward_features(x)?;
         let feats: Vec<&Tensor> = self
             .head_levels
@@ -913,10 +959,7 @@ impl DetectModel {
     }
 
     /// OBB 前向：每层 (stride, cls [N,C,H,W], box 积分 [N,4,H,W], tθ raw [N,1,H,W], DFL 分布)。
-    fn forward_levels_obb(
-        &self,
-        x: &Tensor,
-    ) -> AvResult<Vec<(i64, Tensor, Tensor, Tensor, Tensor)>> {
+    fn forward_levels_obb(&self, x: &Tensor) -> AvResult<ObbLevelRaw> {
         let py = self.backbone.forward_features(x)?;
         let feats: Vec<&Tensor> = self
             .head_levels
@@ -926,8 +969,7 @@ impl DetectModel {
         let outs = self.head.forward(&feats);
         let mut out = Vec::with_capacity(self.head_levels.len());
         for ((cls, dist, theta), &s) in outs.into_iter().zip(self.head_levels.iter()) {
-            let theta =
-                theta.ok_or_else(|| AvError::shape("OBB 模型缺少角度分支输出"))?;
+            let theta = theta.ok_or_else(|| AvError::shape("OBB 模型缺少角度分支输出"))?;
             let box_raw = dfl_project(&dist);
             out.push((s as i64, cls, box_raw, theta, dist));
         }
@@ -1027,30 +1069,29 @@ impl DetectModel {
                 }
             }
         }
-        let mut assignments: Vec<Vec<Option<assigner::PosCell>>> = Vec::with_capacity(n);
-        for ni in 0..n {
-            let mut all_boxes: Vec<[f32; 4]> = Vec::with_capacity(all_centers.len());
-            let mut rows: Vec<Vec<f32>> = Vec::new();
-            for snap in &snaps {
-                all_boxes.extend_from_slice(&snap.pred_boxes[ni]);
-            }
-            let g_cnt = snaps[0].scores[ni].len();
-            for g in 0..g_cnt {
-                let mut row = Vec::with_capacity(all_centers.len());
+        // 逐图 TAL 分配彼此独立，rayon 按图并行（保序 collect，结果与串行一致）；
+        // 每 gt 候选缓冲复用等优化见 assigner 内部
+        let assignments: Vec<Vec<Option<assigner::PosCell>>> = gts
+            .par_iter()
+            .enumerate()
+            .map(|(ni, gt_i)| {
+                let mut all_boxes: Vec<[f32; 4]> = Vec::with_capacity(all_centers.len());
+                let mut rows: Vec<Vec<f32>> = Vec::new();
                 for snap in &snaps {
-                    row.extend_from_slice(&snap.scores[ni][g]);
+                    all_boxes.extend_from_slice(&snap.pred_boxes[ni]);
                 }
-                rows.push(row);
-            }
-            let row_slices: Vec<&[f32]> = rows.iter().map(|r| r.as_slice()).collect();
-            assignments.push(assigner::assign_single_image(
-                &all_boxes,
-                &all_centers,
-                &row_slices,
-                &gts[ni],
-                &tal_cfg,
-            ));
-        }
+                let g_cnt = snaps[0].scores[ni].len();
+                for g in 0..g_cnt {
+                    let mut row = Vec::with_capacity(all_centers.len());
+                    for snap in &snaps {
+                        row.extend_from_slice(&snap.scores[ni][g]);
+                    }
+                    rows.push(row);
+                }
+                let row_slices: Vec<&[f32]> = rows.iter().map(|r| r.as_slice()).collect();
+                assigner::assign_single_image(&all_boxes, &all_centers, &row_slices, gt_i, &tal_cfg)
+            })
+            .collect();
 
         // ---- 梯度侧：逐层构建目标张量并计算三类损失 ----
         let mut total: Option<Tensor> = None;
@@ -1069,8 +1110,7 @@ impl DetectModel {
             let mut dfl_t = vec![DFL_SHIFT; n * 4 * cells];
             let mut pos_cnt = 0usize;
             let mut pos_cls_idx: Vec<usize> = Vec::new();
-            let clamp_dfl =
-                |v: f32| v.clamp(1e-4, REG_MAX as f32 - 1.0 - 1e-4);
+            let clamp_dfl = |v: f32| v.clamp(1e-4, REG_MAX as f32 - 1.0 - 1e-4);
 
             for (gi, asg) in assignments.iter().enumerate() {
                 for (cell, pos) in asg.iter().enumerate() {
@@ -1115,16 +1155,19 @@ impl DetectModel {
             // 正负失衡加权（正样本 class 通道额外加权，上限 50）
             if pos_cnt > 0 {
                 let total_elems = n * c_len * cells;
-                let boost =
-                    (((total_elems - pos_cnt) as f32) / (pos_cnt as f32)).clamp(1.0, 50.0);
+                let boost = (((total_elems - pos_cnt) as f32) / (pos_cnt as f32)).clamp(1.0, 50.0);
                 for &idx in &pos_cls_idx {
                     cls_w[idx] = boost;
                 }
             }
 
             let shape_c = [n as i64, c_len as i64, h as i64, w as i64];
-            let cls_t_t = Tensor::from_slice(&cls_t).to_device(device).reshape(shape_c);
-            let cls_w_t = Tensor::from_slice(&cls_w).to_device(device).reshape(shape_c);
+            let cls_t_t = Tensor::from_slice(&cls_t)
+                .to_device(device)
+                .reshape(shape_c);
+            let cls_w_t = Tensor::from_slice(&cls_w)
+                .to_device(device)
+                .reshape(shape_c);
             let cls_loss = cls.binary_cross_entropy_with_logits(
                 &cls_t_t,
                 Some(&cls_w_t),
@@ -1133,16 +1176,20 @@ impl DetectModel {
             );
 
             let shape_b = [n as i64, 4i64, h as i64, w as i64];
-            let gt_box_t = Tensor::from_slice(&gt_box).to_device(device).reshape(shape_b);
+            let gt_box_t = Tensor::from_slice(&gt_box)
+                .to_device(device)
+                .reshape(shape_b);
             let pred_xyxy = decode_pred_xyxy(box_raw, s);
             let ciou_elem = ciou_element(&pred_xyxy, &gt_box_t); // [N,H,W]
             let pos_w_t = Tensor::from_slice(&pos_w)
                 .to_device(device)
                 .reshape([n as i64, 1i64, h as i64, w as i64]);
-            let ciou_loss = (&ciou_elem * &pos_w_t).sum(Kind::Float)
-                / pos_w_t.sum(Kind::Float).clamp_min(1.0);
+            let ciou_loss =
+                (&ciou_elem * &pos_w_t).sum(Kind::Float) / pos_w_t.sum(Kind::Float).clamp_min(1.0);
 
-            let dfl_t_t = Tensor::from_slice(&dfl_t).to_device(device).reshape(shape_b);
+            let dfl_t_t = Tensor::from_slice(&dfl_t)
+                .to_device(device)
+                .reshape(shape_b);
             let dfl_loss = dfl_element(dist, &dfl_t_t, &pos_w_t);
 
             let level_loss = &cls_loss * self.loss_w_cls
@@ -1244,30 +1291,28 @@ impl DetectModel {
                 }
             }
         }
-        let mut assignments: Vec<Vec<Option<assigner::PosCell>>> = Vec::with_capacity(n);
-        for ni in 0..n {
-            let mut all_boxes: Vec<[f32; 4]> = Vec::with_capacity(all_centers.len());
-            let mut rows: Vec<Vec<f32>> = Vec::new();
-            for snap in &snaps {
-                all_boxes.extend_from_slice(&snap.pred_boxes[ni]);
-            }
-            let g_cnt = snaps[0].scores[ni].len();
-            for g in 0..g_cnt {
-                let mut row = Vec::with_capacity(all_centers.len());
+        // 逐图 TAL 分配彼此独立，rayon 按图并行（保序 collect，结果与串行一致）
+        let assignments: Vec<Vec<Option<assigner::PosCell>>> = gts_env
+            .par_iter()
+            .enumerate()
+            .map(|(ni, gt_i)| {
+                let mut all_boxes: Vec<[f32; 4]> = Vec::with_capacity(all_centers.len());
+                let mut rows: Vec<Vec<f32>> = Vec::new();
                 for snap in &snaps {
-                    row.extend_from_slice(&snap.scores[ni][g]);
+                    all_boxes.extend_from_slice(&snap.pred_boxes[ni]);
                 }
-                rows.push(row);
-            }
-            let row_slices: Vec<&[f32]> = rows.iter().map(|r| r.as_slice()).collect();
-            assignments.push(assigner::assign_single_image(
-                &all_boxes,
-                &all_centers,
-                &row_slices,
-                &gts_env[ni],
-                &tal_cfg,
-            ));
-        }
+                let g_cnt = snaps[0].scores[ni].len();
+                for g in 0..g_cnt {
+                    let mut row = Vec::with_capacity(all_centers.len());
+                    for snap in &snaps {
+                        row.extend_from_slice(&snap.scores[ni][g]);
+                    }
+                    rows.push(row);
+                }
+                let row_slices: Vec<&[f32]> = rows.iter().map(|r| r.as_slice()).collect();
+                assigner::assign_single_image(&all_boxes, &all_centers, &row_slices, gt_i, &tal_cfg)
+            })
+            .collect();
 
         // ---- 梯度侧：逐层构建目标张量并计算 BCE(cls) + KFIoU(reg) + DFL ----
         let mut total: Option<Tensor> = None;
@@ -1315,8 +1360,7 @@ impl DetectModel {
                     let gt = gts5[gi][p.gt];
                     let (gcx, gcy, gw, gh) = (gt[0], gt[1], gt[2], gt[3]);
                     // cls：软标签 = 归一化对齐指标（YOLOv8 norm_align_metric）
-                    let cls_flat =
-                        (gi * c_len + gt_labels[gi][p.gt] as usize) * cells + flat;
+                    let cls_flat = (gi * c_len + gt_labels[gi][p.gt] as usize) * cells + flat;
                     cls_t[cls_flat] = p.weight;
                     pos_cls_idx.push(cls_flat);
                     // pos_w 布局 [N,H,W]：必须带批索引 gi（对齐 loss_tal 的 flat2）。
@@ -1346,16 +1390,19 @@ impl DetectModel {
             // 正负失衡加权（正样本 class 通道额外加权，上限 50）
             if pos_cnt > 0 {
                 let total_elems = n * c_len * cells;
-                let boost =
-                    (((total_elems - pos_cnt) as f32) / (pos_cnt as f32)).clamp(1.0, 50.0);
+                let boost = (((total_elems - pos_cnt) as f32) / (pos_cnt as f32)).clamp(1.0, 50.0);
                 for &idx in &pos_cls_idx {
                     cls_w[idx] = boost;
                 }
             }
 
             let shape_c = [n as i64, c_len as i64, h as i64, w as i64];
-            let cls_t_t = Tensor::from_slice(&cls_t).to_device(device).reshape(shape_c);
-            let cls_w_t = Tensor::from_slice(&cls_w).to_device(device).reshape(shape_c);
+            let cls_t_t = Tensor::from_slice(&cls_t)
+                .to_device(device)
+                .reshape(shape_c);
+            let cls_w_t = Tensor::from_slice(&cls_w)
+                .to_device(device)
+                .reshape(shape_c);
             let cls_loss = cls.binary_cross_entropy_with_logits(
                 &cls_t_t,
                 Some(&cls_w_t),
@@ -1374,12 +1421,14 @@ impl DetectModel {
             let pos_w_hw = Tensor::from_slice(&pos_w)
                 .to_device(device)
                 .reshape([n as i64, h as i64, w as i64]);
-            let kf_loss = (&kf_elem * &pos_w_hw).sum(Kind::Float)
-                / pos_w_hw.sum(Kind::Float).clamp_min(1.0);
+            let kf_loss =
+                (&kf_elem * &pos_w_hw).sum(Kind::Float) / pos_w_hw.sum(Kind::Float).clamp_min(1.0);
 
             // DFL：与普通 TAL 路径一致，继续监督 (tx,ty,tw,th) 分布
             let shape_b = [n as i64, 4i64, h as i64, w as i64];
-            let dfl_t_t = Tensor::from_slice(&dfl_t).to_device(device).reshape(shape_b);
+            let dfl_t_t = Tensor::from_slice(&dfl_t)
+                .to_device(device)
+                .reshape(shape_b);
             let dfl_loss = dfl_element(dist, &dfl_t_t, &pos_w_hw.unsqueeze(1));
 
             let level_loss = &cls_loss * self.loss_w_cls
@@ -1420,7 +1469,11 @@ impl DetectModel {
         let breaks = level_breaks(self.img_size, &head_levels);
         let mut total: Option<Tensor> = None;
 
-        for (s, cls, box_raw) in self.forward_levels(x)?.iter().map(|(s, c, _d, b)| (s, c, b)) {
+        for (s, cls, box_raw) in self
+            .forward_levels(x)?
+            .iter()
+            .map(|(s, c, _d, b)| (s, c, b))
+        {
             let size = cls.size();
             let (c_len, h, w) = (size[1] as usize, size[2] as usize, size[3] as usize);
             let s = *s as f32;
@@ -1504,12 +1557,9 @@ impl DetectModel {
             } else {
                 (n * 4 * h * w) as f32 / (pos_cnt * 4) as f32
             };
-            let box_loss = (box_raw - &box_t)
-                .abs()
-                * &box_mask;
-            let box_loss = box_loss
-                .mean_dim(&[0i64, 1, 2, 3][..], false, Kind::Float)
-                * &Tensor::from(scale);
+            let box_loss = (box_raw - &box_t).abs() * &box_mask;
+            let box_loss =
+                box_loss.mean_dim(&[0i64, 1, 2, 3][..], false, Kind::Float) * &Tensor::from(scale);
             let level_loss = &cls_loss + &(&box_loss * &Tensor::from(5f32));
             if let Some(dbg) = LOSS_DEBUG.with(|d| d.take()) {
                 eprintln!(
@@ -1534,16 +1584,10 @@ impl DetectModel {
                 let n = x.size()[0] as usize;
                 let mut all: Vec<Vec<Detection>> = vec![Vec::new(); n];
                 for (s, cls, box_raw, t_theta, _dist) in self.forward_levels_obb(x)? {
-                    for (i, dets) in decode_level_obb(
-                        s,
-                        &cls,
-                        &box_raw,
-                        &t_theta,
-                        conf,
-                        obb.angle_domain,
-                    )?
-                    .into_iter()
-                    .enumerate()
+                    for (i, dets) in
+                        decode_level_obb(s, &cls, &box_raw, &t_theta, conf, obb.angle_domain)?
+                            .into_iter()
+                            .enumerate()
                     {
                         all[i].extend(dets);
                     }
@@ -1608,9 +1652,10 @@ fn decode_level_obb(
             for wi in 0..w {
                 let (best_ci, best_p) = (0..c)
                     .map(|ci| (ci, probs_v[pidx(ni, ci, hi, wi)]))
-                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
                     .unwrap_or((0, 0.0));
-                if best_p < conf {
+                // NaN 分数（坏权重/发散步）不进候选：NaN 参与任何比较均为 false
+                if best_p.is_nan() || best_p < conf {
                     continue;
                 }
                 let tx = boxes_v[bidx(ni, 0, hi, wi)];
@@ -1637,19 +1682,26 @@ fn decode_level_obb(
 }
 
 /// 张量解码为逐图候选（CPU、纯标量循环；v0.1 规模足够，批量解码 M2 优化）。
-fn decode_level(s: i64, cls: &Tensor, box_raw: &Tensor, conf: f32) -> AvResult<Vec<Vec<Detection>>> {
-    let cls = cls.to_device(Device::Cpu).to_kind(Kind::Float);
-    let box_raw = box_raw.to_device(Device::Cpu).to_kind(Kind::Float);
+fn decode_level(
+    s: i64,
+    cls: &Tensor,
+    box_raw: &Tensor,
+    conf: f32,
+) -> AvResult<Vec<Vec<Detection>>> {
     let size = cls.size();
-    let (n, c, h, w) = (size[0] as usize, size[1] as usize, size[2] as usize, size[3] as usize);
+    let (n, c, h, w) = (
+        size[0] as usize,
+        size[1] as usize,
+        size[2] as usize,
+        size[3] as usize,
+    );
+    // sigmoid 在源设备算完再下载（80 类@640 = 每图 64 万次 exp 不再落在
+    // CPU；CPU 张量路径数值不变，GPU 路径 expf 与 CPU exp 至多差 1ulp，
+    // 属推理框架常态）。`tensor_to_vec_f32` 自带下载。
     let probs_v = tensor_to_vec_f32(&cls.sigmoid());
-    let boxes_v = tensor_to_vec_f32(&box_raw);
-    let pidx = |ni: usize, ci: usize, hi: usize, wi: usize| {
-        ((ni * c + ci) * h + hi) * w + wi
-    };
-    let bidx = |ni: usize, k: usize, hi: usize, wi: usize| {
-        ((ni * 4 + k) * h + hi) * w + wi
-    };
+    let boxes_v = tensor_to_vec_f32(box_raw);
+    let pidx = |ni: usize, ci: usize, hi: usize, wi: usize| ((ni * c + ci) * h + hi) * w + wi;
+    let bidx = |ni: usize, k: usize, hi: usize, wi: usize| ((ni * 4 + k) * h + hi) * w + wi;
     let sf = s as f32;
     let mut out = vec![Vec::new(); n];
     for ni in 0..n {
@@ -1657,9 +1709,10 @@ fn decode_level(s: i64, cls: &Tensor, box_raw: &Tensor, conf: f32) -> AvResult<V
             for wi in 0..w {
                 let (best_ci, best_p) = (0..c)
                     .map(|ci| (ci, probs_v[pidx(ni, ci, hi, wi)]))
-                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
                     .unwrap_or((0, 0.0));
-                if best_p < conf {
+                // NaN 分数（坏权重/发散步）不进候选：NaN 参与任何比较均为 false
+                if best_p.is_nan() || best_p < conf {
                     continue;
                 }
                 let tx = boxes_v[bidx(ni, 0, hi, wi)];
@@ -1727,11 +1780,22 @@ impl SegModel {
         let mut cls_t = vec![0f32; total_elems];
         let mut cls_w = vec![1f32; total_elems];
         let mut pos_idx: Vec<usize> = Vec::new();
-        let mut mask_losses: Vec<Tensor> = Vec::new();
+        // 有效实例先在 CPU 侧收集（质心/正 cell 归属），GPU 侧统一处理——
+        // 旧实现逐实例做整平面 sigmoid + 掩码 H2D，G 个实例 = G 次 sigmoid 内核
+        // 与 G 次小拷贝，实例多的批把 GPU 串成小内核流水。
+        struct MaskInst {
+            img: i64,
+            hi: i64,
+            wi: i64,
+            gt: Vec<u8>,
+        }
+        let mut insts: Vec<MaskInst> = Vec::new();
 
         for i in 0..n.min(masks.len()).min(labels.len()) {
             for (g, &label) in labels[i].iter().enumerate() {
-                let Some(gt_mask) = masks[i].get(g) else { continue };
+                let Some(gt_mask) = masks[i].get(g) else {
+                    continue;
+                };
                 if (label as i64) >= c {
                     continue; // 标注类别越界（数据脏）整条跳过
                 }
@@ -1760,19 +1824,47 @@ impl SegModel {
                 cls_t[cls_flat] = 1.0;
                 pos_idx.push(cls_flat);
 
+                insts.push(MaskInst {
+                    img: i as i64,
+                    hi: hi as i64,
+                    wi: wi as i64,
+                    gt: gt_mask.clone(),
+                });
+            }
+        }
+
+        // 原型整批一次 sigmoid（逐元素，与逐实例 sigmoid 结果逐位一致；YOLACT
+        // 语义：原型是「基掩码」，系数线性组合后再过最终 sigmoid——组合方式
+        // 必须与 predict 逐位一致，否则推理掩码与训练学到的组合不可比）。
+        // GT 掩码整批一次 H2D。
+        let mut mask_losses: Vec<Tensor> = Vec::new();
+        if !insts.is_empty() {
+            let proto_sig = proto.sigmoid(); // [N,K,mh,mw]
+            let plane = (mh * mw) as usize;
+            let mut gt_flat = vec![0f32; insts.len() * plane];
+            for (gi, inst) in insts.iter().enumerate() {
+                for (pj, &v) in inst.gt.iter().enumerate() {
+                    gt_flat[gi * plane + pj] = v as f32;
+                }
+            }
+            let gt_all = Tensor::from_slice(&gt_flat).to_device(device).reshape([
+                insts.len() as i64,
+                mh,
+                mw,
+            ]);
+
+            for (gi, inst) in insts.iter().enumerate() {
+                let MaskInst { img, hi, wi, .. } = inst;
                 // 该 cell 的系数向量 [K] → 与原型线性组合成实例掩码 logits [mh,mw]。
-                // 原型先过 sigmoid（YOLACT 语义：原型是「基掩码」，系数线性组合后
-                // 再过最终 sigmoid）——必须与 predict 的组合方式逐位一致，
-                // 否则推理时的掩码与训练学到的组合不可比（实测会导致评测全零）。
-                let coef_map = coefcls.select(0, i as i64).narrow(0, c, k); // [K,gh,gw]
-                let coef = coef_map.select(1, hi as i64).select(1, wi as i64); // [K]
-                let proto_i = proto.select(0, i as i64).sigmoid(); // [K,mh,mw]
-                let logit = (&proto_i * &coef.reshape([k, 1i64, 1i64]))
-                    .sum_dim_intlist(&[0i64][..], false, Kind::Float);
-                let gt_t = Tensor::from_slice(gt_mask)
-                    .to_device(device)
-                    .to_kind(Kind::Float)
-                    .reshape([mh, mw]);
+                let coef_map = coefcls.select(0, *img).narrow(0, c, k); // [K,gh,gw]
+                let coef = coef_map.select(1, *hi).select(1, *wi); // [K]
+                let proto_i = proto_sig.select(0, *img); // [K,mh,mw]（已 sigmoid）
+                let logit = (&proto_i * &coef.reshape([k, 1i64, 1i64])).sum_dim_intlist(
+                    &[0i64][..],
+                    false,
+                    Kind::Float,
+                );
+                let gt_t = gt_all.select(0, gi as i64); // [mh,mw]（批量上传后的视图）
                 let bce = logit.binary_cross_entropy_with_logits(
                     &gt_t,
                     None::<&Tensor>,
@@ -1786,8 +1878,8 @@ impl SegModel {
 
         // cls：正 cell 加权（正负失衡，上限 50，同检测路径）
         if !pos_idx.is_empty() {
-            let boost = (((total_elems - pos_idx.len()) as f32) / (pos_idx.len() as f32))
-                .clamp(1.0, 50.0);
+            let boost =
+                (((total_elems - pos_idx.len()) as f32) / (pos_idx.len() as f32)).clamp(1.0, 50.0);
             for &idx in &pos_idx {
                 cls_w[idx] = boost;
             }
@@ -1795,16 +1887,18 @@ impl SegModel {
         // cls BCE 只作用于前 C 通道（类别分数）；后 K 通道是原型系数，
         // 不应被推向 0（系数没有显式目标，梯度只经掩码损失回传——YOLACT 同款）
         let shape_c = [n as i64, c, gh, gw];
-        let cls_t_t = Tensor::from_slice(&cls_t).to_device(device).reshape(shape_c);
-        let cls_w_t = Tensor::from_slice(&cls_w).to_device(device).reshape(shape_c);
-        let cls_loss = coefcls
-            .slice(1, 0, c, 1)
-            .binary_cross_entropy_with_logits(
-                &cls_t_t,
-                Some(&cls_w_t),
-                None::<&Tensor>,
-                tch::Reduction::Mean,
-            );
+        let cls_t_t = Tensor::from_slice(&cls_t)
+            .to_device(device)
+            .reshape(shape_c);
+        let cls_w_t = Tensor::from_slice(&cls_w)
+            .to_device(device)
+            .reshape(shape_c);
+        let cls_loss = coefcls.slice(1, 0, c, 1).binary_cross_entropy_with_logits(
+            &cls_t_t,
+            Some(&cls_w_t),
+            None::<&Tensor>,
+            tch::Reduction::Mean,
+        );
 
         // 掩码项：逐实例 BCE+Dice 求均值；批内无实例时退化为纯 cls 项
         // （cls 项恒连通梯度，backward 不会因常数张量断图）
@@ -1819,13 +1913,21 @@ impl SegModel {
                 });
             }
             let mask_mean = acc.expect("mask_losses 非空") / cnt;
-            total = total + mask_mean;
+            total += mask_mean;
         }
         Ok(total * self.loss_weight)
     }
 
     /// 推理：逐 cell 类别分数过 conf → 系数与原型线性组合 → 0.5 阈值二值化
     /// → 同类别掩码 IoU NMS 去重（贪心，按分数降序）。
+    ///
+    /// 合成在设备端批量完成：每图一次 GEMM `[M,K]×[K,mh·mw]` 产出全部候选
+    /// logits（旧实现逐候选标量 K×mh·mw 乘加 + 整批原型平面下载，640 输入
+    /// 单图最坏 1.3 GFLOP 标量运算）。候选先按分数截到 [`MAX_SEGS_PER_IMAGE`]
+    /// 再合成——NMS 分数降序 + 截断之后，分数进不了前 MAX_SEGS 的候选必然
+    /// 被丢弃，故该截断与全量合成 + NMS 输出逐实例一致。注意 GEMM 求和次序
+    /// 与标量循环可在 logit 极近 0 处产生 ±1ulp 差异（阈值化后理论可能翻转
+    /// 个别像素），掩码语义不变。
     pub fn predict(&self, x: &Tensor, conf: f32, nms_iou: f32) -> AvResult<Vec<Vec<SegInstance>>> {
         tch::no_grad(|| {
             let (proto, coefcls) = self.forward_branch(x)?;
@@ -1834,69 +1936,74 @@ impl SegModel {
             let (c, k, gh, gw) = (self.num_classes, self.mask_branch.num_protos, cs[2], cs[3]);
             let ps = proto.size();
             let (mh, mw) = (ps[2] as usize, ps[3] as usize);
-            // 整平面一次性拷入 CPU（copy_data 单次 FFI，同 decode_level 模式）
-            let proto_v = tensor_to_vec_f32(&proto.sigmoid());
-            let cls_v = tensor_to_vec_f32(
-                &coefcls
-                    .slice(1, 0, c, 1)
-                    .sigmoid()
-                    .to_device(Device::Cpu)
-                    .to_kind(Kind::Float),
-            );
-            let coef_v = tensor_to_vec_f32(&coefcls.slice(1, c, c + k, 1));
-            let c_len = c as usize;
-            let k_len = k as usize;
-            let pidx = |ni: usize, ci: usize, hi: usize, wi: usize| {
-                ((ni * c_len + ci) * gh as usize + hi) * gw as usize + wi
-            };
-            let fidx = |ni: usize, ki: usize, hi: usize, wi: usize| {
-                ((ni * k_len + ki) * gh as usize + hi) * gw as usize + wi
-            };
-            let pridx = |ni: usize, ki: usize, yi: usize, xi: usize| {
-                ((ni * k_len + ki) * mh + yi) * mw + xi
-            };
+            let plane = (mh * mw) as i64;
+            let cells = (gh * gw) as usize;
+            let device = proto.device();
+
+            // 设备端一次 sigmoid；原型不再整批下载（只有最终二值掩码下行）
+            let proto_sig = proto.sigmoid(); // [N,K,mh,mw]
+            let cls_sig = coefcls.slice(1, 0, c, 1).sigmoid(); // [N,C,gh,gw]
+            let coef_map = coefcls
+                .slice(1, c, c + k, 1)
+                .reshape([n as i64, k, cells as i64]);
 
             let mut out: Vec<Vec<SegInstance>> = vec![Vec::new(); n];
-            for ni in 0..n {
-                for hi in 0..gh as usize {
-                    for wi in 0..gw as usize {
-                        // 类别分数（argmax over C）
-                        let (best_ci, best_p) = (0..c_len)
-                            .map(|ci| (ci, cls_v[pidx(ni, ci, hi, wi)]))
-                            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                            .unwrap_or((0, 0.0));
-                        if best_p < conf {
-                            continue;
-                        }
-                        // 掩码 = sigmoid(Σ coef_k · proto_k)，0.5 阈值二值化
-                        let mut coef = vec![0f32; k_len];
-                        for ki in 0..k_len {
-                            coef[ki] = coef_v[fidx(ni, ki, hi, wi)];
-                        }
-                        let mut mask = vec![0u8; mh * mw];
-                        for yi in 0..mh {
-                            for xi in 0..mw {
-                                let mut s = 0f32;
-                                for ki in 0..k_len {
-                                    s += coef[ki] * proto_v[pridx(ni, ki, yi, xi)];
-                                }
-                                if s > 0.0 {
-                                    mask[yi * mw + xi] = 1;
-                                }
-                            }
-                        }
-                        if !mask.iter().any(|&v| v == 1) {
-                            continue; // 空掩码无意义，丢弃
-                        }
-                        out[ni].push(SegInstance {
-                            label: best_ci as u32,
-                            score: best_p,
-                            mask,
-                        });
+            for (ni, out_ni) in out.iter_mut().enumerate() {
+                // 类别分数 argmax：[gh,gw] 分数图 + 类别下标图
+                let (scores, cls_idx) = cls_sig.select(0, ni as i64).max_dim(0, false); // 对 C 取 argmax
+                let scores = scores.reshape([cells as i64]);
+                let cls_idx = cls_idx.reshape([cells as i64]);
+                // 候选 = score >= conf（NaN 与任何比较均为 false，自动排除）
+                let cand_all = scores
+                    .ge(tch::Scalar::from(conf as f64))
+                    .nonzero()
+                    .select(1, 0); // [M]
+                let m_all = cand_all.size()[0] as usize;
+                if m_all == 0 {
+                    continue;
+                }
+                let cand_scores = tensor_to_vec_f32(&scores.index_select(0, &cand_all));
+                // 分数降序截到上限（稳定排序，平局保持 cell 行序——与 mask_nms
+                // 内部排序同款，故截断后喂入 NMS 的输出与全量合成逐实例一致）
+                let mut order: Vec<usize> = (0..m_all).collect();
+                order.sort_by(|&a, &b| cand_scores[b].total_cmp(&cand_scores[a]));
+                order.truncate(MAX_SEGS_PER_IMAGE);
+
+                // 截断后的候选下标回设备，批量取分数/类别/系数
+                let idx_top =
+                    Tensor::from_slice(&(order.iter().map(|&p| p as i64).collect::<Vec<_>>()[..]))
+                        .to_device(device);
+                let top_scores = tensor_to_vec_f32(&scores.index_select(0, &idx_top));
+                let top_cls = tensor_to_vec_i64(&cls_idx.index_select(0, &idx_top));
+
+                // 全部候选掩码 logits 一次 GEMM：[M',K] × [K,mh·mw] → [M',mh·mw]
+                let cand_coef = coef_map
+                    .select(0, ni as i64)
+                    .index_select(1, &idx_top)
+                    .transpose(0, 1); // [M',K]（视图）
+                let proto_n = proto_sig.select(0, ni as i64).reshape([k, plane]);
+                let logits = cand_coef.matmul(&proto_n); // [M',mh·mw]
+                                                         // 0.5 阈值二值化（logits > 0）后以 u8 下载
+                let masks_v = tensor_to_vec_u8(
+                    &logits
+                        .greater(tch::Scalar::from(0.0f64))
+                        .to_kind(Kind::Uint8),
+                );
+                let plane_u = plane as usize;
+
+                let mut insts: Vec<SegInstance> = Vec::with_capacity(order.len());
+                for (j, mask) in masks_v.chunks_exact(plane_u).enumerate() {
+                    if !mask.contains(&1) {
+                        continue; // 空掩码无意义，丢弃
                     }
+                    insts.push(SegInstance {
+                        label: top_cls[j] as u32,
+                        score: top_scores[j],
+                        mask: mask.to_vec(),
+                    });
                 }
                 // 掩码 NMS：分数降序贪心，同类掩码 IoU ≥ 阈值者抑制
-                out[ni] = mask_nms(std::mem::take(&mut out[ni]), nms_iou);
+                *out_ni = mask_nms(insts, nms_iou);
             }
             Ok(out)
         })
@@ -1926,7 +2033,7 @@ impl KeypointModel {
 
     /// 训练损失（decode = "direct"）：
     /// BCE(cls，正 cell boost) + 掩码 L1(box，×5) + 可见性加权 L1(偏移，cell 域)
-    /// + BCE(可见性) + (1 − mean OKS)（[`oks_loss`]，对偏移坐标可微），
+    /// 加 BCE(可见性) 与 (1 − mean OKS)（[`oks_loss`]，对偏移坐标可微），
     /// 权重 [`LOSS_W_KP_CLS`] / [`LOSS_W_KP_BOX`] / [`LOSS_W_KP_OFF`] /
     /// [`LOSS_W_KP_VIS`]，总权重乘 KeypointCfg.loss_weight。
     ///
@@ -2032,9 +2139,14 @@ impl KeypointModel {
         }
 
         let shape_c = [n as i64, 1i64, h as i64, w as i64];
-        let cls_t_t = Tensor::from_slice(&cls_t).to_device(device).reshape(shape_c);
-        let cls_w_t = Tensor::from_slice(&cls_w).to_device(device).reshape(shape_c);
-        let loss_cls = out.narrow(1, crate::keypoint::KP_CLS_CH, 1)
+        let cls_t_t = Tensor::from_slice(&cls_t)
+            .to_device(device)
+            .reshape(shape_c);
+        let cls_w_t = Tensor::from_slice(&cls_w)
+            .to_device(device)
+            .reshape(shape_c);
+        let loss_cls = out
+            .narrow(1, crate::keypoint::KP_CLS_CH, 1)
             .binary_cross_entropy_with_logits(
                 &cls_t_t,
                 Some(&cls_w_t),
@@ -2049,7 +2161,9 @@ impl KeypointModel {
         }
 
         let shape_b = [n as i64, 4i64, h as i64, w as i64];
-        let box_t_t = Tensor::from_slice(&box_t).to_device(device).reshape(shape_b);
+        let box_t_t = Tensor::from_slice(&box_t)
+            .to_device(device)
+            .reshape(shape_b);
         let pos_w_t = Tensor::from_slice(&pos_w)
             .to_device(device)
             .reshape([n as i64, 1i64, h as i64, w as i64]);
@@ -2057,15 +2171,23 @@ impl KeypointModel {
         let box_l1 = box_l1.sum(Kind::Float) / (&pos_w_t * 4.0).sum(Kind::Float).clamp_min(1.0);
 
         let shape_o = [n as i64, ku as i64, h as i64, w as i64];
-        let off_t_t = Tensor::from_slice(&off_t).to_device(device).reshape(shape_o);
-        let off_w_t = Tensor::from_slice(&off_w).to_device(device).reshape(shape_o);
-        let off_l1 = (out.narrow(1, crate::keypoint::KP_OFF_CH, ku as i64) - &off_t_t).abs()
-            * &off_w_t;
+        let off_t_t = Tensor::from_slice(&off_t)
+            .to_device(device)
+            .reshape(shape_o);
+        let off_w_t = Tensor::from_slice(&off_w)
+            .to_device(device)
+            .reshape(shape_o);
+        let off_l1 =
+            (out.narrow(1, crate::keypoint::KP_OFF_CH, ku as i64) - &off_t_t).abs() * &off_w_t;
         let off_l1 = off_l1.sum(Kind::Float) / off_w_t.sum(Kind::Float).clamp_min(1.0);
 
         let shape_v = [n as i64, k as i64, h as i64, w as i64];
-        let vis_t_t = Tensor::from_slice(&vis_t).to_device(device).reshape(shape_v);
-        let vis_w_t = Tensor::from_slice(&vis_w).to_device(device).reshape(shape_v);
+        let vis_t_t = Tensor::from_slice(&vis_t)
+            .to_device(device)
+            .reshape(shape_v);
+        let vis_w_t = Tensor::from_slice(&vis_w)
+            .to_device(device)
+            .reshape(shape_v);
         let loss_vis = out
             .narrow(1, crate::keypoint::KP_OFF_CH + ku as i64, k as i64)
             .binary_cross_entropy_with_logits(
@@ -2080,7 +2202,9 @@ impl KeypointModel {
         // 其 (0,0) 退化目标不产生损失路径（exp 项有界，无 NaN 风险）
         let gtx_t = Tensor::from_slice(&gtx).to_device(device).reshape(shape_v);
         let gty_t = Tensor::from_slice(&gty).to_device(device).reshape(shape_v);
-        let vis_map_t = Tensor::from_slice(&vis_map).to_device(device).reshape(shape_v);
+        let vis_map_t = Tensor::from_slice(&vis_map)
+            .to_device(device)
+            .reshape(shape_v);
         let scale_map_t = Tensor::from_slice(&scale_map)
             .to_device(device)
             .reshape([n as i64, 1i64, h as i64, w as i64]);
@@ -2090,10 +2214,10 @@ impl KeypointModel {
         let sigma = Tensor::from_slice(&sigma_table(k))
             .to_device(device)
             .reshape([1i64, k as i64, 1i64, 1i64]);
-        let xs = Tensor::arange(w as i64, (Kind::Float, device))
-            .reshape([1i64, 1i64, 1i64, w as i64]);
-        let ys = Tensor::arange(h as i64, (Kind::Float, device))
-            .reshape([1i64, 1i64, h as i64, 1i64]);
+        let xs =
+            Tensor::arange(w as i64, (Kind::Float, device)).reshape([1i64, 1i64, 1i64, w as i64]);
+        let ys =
+            Tensor::arange(h as i64, (Kind::Float, device)).reshape([1i64, 1i64, h as i64, 1i64]);
         let off_raw = out
             .narrow(1, crate::keypoint::KP_OFF_CH, ku as i64)
             .reshape([n as i64, k as i64, 2i64, h as i64, w as i64]);
@@ -2111,8 +2235,8 @@ impl KeypointModel {
             .sum_dim_intlist(&[1i64][..], false, Kind::Float)
             .clamp_min(1.0);
         let ok_map = &num / &den;
-        let ok_mean = (&ok_map * &oks_pos_t).sum(Kind::Float)
-            / oks_pos_t.sum(Kind::Float).clamp_min(1.0);
+        let ok_mean =
+            (&ok_map * &oks_pos_t).sum(Kind::Float) / oks_pos_t.sum(Kind::Float).clamp_min(1.0);
         // 损失 = 1 − mean OKS（标量在左的 `1.0 - &t` 会踩 E0282，改写为右乘加）
         let loss_oks = ok_mean * -1.0 + 1.0;
 
@@ -2149,18 +2273,16 @@ impl KeypointModel {
             // 整平面一次性拷入 CPU（copy_data 单次 FFI，同 decode_level 模式）
             let cls_v = tensor_to_vec_f32(&out.narrow(1, crate::keypoint::KP_CLS_CH, 1).sigmoid());
             let box_v = tensor_to_vec_f32(&out.narrow(1, crate::keypoint::KP_BOX_CH, 4));
-            let off_v =
-                tensor_to_vec_f32(&out.narrow(1, crate::keypoint::KP_OFF_CH, ku_of(k)));
+            let off_v = tensor_to_vec_f32(&out.narrow(1, crate::keypoint::KP_OFF_CH, ku_of(k)));
             let vis_v = tensor_to_vec_f32(
-                &out.narrow(1, crate::keypoint::KP_OFF_CH + 2 * k as i64, k as i64).sigmoid(),
+                &out.narrow(1, crate::keypoint::KP_OFF_CH + 2 * k as i64, k as i64)
+                    .sigmoid(),
             );
             let cidx = |ni: usize, hi: usize, wi: usize| (ni * h + hi) * w + wi;
-            let bidx =
-                |ni: usize, c: usize, hi: usize, wi: usize| ((ni * 4 + c) * h + hi) * w + wi;
+            let bidx = |ni: usize, c: usize, hi: usize, wi: usize| ((ni * 4 + c) * h + hi) * w + wi;
             let oidx =
                 |ni: usize, c: usize, hi: usize, wi: usize| ((ni * 2 * k + c) * h + hi) * w + wi;
-            let vidx =
-                |ni: usize, j: usize, hi: usize, wi: usize| ((ni * k + j) * h + hi) * w + wi;
+            let vidx = |ni: usize, j: usize, hi: usize, wi: usize| ((ni * k + j) * h + hi) * w + wi;
 
             let mut out_imgs: Vec<Vec<Detection>> = vec![Vec::new(); n];
             for ni in 0..n {
@@ -2182,7 +2304,11 @@ impl KeypointModel {
                         for j in 0..k {
                             let kx = (wi as f32 + 0.5 + off_v[oidx(ni, 2 * j, hi, wi)]) * sf;
                             let ky = (hi as f32 + 0.5 + off_v[oidx(ni, 2 * j + 1, hi, wi)]) * sf;
-                            let v = if vis_v[vidx(ni, j, hi, wi)] > 0.5 { 2.0 } else { 0.0 };
+                            let v = if vis_v[vidx(ni, j, hi, wi)] > 0.5 {
+                                2.0
+                            } else {
+                                0.0
+                            };
                             kps.push([kx.clamp(0.0, lim), ky.clamp(0.0, lim), v]);
                         }
                         out_imgs[ni].push(Detection {
@@ -2303,7 +2429,10 @@ backbone = {{ family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"
 
     fn sample_batch() -> TrainBatch {
         TrainBatch::Detect {
-            boxes: vec![vec![[10.0, 12.0, 30.0, 34.0]], vec![[20.0, 20.0, 44.0, 41.0]]],
+            boxes: vec![
+                vec![[10.0, 12.0, 30.0, 34.0]],
+                vec![[20.0, 20.0, 44.0, 41.0]],
+            ],
             labels: vec![vec![0], vec![1]],
         }
     }
@@ -2357,7 +2486,11 @@ backbone = {{ family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"
         let pred = Tensor::from_slice(&[0.0f32, 0.0, 10.0, 10.0]).reshape([1i64, 4, 1, 1]);
         let gt = Tensor::from_slice(&[0.0f32, 0.0, 10.0, 10.0]).reshape([1i64, 4, 1, 1]);
         let l = ciou_element(&pred, &gt);
-        assert!((l.double_value(&[0, 0])).abs() < 1e-4, "got {}", l.double_value(&[0, 0]));
+        assert!(
+            (l.double_value(&[0, 0])).abs() < 1e-4,
+            "got {}",
+            l.double_value(&[0, 0])
+        );
 
         // 情形 2：pred [0,0,10,10] vs gt [5,5,15,15]
         // IoU = 25/175 = 0.142857；ρ² = 50，c² = 15²+15² = 450 → 50/450 = 0.111111
@@ -2424,7 +2557,9 @@ backbone = {{ family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"
         let vs = tch::nn::VarStore::new(tch::Device::Cpu);
         let model = build_model(&vs.root(), &cfg).expect("装配应成功");
         let x = Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu));
-        let loss = model.loss(&x, &sample_batch()).expect("L1 旧路径损失应成功");
+        let loss = model
+            .loss(&x, &sample_batch())
+            .expect("L1 旧路径损失应成功");
         assert!(loss.double_value(&[]).is_finite());
         loss.backward();
     }
@@ -2498,7 +2633,7 @@ backbone = {{ family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"
         let raw = m.raw_preds(&x).expect("检测前向应成功");
         assert_eq!(raw.len(), 3);
         for (li, (s, cls, box_raw)) in raw.iter().enumerate() {
-            let stride = *s as i64;
+            let stride = *s;
             assert_eq!(stride as u32, [4u32, 8, 16][li]);
             let grid = 64 / stride;
             assert_eq!(
@@ -2537,7 +2672,11 @@ backbone = {{ family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"
         let breaks = level_breaks(64, &levels);
         assert_eq!(breaks, vec![16.0, 32.0]);
         assert_eq!(select_level(&levels, &breaks, 0.5), 8);
-        assert_eq!(select_level(&levels, &breaks, 16.0), 8, "边界值（含）归低层");
+        assert_eq!(
+            select_level(&levels, &breaks, 16.0),
+            8,
+            "边界值（含）归低层"
+        );
         assert_eq!(select_level(&levels, &breaks, 16.1), 16);
         assert_eq!(select_level(&levels, &breaks, 64.0), 16);
     }
@@ -2551,10 +2690,18 @@ backbone = {{ family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"
         assert_eq!(select_level(&levels, &breaks, 1.0), 4);
         assert_eq!(select_level(&levels, &breaks, 80.0), 4, "边界值（含）归 P2");
         assert_eq!(select_level(&levels, &breaks, 80.5), 8);
-        assert_eq!(select_level(&levels, &breaks, 160.0), 8, "边界值（含）归中层");
+        assert_eq!(
+            select_level(&levels, &breaks, 160.0),
+            8,
+            "边界值（含）归中层"
+        );
         assert_eq!(select_level(&levels, &breaks, 160.5), 16);
         assert_eq!(select_level(&levels, &breaks, 320.0), 16);
-        assert_eq!(select_level(&levels, &breaks, 640.0), 16, "超出回落最大 stride 层");
+        assert_eq!(
+            select_level(&levels, &breaks, 640.0),
+            16,
+            "超出回落最大 stride 层"
+        );
     }
 
     #[test]
@@ -2650,7 +2797,9 @@ backbone = {{ family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"
         assert_eq!(s8.1.size()[1], 128, "s8 头输入通道应等于骨干 stride 8 通道");
         // 前向 + 反传全链路（默认 [8,16] 两级头）
         let x = Tensor::randn([2, 3, 96, 96], (Kind::Float, Device::Cpu));
-        let loss = model.loss(&x, &sample_batch()).expect("resnet18 检测损失应成功");
+        let loss = model
+            .loss(&x, &sample_batch())
+            .expect("resnet18 检测损失应成功");
         assert!(loss.double_value(&[]).is_finite());
         loss.backward();
     }
@@ -2702,7 +2851,7 @@ dir = \"d\"
 
     fn obb_cfg_toml() -> av_core::config::RunConfig {
         let toml = concat!(
-                "[model]
+            "[model]
 backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"none\" }
 ",
             "[data.sources.train]\ndir = \"d\"\n",
@@ -2738,7 +2887,7 @@ backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"n
     fn obb_p2_loss_smoke_forward_backward() {
         // OBB 角度分支 + P2 三层组合：forward_levels_obb 的层级循环参数化后可跑
         let toml = concat!(
-                "[model]
+            "[model]
 backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"none\" }
 ",
             "[data.sources.train]\ndir = \"d\"\n",
@@ -2753,7 +2902,9 @@ backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"n
         };
         assert_eq!(m.head.strides, vec![4, 8, 16]);
         let x = Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu));
-        let loss = model.loss(&x, &obb_sample_batch()).expect("OBB P2 损失应成功");
+        let loss = model
+            .loss(&x, &obb_sample_batch())
+            .expect("OBB P2 损失应成功");
         assert!(loss.double_value(&[]).is_finite());
         loss.backward();
     }
@@ -2764,15 +2915,21 @@ backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"n
         let vs = tch::nn::VarStore::new(tch::Device::Cpu);
         let obb_model = build_model(&vs.root(), &cfg).expect("装配应成功");
         // OBB 模型 + 水平框批 → 明确报错（避免静默丢角度监督）
-        assert!(obb_model.loss(&Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)), &sample_batch()).is_err());
+        assert!(obb_model
+            .loss(
+                &Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)),
+                &sample_batch()
+            )
+            .is_err());
         // 普通检测模型 + OBB 批 → 明确报错
         let vs2 = tch::nn::VarStore::new(tch::Device::Cpu);
         let det_model = build_model(&vs2.root(), &detect_cfg_toml("tal")).expect("装配应成功");
-        assert!(
-            det_model
-                .loss(&Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)), &obb_sample_batch())
-                .is_err()
-        );
+        assert!(det_model
+            .loss(
+                &Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)),
+                &obb_sample_batch()
+            )
+            .is_err());
     }
 
     #[test]
@@ -2869,7 +3026,7 @@ backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"n
     #[test]
     fn standalone_obb_task_reports_guidance() {
         let toml = concat!(
-                "[model]
+            "[model]
 backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"none\" }
 ",
             "[data.sources.train]\ndir = \"d\"\n",
@@ -2971,15 +3128,17 @@ backbone = {{ family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"
         for inst in &out[0] {
             assert_eq!(inst.mask.len(), 256);
             assert!(inst.mask.iter().all(|&v| v <= 1), "掩码应二值");
-            assert!(inst.mask.iter().any(|&v| v == 1), "空掩码应被丢弃");
+            assert!(inst.mask.contains(&1), "空掩码应被丢弃");
             assert!((0.0..=1.0).contains(&inst.score), "score 应在 [0,1]");
             assert!((inst.label as i64) < 3, "label 应在类数内");
         }
         // NMS 契约：保留集内同类别掩码 IoU 两两 < 阈值（近重复被抑制）
         let kept = &out[0];
-        for (a, b) in kept.iter().enumerate().flat_map(|(i, a)| {
-            kept[i + 1..].iter().map(move |b| (a, b))
-        }) {
+        for (a, b) in kept
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| kept[i + 1..].iter().map(move |b| (a, b)))
+        {
             if a.label == b.label {
                 assert!(
                     mask_iou(&a.mask, &b.mask) < 0.5,
@@ -3019,19 +3178,21 @@ backbone = {{ family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"
         let vs = tch::nn::VarStore::new(tch::Device::Cpu);
         let seg_model = build_model(&vs.root(), &cfg).expect("装配应成功");
         // Seg 模型 + 检测批 → 明确报错
-        assert!(
-            seg_model
-                .loss(&Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)), &sample_batch())
-                .is_err()
-        );
+        assert!(seg_model
+            .loss(
+                &Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)),
+                &sample_batch()
+            )
+            .is_err());
         // 检测模型 + Seg 批 → 明确报错
         let vs2 = tch::nn::VarStore::new(tch::Device::Cpu);
         let det_model = build_model(&vs2.root(), &detect_cfg_toml("tal")).expect("装配应成功");
-        assert!(
-            det_model
-                .loss(&Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)), &seg_sample_batch())
-                .is_err()
-        );
+        assert!(det_model
+            .loss(
+                &Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)),
+                &seg_sample_batch()
+            )
+            .is_err());
     }
 
     #[test]
@@ -3072,8 +3233,13 @@ backbone = {{ family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"
             .to_kind(Kind::Float)
             .reshape([2i64, 3, s as i64, s as i64]);
         let batch = seg_sample_batch();
-        let mut opt = tch::nn::Adam::default().build(&vs, 1e-2).expect("优化器应构建");
-        let first = model.loss(&x, &batch).expect("损失应成功").double_value(&[]);
+        let mut opt = tch::nn::Adam::default()
+            .build(&vs, 1e-2)
+            .expect("优化器应构建");
+        let first = model
+            .loss(&x, &batch)
+            .expect("损失应成功")
+            .double_value(&[]);
         // 自适应预算：每 40 步检查一次 predict 是否已产出掩码候选（上限 400 步，
         // 与 coco8-seg 实测训练同量级）。不绑损失比值——Adam 对坏 init 的早期
         // 收敛速度随种子波动，数值阈值必然偶发误报。
@@ -3109,7 +3275,7 @@ backbone = {{ family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"
 
     fn kp_cfg_toml() -> av_core::config::RunConfig {
         let toml = concat!(
-                "[model]
+            "[model]
 backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"none\" }
 ",
             "[data.sources.train]\ndir = \"d\"\n",
@@ -3127,7 +3293,11 @@ backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"n
                 vec![[20.0, 40.0, 12.0, 20.0], [44.0, 16.0, 12.0, 12.0]],
             ],
             kpts: vec![
-                vec![vec![[30.0, 28.0, 2.0], [34.0, 28.0, 2.0], [32.0, 36.0, 1.0]]],
+                vec![vec![
+                    [30.0, 28.0, 2.0],
+                    [34.0, 28.0, 2.0],
+                    [32.0, 36.0, 1.0],
+                ]],
                 vec![
                     vec![[18.0, 32.0, 2.0], [22.0, 32.0, 0.0], [20.0, 44.0, 2.0]],
                     vec![[42.0, 12.0, 2.0], [46.0, 12.0, 2.0], [44.0, 20.0, 2.0]],
@@ -3143,7 +3313,9 @@ backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"n
         let vs = tch::nn::VarStore::new(tch::Device::Cpu);
         let model = build_model(&vs.root(), &cfg).expect("Keypoint 模型装配应成功");
         let x = Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu));
-        let loss = model.loss(&x, &kp_sample_batch()).expect("关键点损失应成功");
+        let loss = model
+            .loss(&x, &kp_sample_batch())
+            .expect("关键点损失应成功");
         assert!(loss.double_value(&[]).is_finite());
         loss.backward(); // BCE(cls) + L1(box/off) + BCE(vis) + OKS 全链路反传不应 panic
     }
@@ -3190,19 +3362,21 @@ backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"n
         let vs = tch::nn::VarStore::new(tch::Device::Cpu);
         let kp_model = build_model(&vs.root(), &cfg).expect("装配应成功");
         // 关键点模型 + 检测批 → 明确报错
-        assert!(
-            kp_model
-                .loss(&Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)), &sample_batch())
-                .is_err()
-        );
+        assert!(kp_model
+            .loss(
+                &Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)),
+                &sample_batch()
+            )
+            .is_err());
         // 检测模型 + 关键点批 → 明确报错
         let vs2 = tch::nn::VarStore::new(tch::Device::Cpu);
         let det_model = build_model(&vs2.root(), &detect_cfg_toml("tal")).expect("装配应成功");
-        assert!(
-            det_model
-                .loss(&Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)), &kp_sample_batch())
-                .is_err()
-        );
+        assert!(det_model
+            .loss(
+                &Tensor::randn([2, 3, 64, 64], (Kind::Float, Device::Cpu)),
+                &kp_sample_batch()
+            )
+            .is_err());
     }
 
     #[test]
@@ -3226,16 +3400,22 @@ backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"n
                     (0.0..=64.0).contains(&kp[0]) && (0.0..=64.0).contains(&kp[1]),
                     "关键点应 clamp 在画布内: {kp:?}"
                 );
-                assert!(kp[2] == 0.0 || kp[2] == 2.0, "v 应二值化为 0/2，got {}", kp[2]);
+                assert!(
+                    kp[2] == 0.0 || kp[2] == 2.0,
+                    "v 应二值化为 0/2，got {}",
+                    kp[2]
+                );
             }
             assert!(d.bbox.x2 >= d.bbox.x1 && d.bbox.y2 >= d.bbox.y1, "框应合法");
             assert!((0.0..=1.0).contains(&d.score), "score 应在 [0,1]");
         }
         // NMS 契约：保留集框两两 IoU ≤ 阈值
         let kept = &per_image[0];
-        for (a, b) in kept.iter().enumerate().flat_map(|(i, a)| {
-            kept[i + 1..].iter().map(move |b| (a, b))
-        }) {
+        for (a, b) in kept
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| kept[i + 1..].iter().map(move |b| (a, b)))
+        {
             assert!(
                 a.bbox.iou(&b.bbox) <= 0.5 + 1e-6,
                 "NMS 后框 IoU 应 ≤ 0.5，got {}",
@@ -3277,8 +3457,13 @@ backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"n
         let x = Tensor::from_slice(&buf)
             .to_kind(Kind::Float)
             .reshape([2i64, 3, s as i64, s as i64]);
-        let mut opt = tch::nn::Adam::default().build(&vs, 1e-2).expect("优化器应构建");
-        let first = model.loss(&x, &batch).expect("损失应成功").double_value(&[]);
+        let mut opt = tch::nn::Adam::default()
+            .build(&vs, 1e-2)
+            .expect("优化器应构建");
+        let first = model
+            .loss(&x, &batch)
+            .expect("损失应成功")
+            .double_value(&[]);
         let mut last = first;
         for _ in 0..150 {
             opt.zero_grad();

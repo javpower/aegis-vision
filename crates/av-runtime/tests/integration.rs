@@ -25,8 +25,8 @@ fn detect_cfg() -> RunConfig {
 // ---------------------------------------------------------------------------
 
 use av_core::config::PretrainCfg;
-use av_pretrain::av_weight::{self, WeightMeta};
-use av_pretrain::weight_adapter::{self, LayerMap, LayerMapping};
+use av_pretrain::av_weight::WeightMeta;
+use av_pretrain::weight_adapter::{self, LayerMap};
 use tch::{Device, Kind, Tensor};
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -80,8 +80,16 @@ fn pretrain_native_roundtrip_restores_inference() {
     let x = Tensor::randn([4, 3, 64, 64], (Kind::Float, Device::Cpu));
     let out_ref = model_ref.predict(&x, 0.0, 0.0).expect("参考模型推理应成功");
     let out_new = model_new.predict(&x, 0.0, 0.0).expect("加载模型推理应成功");
-    let (av_tasks::models::PredictOutput::Classify { labels: l1, confs: c1 },
-         av_tasks::models::PredictOutput::Classify { labels: l2, confs: c2 }) = (out_ref, out_new)
+    let (
+        av_tasks::models::PredictOutput::Classify {
+            labels: l1,
+            confs: c1,
+        },
+        av_tasks::models::PredictOutput::Classify {
+            labels: l2,
+            confs: c2,
+        },
+    ) = (out_ref, out_new)
     else {
         panic!("应为分类输出");
     };
@@ -133,18 +141,27 @@ fn pretrain_freeze_backbone_keeps_weights_frozen_during_training() {
         let f = std::path::Path::new(&report.run_dir)
             .join("best.ckpt")
             .join(name.replace('.', "_"));
-        Tensor::load(&f).expect("checkpoint 张量应可读")
+        // 训练设备跟随配置（GPU 环境下为 CUDA），统一转 CPU 再比对
+        Tensor::load(&f)
+            .expect("checkpoint 张量应可读")
+            .to_device(Device::Cpu)
     };
 
     let bb_src = src_of("backbone.c1.weight");
     let bb_trained = read_ckpt("backbone.c1.weight");
     let bb_diff = (bb_src - bb_trained).abs().max().double_value(&[]);
-    assert_eq!(bb_diff, 0.0, "冻结的 backbone 权重必须与导入源逐位一致（diff={bb_diff}）");
+    assert_eq!(
+        bb_diff, 0.0,
+        "冻结的 backbone 权重必须与导入源逐位一致（diff={bb_diff}）"
+    );
 
     let head_src = src_of("head.fc.weight");
     let head_trained = read_ckpt("head.fc.weight");
     let head_diff = (head_src - head_trained).abs().max().double_value(&[]);
-    assert!(head_diff > 0.0, "未冻结的头部权重应被训练更新（diff={head_diff}）");
+    assert!(
+        head_diff > 0.0,
+        "未冻结的头部权重应被训练更新（diff={head_diff}）"
+    );
     let _ = std::fs::remove_file(&src_st);
 }
 
@@ -176,7 +193,11 @@ fn pretrain_safetensors_import_report_chain() {
             .filter(|(n, _)| n.contains("backbone"))
             .map(|(n, t)| (n, t.size()))
             .collect();
-        assert_eq!(targets.len(), 8, "simple-cnn 分类模型应有 8 个 backbone 变量");
+        assert_eq!(
+            targets.len(),
+            8,
+            "simple-cnn 分类模型应有 8 个 backbone 变量"
+        );
 
         // 演示层映射（写入临时 TOML，一并验证 LayerMap::from_toml_path）
         let map_path = temp_dir("layer-map").join("layer_map.toml");
@@ -228,16 +249,33 @@ to = 'backbone.c3.weight'
             .unwrap_or_else(|| panic!("应载入 {target}: {report:?}"))
     };
     assert_eq!(report.loaded.len(), 3, "{}", report.summary());
-    assert_eq!(loaded_of("backbone.c1.weight").source, "model.0.conv.weight");
+    assert_eq!(
+        loaded_of("backbone.c1.weight").source,
+        "model.0.conv.weight"
+    );
     assert_eq!(loaded_of("backbone.c1.weight").shape, vec![16, 3, 3, 3]);
-    assert_eq!(loaded_of("backbone.c2.weight").source, "model.1.conv.weight");
-    assert_eq!(loaded_of("backbone.c3.weight").source, "model.3.conv.weight");
+    assert_eq!(
+        loaded_of("backbone.c2.weight").source,
+        "model.1.conv.weight"
+    );
+    assert_eq!(
+        loaded_of("backbone.c3.weight").source,
+        "model.3.conv.weight"
+    );
     assert_eq!(loaded_of("backbone.c3.weight").shape, vec![64, 32, 3, 3]);
 
     // 演示性不匹配：cv1 分支 [16,16,3,3] ≠ c3 [64,32,3,3]
-    assert_eq!(report.skipped_shape_mismatch.len(), 1, "{}", report.summary());
+    assert_eq!(
+        report.skipped_shape_mismatch.len(),
+        1,
+        "{}",
+        report.summary()
+    );
     assert_eq!(report.skipped_shape_mismatch[0].got, vec![16, 16, 3, 3]);
-    assert_eq!(report.skipped_shape_mismatch[0].expected, vec![64, 32, 3, 3]);
+    assert_eq!(
+        report.skipped_shape_mismatch[0].expected,
+        vec![64, 32, 3, 3]
+    );
 
     // 其余 38 个源（BN/C2f 分支/Int 标量）无处安放；c1.bias、c4 等保持缺失
     assert_eq!(report.unexpected.len(), n_sources - report.loaded.len() - 1);
@@ -279,8 +317,12 @@ fn resnet18_pretrain_import() {
         100,
         "resnet18 骨干应有 100 个变量（20 conv + 40 BN 参数 + 40 BN 统计量）"
     );
-    assert!(targets.iter().any(|(n, _)| n == "backbone.bn1.running_mean"),
-        "BN 统计量必须是 VarStore 命名变量（导入链路的前提）");
+    assert!(
+        targets
+            .iter()
+            .any(|(n, _)| n == "backbone.bn1.running_mean"),
+        "BN 统计量必须是 VarStore 命名变量（导入链路的前提）"
+    );
 
     // 3) 真实导出 + 随仓库发布的映射文件（写临时路径验证 from_toml_path 全链路）
     let sources = weight_adapter::read_safetensors_all(src).expect("torchvision 导出应可读");
@@ -291,7 +333,11 @@ fn resnet18_pretrain_import() {
     );
     let map_path = temp_dir("resnet18-map").join("resnet18_map.toml");
     std::fs::create_dir_all(map_path.parent().unwrap()).unwrap();
-    std::fs::write(&map_path, include_str!("../../../configs/resnet18_map.toml")).unwrap();
+    std::fs::write(
+        &map_path,
+        include_str!("../../../configs/resnet18_map.toml"),
+    )
+    .unwrap();
     let map = LayerMap::from_toml_path(&map_path).expect("层映射应可加载");
     let sources_n = sources.len(); // adapt 按 value 收参，计数先取（borrow 修复）
     let report = weight_adapter::adapt(sources, &map, &targets);
@@ -315,13 +361,27 @@ fn resnet18_pretrain_import() {
         report.summary()
     );
     assert_eq!(report.loaded.len(), 100, "{}", report.summary());
-    assert!(report.missing.is_empty(), "骨干目标应全部命中: {:?}", report.missing);
+    assert!(
+        report.missing.is_empty(),
+        "骨干目标应全部命中: {:?}",
+        report.missing
+    );
     // fc.weight/fc.bias + 20 个 num_batches_tracked → unexpected（完整报告）
     assert_eq!(report.unexpected.len(), sources_n - report.loaded.len());
-    assert!(report.loaded.iter().any(|l| l.target == "backbone.bn1.running_mean"),
-        "BN running 统计量应被导入");
-    assert!(report.loaded.iter().any(|l| l.target == "backbone.layer4.1.bn2.bias"),
-        "深层 BN 参数应被导入");
+    assert!(
+        report
+            .loaded
+            .iter()
+            .any(|l| l.target == "backbone.bn1.running_mean"),
+        "BN running 统计量应被导入"
+    );
+    assert!(
+        report
+            .loaded
+            .iter()
+            .any(|l| l.target == "backbone.layer4.1.bn2.bias"),
+        "深层 BN 参数应被导入"
+    );
 
     // 5) 写回（engine apply_pretrain 同款 no_grad copy_）+ 权重保真抽查
     tch::no_grad(|| {
@@ -342,7 +402,10 @@ fn resnet18_pretrain_import() {
         .expect("conv1.weight 应已载入")
         .1;
     let diff = (&conv1 - conv1_src).abs().max().double_value(&[]);
-    assert_eq!(diff, 0.0, "ImageNet conv1.weight 写回必须逐位一致（diff={diff}）");
+    assert_eq!(
+        diff, 0.0,
+        "ImageNet conv1.weight 写回必须逐位一致（diff={diff}）"
+    );
 
     // 6) 前向形状：分类 logits [N, num_classes]
     let av_tasks::models::TaskModel::Classify(m) = &model else {
@@ -394,6 +457,8 @@ fn detection_trains_and_localizes() {
     let mut rng = XorShift::new(99);
     let (x, _, _) = av_tasks_testing_detect_batch(&mut rng, &cfg2);
     let model = av_runtime::testing::load_model(&cfg2, &weights).expect("权重应可加载");
+    // 模型设备跟随配置解析（GPU 环境下 cuda:0 不会回退 CPU），输入须同设备
+    let x = x.to_device(av_runtime::engine::resolve_device(&cfg2));
     let out = model.predict(&x, 0.25, 0.5).expect("推理应成功");
     let av_tasks::models::PredictOutput::Detect { per_image } = out else {
         panic!("应为检测输出");
@@ -506,16 +571,22 @@ fn imagenette_pipeline() {
     assert_eq!(class_map.len(), 10, "ImageNette 应有 10 个 wnid 类");
     assert!(val.len() > 1000, "val 应有数千张图，实际 {}", val.len());
     assert_eq!(val.len(), labels.len(), "样本与标签应一一对应");
-    assert!(labels.iter().all(|&l| (l as u32) < num_classes));
+    assert!(labels.iter().all(|&l| l < num_classes));
 
     // 限前 64 样本加速
     let n = val.len().min(64);
     let subset: Vec<_> = val[..n].to_vec();
     let x = av_runtime::dataset::stack_classify(&subset).expect("样本堆叠应成功");
-    assert_eq!(x.size(), vec![n as i64, 3, img_size as i64, img_size as i64]);
+    assert_eq!(
+        x.size(),
+        vec![n as i64, 3, img_size as i64, img_size as i64]
+    );
     // 像素域 [0,1]
     let (mn, mx) = (x.min().double_value(&[]), x.max().double_value(&[]));
-    assert!((0.0..=1.0).contains(&mn) && (0.0..=1.0).contains(&mx), "min={mn} max={mx}");
+    assert!(
+        (0.0..=1.0).contains(&mn) && (0.0..=1.0).contains(&mx),
+        "min={mn} max={mx}"
+    );
 
     // 随机权重模型 forward：logits 形状 [B,10] 且无 NaN
     let vs = tch::nn::VarStore::new(tch::Device::Cpu);
@@ -532,7 +603,11 @@ fn imagenette_pipeline() {
     let (pred, confs) = m.predict(&x).expect("predict 应成功");
     assert_eq!(pred.len(), n);
     assert_eq!(confs.len(), n);
-    let correct = pred.iter().zip(&labels[..n]).filter(|(a, b)| a == b).count();
+    let correct = pred
+        .iter()
+        .zip(&labels[..n])
+        .filter(|(a, b)| a == b)
+        .count();
     let top1 = correct as f32 / n as f32;
     assert!((0.0..=1.0).contains(&top1), "top1 应在 [0,1]，实际 {top1}");
 }
@@ -602,7 +677,11 @@ fn seg_coco8_pipeline() {
             assert!((0.0..=1.0).contains(&it.score), "score 应在 [0,1]");
         }
     }
-    println!("coco8-seg 管线：val {} 图 / {n_inst} 实例，loss={:.4}", val.len(), loss.double_value(&[]));
+    println!(
+        "coco8-seg 管线：val {} 图 / {n_inst} 实例，loss={:.4}",
+        val.len(),
+        loss.double_value(&[])
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -631,8 +710,9 @@ fn keypoint_coco8_pipeline() {
     assert_eq!(num_keypoints, 17);
 
     // val split 加载：每实例 17 个 [x,y,v] 画布像素 + cxcywh 框
-    let val = av_runtime::dataset::load_cocopose_dir(root, "val", img_size, tch::Device::Cpu, false)
-        .expect("coco8-pose val 应可加载");
+    let val =
+        av_runtime::dataset::load_cocopose_dir(root, "val", img_size, tch::Device::Cpu, false)
+            .expect("coco8-pose val 应可加载");
     assert_eq!(val.len(), 4, "coco8-pose val 应有 4 张图");
     assert!(val.iter().all(|s| s.boxes.len() == s.kpts.len()));
     let n_inst = val.iter().map(|s| s.kpts.len()).sum::<usize>();
@@ -676,9 +756,8 @@ fn keypoint_coco8_pipeline() {
     loss.backward();
 
     // predict 出口：每实例 17 个画布内关键点 + 可见性二值标志
-    let PredictOutput::Keypoint { per_image } = model
-        .predict(&x, 0.05, 0.5)
-        .expect("predict 应成功")
+    let PredictOutput::Keypoint { per_image } =
+        model.predict(&x, 0.05, 0.5).expect("predict 应成功")
     else {
         panic!("应为关键点输出");
     };
@@ -699,10 +778,13 @@ fn keypoint_coco8_pipeline() {
     let TaskModel::Keypoint(m) = &model else {
         panic!("应为关键点模型");
     };
-    let (pck, mean_oks, n_vis, n_inst_eval) = av_runtime::testing::eval_kp_samples(m, &val)
-        .expect("PCK 评测应成功");
+    let (pck, mean_oks, n_vis, n_inst_eval) =
+        av_runtime::testing::eval_kp_samples(m, &val).expect("PCK 评测应成功");
     assert!((0.0..=1.0).contains(&pck), "PCK 应在 [0,1]，实际 {pck}");
-    assert!((0.0..=1.0).contains(&mean_oks), "mean OKS 应在 [0,1]，实际 {mean_oks}");
+    assert!(
+        (0.0..=1.0).contains(&mean_oks),
+        "mean OKS 应在 [0,1]，实际 {mean_oks}"
+    );
     assert!(n_vis > 0 && n_inst_eval == n_inst);
     println!(
         "coco8-pose 管线：val {} 图 / {n_inst} 实例 / {n_vis} 可见点，loss={:.4} 随机权重 PCK={pck:.3}",
@@ -731,26 +813,30 @@ fn augment_raw_encode_consistency_on_real_data() {
         println!("[skip] {root:?} 不存在，跳过增强一致性测试（关键点）");
         return;
     }
-    let img_size = match RunConfig::from_toml_str(include_str!(
-        "../../../configs/keypoint_coco8.toml"
-    ))
-    .expect("keypoint_coco8 配置必须合法")
-    .model
-    .tasks
-    .first()
-    {
-        Some(av_core::config::TaskCfg::Keypoint(k)) => k.img_size,
-        _ => panic!("keypoint_coco8 应为关键点任务"),
-    };
+    let img_size =
+        match RunConfig::from_toml_str(include_str!("../../../configs/keypoint_coco8.toml"))
+            .expect("keypoint_coco8 配置必须合法")
+            .model
+            .tasks
+            .first()
+        {
+            Some(av_core::config::TaskCfg::Keypoint(k)) => k.img_size,
+            _ => panic!("keypoint_coco8 应为关键点任务"),
+        };
     let plain = dataset::load_cocopose_dir(root, "train", img_size, tch::Device::Cpu, false)
         .expect("coco8-pose train 应可加载");
     let raw = dataset::load_cocopose_dir_raw(root, "train").expect("raw 加载应成功");
     assert_eq!(plain.len(), raw.len());
     assert!(!plain.is_empty());
     for (p, r) in plain.iter().zip(&raw) {
-        let enc =
-            dataset::encode_keypoint_sample(r, img_size, tch::Device::Cpu, &AugmentPlan::none(), false)
-                .expect("none 编码应成功");
+        let enc = dataset::encode_keypoint_sample(
+            r,
+            img_size,
+            tch::Device::Cpu,
+            &AugmentPlan::none(),
+            false,
+        )
+        .expect("none 编码应成功");
         let diff = (&p.x - &enc.x).abs().max().double_value(&[]);
         assert_eq!(diff, 0.0, "none() 编码张量应与 plain 加载器逐位一致");
         assert_eq!(p.boxes, enc.boxes, "none() 框应一致");
@@ -783,7 +869,8 @@ fn augment_raw_encode_consistency_on_real_data() {
             for b in &enc.boxes {
                 assert!(b[2] > 0.0 && b[3] > 0.0, "框宽高应保持正: {b:?}");
                 assert!(
-                    (0.0..=img_size as f32).contains(&b[0]) && (0.0..=img_size as f32).contains(&b[1]),
+                    (0.0..=img_size as f32).contains(&b[0])
+                        && (0.0..=img_size as f32).contains(&b[1]),
                     "框中心应在画布内: {b:?}"
                 );
             }
@@ -796,15 +883,16 @@ fn augment_raw_encode_consistency_on_real_data() {
         println!("[skip] {root:?} 不存在，跳过增强一致性测试（检测）");
         return;
     }
-    let img_size = match RunConfig::from_toml_str(include_str!("../../../configs/detect_coco8.toml"))
-        .expect("detect_coco8 配置必须合法")
-        .model
-        .tasks
-        .first()
-    {
-        Some(av_core::config::TaskCfg::Detect(d)) => d.img_size,
-        _ => panic!("detect_coco8 应为检测任务"),
-    };
+    let img_size =
+        match RunConfig::from_toml_str(include_str!("../../../configs/detect_coco8.toml"))
+            .expect("detect_coco8 配置必须合法")
+            .model
+            .tasks
+            .first()
+        {
+            Some(av_core::config::TaskCfg::Detect(d)) => d.img_size,
+            _ => panic!("detect_coco8 应为检测任务"),
+        };
     let plain = dataset::load_yolo_dir(root, "train", img_size, tch::Device::Cpu, false)
         .expect("coco8 train 应可加载");
     let raw = dataset::load_yolo_dir_raw(root, "train").expect("raw 加载应成功");
@@ -835,14 +923,11 @@ fn augment_raw_encode_consistency_on_real_data() {
 /// 关断语义由 av-tasks::augment 单测锁定；两臂除 augment 外逐字段一致）。
 #[test]
 fn augment_ab_keypoint_configs_parse() {
-    let base = RunConfig::from_toml_str(include_str!(
-        "../../../configs/keypoint_coco8_ab_base.toml"
-    ))
-    .expect("A/B 基线配置必须合法");
-    let aug = RunConfig::from_toml_str(include_str!(
-        "../../../configs/keypoint_coco8_ab_aug.toml"
-    ))
-    .expect("A/B 增强配置必须合法");
+    let base =
+        RunConfig::from_toml_str(include_str!("../../../configs/keypoint_coco8_ab_base.toml"))
+            .expect("A/B 基线配置必须合法");
+    let aug = RunConfig::from_toml_str(include_str!("../../../configs/keypoint_coco8_ab_aug.toml"))
+        .expect("A/B 增强配置必须合法");
 
     let base_aug = &base.data.sources.train.tasks[0].augment;
     assert!(!av_tasks::augment::has_strength(base_aug), "基线臂应无增强");
@@ -889,17 +974,16 @@ fn coco8_avpack_pipeline_matches_dir_loader() {
     let (n, _) = av_runtime::avpack::pack_dir(root, &pack_path).expect("coco8 打包应成功");
     assert!(n > 0, "打包应产出条目");
 
-    let img_size = match RunConfig::from_toml_str(include_str!(
-        "../../../configs/detect_coco8_avpack.toml"
-    ))
-    .expect("detect_coco8_avpack 配置必须合法")
-    .model
-    .tasks
-    .first()
-    {
-        Some(av_core::config::TaskCfg::Detect(d)) => d.img_size,
-        _ => panic!("detect_coco8_avpack 应为检测任务"),
-    };
+    let img_size =
+        match RunConfig::from_toml_str(include_str!("../../../configs/detect_coco8_avpack.toml"))
+            .expect("detect_coco8_avpack 配置必须合法")
+            .model
+            .tasks
+            .first()
+        {
+            Some(av_core::config::TaskCfg::Detect(d)) => d.img_size,
+            _ => panic!("detect_coco8_avpack 应为检测任务"),
+        };
 
     let packed = dataset::load_yolo_avpack(&pack_path, "val", img_size, tch::Device::Cpu, false)
         .expect("avpack val split 应可加载");
@@ -918,7 +1002,10 @@ fn coco8_avpack_pipeline_matches_dir_loader() {
             }
             // 画布内（letterbox map_box 的裁剪边界留 0.5px 容差）
             assert!(*b.first().unwrap() >= -0.5 && *b.last().unwrap() <= img_size as f32 + 0.5);
-            assert!(b[0] <= b[2] + 1e-3 && b[1] <= b[3] + 1e-3, "样本 {i} 框退化: {b:?}");
+            assert!(
+                b[0] <= b[2] + 1e-3 && b[1] <= b[3] + 1e-3,
+                "样本 {i} 框退化: {b:?}"
+            );
         }
     }
 
@@ -930,7 +1017,11 @@ fn coco8_avpack_pipeline_matches_dir_loader() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
-    println!("coco8 avpack 管线：容器 {} 条目，val {} 样本与目录加载一致", n, packed.len());
+    println!(
+        "coco8 avpack 管线：容器 {} 条目，val {} 样本与目录加载一致",
+        n,
+        packed.len()
+    );
 }
 
 /// avpack 管线端到端训练冒烟：整条「容器 → 样本 → 训练循环 → checkpoint 落盘」
@@ -950,10 +1041,9 @@ fn coco8_avpack_train_smoke() {
     let pack_path = tmp.join("coco8.avpack");
     av_runtime::avpack::pack_dir(root, &pack_path).expect("coco8 打包应成功");
 
-    let mut cfg = RunConfig::from_toml_str(include_str!(
-        "../../../configs/detect_coco8_avpack.toml"
-    ))
-    .expect("detect_coco8_avpack 配置必须合法");
+    let mut cfg =
+        RunConfig::from_toml_str(include_str!("../../../configs/detect_coco8_avpack.toml"))
+            .expect("detect_coco8_avpack 配置必须合法");
     cfg.run_id = format!("avpack-smoke-{}", std::process::id());
     cfg.data.sources.train.avpack = Some(pack_path.clone());
     cfg.data.sources.val.avpack = Some(pack_path.clone());
@@ -962,10 +1052,17 @@ fn coco8_avpack_train_smoke() {
 
     let rep = av_runtime::engine::train(&cfg).expect("avpack 训练冒烟应成功");
     assert_eq!(rep.epochs, 2);
-    assert!(rep.final_loss.is_finite(), "loss 应有限: {}", rep.final_loss);
+    assert!(
+        rep.final_loss.is_finite(),
+        "loss 应有限: {}",
+        rep.final_loss
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
-    println!("avpack 训练冒烟：task={} loss={:.4} run={}", rep.task, rep.final_loss, rep.run_id);
+    println!(
+        "avpack 训练冒烟：task={} loss={:.4} run={}",
+        rep.task, rep.final_loss, rep.run_id
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,13 +1108,17 @@ fn dinov2_pretrained_import_and_forward() {
         family: "dinov2".into(),
         ..Default::default()
     };
-    let mut backbone =
-        DinoV2Backbone::new(&vs.root(), &cfg, img).expect("224 应满足 14/32 整除");
+    let mut backbone = DinoV2Backbone::new(&vs.root(), &cfg, img).expect("224 应满足 14/32 整除");
 
-    let x = Tensor::randn([2, 3, img as i64, img as i64], (tch::Kind::Float, tch::Device::Cpu));
+    let x = Tensor::randn(
+        [2, 3, img as i64, img as i64],
+        (tch::Kind::Float, tch::Device::Cpu),
+    );
     let pooled_before = tch::no_grad(|| backbone.forward_pooled(&x).unwrap());
 
-    let stats = backbone.load_dinov2_weights(&ckpt).expect("官方权重导入应成功");
+    let stats = backbone
+        .load_dinov2_weights(&ckpt)
+        .expect("官方权重导入应成功");
     println!("[dinov2] 导入统计: {}", stats.summary());
     println!(
         "[dinov2] 非骨干跳过样例: {:?}",
@@ -1029,7 +1130,11 @@ fn dinov2_pretrained_import_and_forward() {
         stats.load_ratio(),
         stats.summary()
     );
-    assert!(stats.loaded >= 170, "ViT-S/14 骨干应有 174 个目标张量，实际 {}", stats.loaded);
+    assert!(
+        stats.loaded >= 170,
+        "ViT-S/14 骨干应有 174 个目标张量，实际 {}",
+        stats.loaded
+    );
     assert!(
         stats.pos_embed_interpolated,
         "518 训练网格 37×37 → 224 网格 16×16 必然触发 pos_embed 插值"
@@ -1053,7 +1158,11 @@ fn dinov2_pretrained_import_and_forward() {
     assert_eq!(sizes[1], vec![2, 256, 14, 14]);
     assert_eq!(sizes[2], vec![2, 256, 7, 7]);
     for l in &pyramid.levels {
-        assert!(!dino_has_nan(&l.tensor), "stride {} 特征不应含 NaN", l.stride);
+        assert!(
+            !dino_has_nan(&l.tensor),
+            "stride {} 特征不应含 NaN",
+            l.stride
+        );
     }
     println!("[dinov2] 金字塔形状: {sizes:?}");
 }
@@ -1070,7 +1179,7 @@ fn dinov2_forward_multi_resolution() {
         assert_eq!(pooled.size(), vec![1, 384], "img={img}");
         assert!(!dino_has_nan(&pooled), "img={img}");
         let g = img / 14;
-        assert_eq!((g * g) as i64 + 1, 1 + g * g); // 网格语义自检（trivial，防手滑改坏）
+        assert_eq!(g * g + 1, 1 + g * g); // 网格语义自检（trivial，防手滑改坏）
     }
 }
 
@@ -1086,7 +1195,7 @@ fn dinov2_latency_report() {
 
     // warmup（首跑含内核/显存初始化）
     for _ in 0..2 {
-        tch::no_grad(|| backbone.forward_pooled(&x).unwrap());
+        let _ = tch::no_grad(|| backbone.forward_pooled(&x).unwrap());
     }
     if device == tch::Device::Cpu {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1095,7 +1204,7 @@ fn dinov2_latency_report() {
     let mut times = Vec::new();
     for _ in 0..runs {
         let t0 = std::time::Instant::now();
-        tch::no_grad(|| backbone.forward_pooled(&x).unwrap());
+        let _ = tch::no_grad(|| backbone.forward_pooled(&x).unwrap());
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -1143,8 +1252,7 @@ fn matrix_initial_loss(
     if pretrain {
         let weight = workspace_root().join("data/pretrain/resnet18_imagenet.safetensors");
         let map_path = workspace_root().join("configs/resnet18_map.toml");
-        let sources =
-            weight_adapter::read_safetensors_all(&weight).expect("ImageNet 导出应可读");
+        let sources = weight_adapter::read_safetensors_all(&weight).expect("ImageNet 导出应可读");
         let map = LayerMap::from_toml_path(&map_path).expect("resnet18_map 应可读");
         let targets: Vec<(String, Vec<i64>)> = vs
             .variables()
@@ -1153,7 +1261,10 @@ fn matrix_initial_loss(
             .map(|(n, t)| (n, t.size()))
             .collect();
         let report = weight_adapter::adapt(sources, &map, &targets);
-        println!("[matrix] ImageNet 导入（初始 loss 前）: {}", report.summary());
+        println!(
+            "[matrix] ImageNet 导入（初始 loss 前）: {}",
+            report.summary()
+        );
         assert_eq!(
             report.loaded.len(),
             100,
@@ -1169,7 +1280,10 @@ fn matrix_initial_loss(
             }
         });
     }
-    model.loss(x, batch).expect("初始 loss 应成功").double_value(&[])
+    model
+        .loss(x, batch)
+        .expect("初始 loss 应成功")
+        .double_value(&[])
 }
 
 #[test]
@@ -1190,7 +1304,11 @@ fn pretrain_ab_matrix_coco8_detect_three_arms() {
         .expect("coco8 train 应可加载");
     assert_eq!(train.len(), 4, "coco8 train 应有 4 张图");
     let x = av_runtime::dataset::stack_samples(&train).expect("堆批应成功");
-    assert_eq!(x.size(), vec![4, 3, 320, 320], "letterbox 后应为 [N,3,320,320]");
+    assert_eq!(
+        x.size(),
+        vec![4, 3, 320, 320],
+        "letterbox 后应为 [N,3,320,320]"
+    );
     let batch = av_tasks::models::TrainBatch::Detect {
         boxes: train.iter().map(|s| s.boxes.clone()).collect(),
         labels: train.iter().map(|s| s.labels.clone()).collect(),
@@ -1240,11 +1358,8 @@ fn pretrain_ab_matrix_coco8_detect_three_arms() {
             family: "resnet18".into(),
             ..Default::default()
         };
-        let bb = av_tasks::backbone_resnet::ResNetBackbone::new(
-            &(vs.root() / "backbone"),
-            &bb_cfg,
-        )
-        .expect("resnet18 骨干装配应成功");
+        let bb = av_tasks::backbone_resnet::ResNetBackbone::new(&(vs.root() / "backbone"), &bb_cfg)
+            .expect("resnet18 骨干装配应成功");
         let py = tch::no_grad(|| bb.forward_features(&x).expect("金字塔前向应成功"));
         let expect = [(4u32, 64i64, 80i64), (8, 128, 40), (16, 256, 20)];
         assert_eq!(py.levels.len(), expect.len());
@@ -1261,8 +1376,8 @@ fn pretrain_ab_matrix_coco8_detect_three_arms() {
         ("A2 resnet18 从零", cfg_a2.clone()),
         ("A3 resnet18+ImageNet", cfg_a3.clone()),
     ] {
-        let rep = av_runtime::engine::train(&cfg)
-            .unwrap_or_else(|e| panic!("{name} 训练应成功: {e}"));
+        let rep =
+            av_runtime::engine::train(&cfg).unwrap_or_else(|e| panic!("{name} 训练应成功: {e}"));
         assert_eq!(rep.epochs, 60, "{name} 应跑满 60 epochs");
         assert!(rep.final_loss.is_finite(), "{name} 最终 loss 应有限");
         assert!(
@@ -1280,9 +1395,18 @@ fn pretrain_ab_matrix_coco8_detect_three_arms() {
 
     println!("\n==== 预训练 A/B 矩阵（coco8 检测 60ep CPU img320）====");
     println!("臂                    | 初始 loss | 最终 loss | 最终 mIoU");
-    println!("A1 simple-cnn 从零     | {loss_a1:9.4} | {:9.4} | {:9.4}", rows[0].1, rows[0].2);
-    println!("A2 resnet18 从零       | {loss_a2:9.4} | {:9.4} | {:9.4}", rows[1].1, rows[1].2);
-    println!("A3 resnet18+ImageNet   | {loss_a3:9.4} | {:9.4} | {:9.4}", rows[2].1, rows[2].2);
+    println!(
+        "A1 simple-cnn 从零     | {loss_a1:9.4} | {:9.4} | {:9.4}",
+        rows[0].1, rows[0].2
+    );
+    println!(
+        "A2 resnet18 从零       | {loss_a2:9.4} | {:9.4} | {:9.4}",
+        rows[1].1, rows[1].2
+    );
+    println!(
+        "A3 resnet18+ImageNet   | {loss_a3:9.4} | {:9.4} | {:9.4}",
+        rows[2].1, rows[2].2
+    );
 
     for (dir, _) in [
         (cfg_a1.output_dir.clone(), ()),
@@ -1353,7 +1477,10 @@ fn ab2_arm_initial_loss(
             }
         });
     }
-    model.loss(x, batch).expect("ab2 初始 loss 应成功").double_value(&[])
+    model
+        .loss(x, batch)
+        .expect("ab2 初始 loss 应成功")
+        .double_value(&[])
 }
 
 #[test]
@@ -1369,8 +1496,14 @@ fn resnet18_ab_norm_bn_phase2() {
         return;
     }
 
-    let cfg_base = matrix_arm_cfg(include_str!("../../../configs/resnet18_ab_base.toml"), "ab2-base");
-    let mut cfg_pre = matrix_arm_cfg(include_str!("../../../configs/resnet18_ab_pretrain.toml"), "ab2-pre");
+    let cfg_base = matrix_arm_cfg(
+        include_str!("../../../configs/resnet18_ab_base.toml"),
+        "ab2-base",
+    );
+    let mut cfg_pre = matrix_arm_cfg(
+        include_str!("../../../configs/resnet18_ab_pretrain.toml"),
+        "ab2-pre",
+    );
     // 补充臂（第一期遗留清单第 4 条）：冻结骨干只训头（BN 恒 eval，统计量不被
     // batch=4 噪声冲刷）——预训练特征在公平条件下的贡献。
     let mut cfg_frz = matrix_arm_cfg(
@@ -1394,7 +1527,10 @@ fn resnet18_ab_norm_bn_phase2() {
     // 归一化真实生效的信号：两域输入必须可测地不同（同 letterbox 几何，只差数值域）
     let domain_shift = tch::no_grad(|| (&x_pre - &x_base).abs().max().double_value(&[]));
     println!("[ab2] 两域输入最大绝对差 = {domain_shift:.4}（ImageNet 归一化生效信号）");
-    assert!(domain_shift > 0.5, "imagenet_norm = true 必须改变输入域（差值 {domain_shift}）");
+    assert!(
+        domain_shift > 0.5,
+        "imagenet_norm = true 必须改变输入域（差值 {domain_shift}）"
+    );
     let batch_base = av_tasks::models::TrainBatch::Detect {
         boxes: train_base.iter().map(|s| s.boxes.clone()).collect(),
         labels: train_base.iter().map(|s| s.labels.clone()).collect(),
@@ -1443,8 +1579,9 @@ fn resnet18_ab_norm_bn_phase2() {
             let model = av_tasks::models::build_model(&vs.root(), cfg).expect("装配应成功");
             if pre {
                 let sources = weight_adapter::read_safetensors_all(&weight).expect("权重应可读");
-                let map = LayerMap::from_toml_path(&workspace_root().join("configs/resnet18_map.toml"))
-                    .expect("resnet18_map 应可读");
+                let map =
+                    LayerMap::from_toml_path(&workspace_root().join("configs/resnet18_map.toml"))
+                        .expect("resnet18_map 应可读");
                 let targets: Vec<(String, Vec<i64>)> = vs
                     .variables()
                     .into_iter()
@@ -1462,7 +1599,8 @@ fn resnet18_ab_norm_bn_phase2() {
                 });
             }
             for step in 0..3 {
-                av_tasks::models::LOSS_DEBUG.with(|d| *d.borrow_mut() = Some(format!("[ab2 {name} step{step}]")));
+                av_tasks::models::LOSS_DEBUG
+                    .with(|d| *d.borrow_mut() = Some(format!("[ab2 {name} step{step}]")));
                 let l = model.loss(x, batch).expect("loss 应成功").double_value(&[]);
                 println!("[ab2] {name} step{step} total={l:.4}");
             }
@@ -1479,7 +1617,8 @@ fn resnet18_ab_norm_bn_phase2() {
     //   ① 归一化生效（两域输入差 = 2.1179 = 1/0.229·0.485 域偏移，上方断言）；
     //   ② ImageNet 权重真实进入前向（同 seed 配对 |Δ总loss| ≫ 数值噪声）；
     //   ③ 120ep 训练全链路 + 最终指标对比（下方）。
-    let loss_base_2026 = ab2_arm_initial_loss(&cfg_base, &x_base, &batch_base, false, &weight, 2026);
+    let loss_base_2026 =
+        ab2_arm_initial_loss(&cfg_base, &x_base, &batch_base, false, &weight, 2026);
     let loss_pre_2026 = ab2_arm_initial_loss(&cfg_pre, &x_pre, &batch_pre, true, &weight, 2026);
     assert!(
         (loss_pre_2026 - loss_base_2026).abs() > 1e-3,
@@ -1494,8 +1633,8 @@ fn resnet18_ab_norm_bn_phase2() {
         ("pretrain resnet18+ImageNet", cfg_pre.clone()),
         ("pretrain 冻结骨干(BN eval)", cfg_frz.clone()),
     ] {
-        let rep = av_runtime::engine::train(&cfg)
-            .unwrap_or_else(|e| panic!("{name} 训练应成功: {e}"));
+        let rep =
+            av_runtime::engine::train(&cfg).unwrap_or_else(|e| panic!("{name} 训练应成功: {e}"));
         assert_eq!(rep.epochs, 120, "{name} 应跑满 120 epochs");
         assert!(rep.final_loss.is_finite(), "{name} 最终 loss 应有限");
         assert!(
@@ -1522,7 +1661,11 @@ fn resnet18_ab_norm_bn_phase2() {
         rows[2].1, rows[2].2, rows[2].3
     );
 
-    for dir in [cfg_base.output_dir.clone(), cfg_pre.output_dir.clone(), cfg_frz.output_dir.clone()] {
+    for dir in [
+        cfg_base.output_dir.clone(),
+        cfg_pre.output_dir.clone(),
+        cfg_frz.output_dir.clone(),
+    ] {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

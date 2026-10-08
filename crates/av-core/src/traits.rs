@@ -194,12 +194,12 @@ mod tests {
 
     #[test]
     fn feature_map_shape_contract() {
-        let t = Tensor::randn(&[1, 8, 16, 16], (tch::Kind::Float, tch::Device::Cpu));
+        let t = Tensor::randn([1, 8, 16, 16], (tch::Kind::Float, tch::Device::Cpu));
         let fm = FeatureMap::new(t, 8).unwrap();
         assert_eq!(fm.channels, 8);
         assert_eq!(fm.height(), 16);
 
-        let bad = Tensor::randn(&[8, 16, 16], (tch::Kind::Float, tch::Device::Cpu));
+        let bad = Tensor::randn([8, 16, 16], (tch::Kind::Float, tch::Device::Cpu));
         assert!(FeatureMap::new(bad, 8).is_err());
     }
 
@@ -208,14 +208,14 @@ mod tests {
         let mut p = FeaturePyramid::default();
         p.levels.push(
             FeatureMap::new(
-                Tensor::randn(&[1, 8, 32, 32], (tch::Kind::Float, tch::Device::Cpu)),
+                Tensor::randn([1, 8, 32, 32], (tch::Kind::Float, tch::Device::Cpu)),
                 8,
             )
             .unwrap(),
         );
         p.levels.push(
             FeatureMap::new(
-                Tensor::randn(&[1, 8, 16, 16], (tch::Kind::Float, tch::Device::Cpu)),
+                Tensor::randn([1, 8, 16, 16], (tch::Kind::Float, tch::Device::Cpu)),
                 16,
             )
             .unwrap(),

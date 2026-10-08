@@ -135,9 +135,36 @@ CUDA shim）；观测面板；.avpack 容器。
 GPU 与编码重叠）/ `off`（历史路径）。语义对齐：掩码坐标逐位一致；s=1 无增益时
 像素逐位一致；增益/缩放路径为定点次序差（单测容差锁定），none/flip 逐位一致。
 
+**数据管线 v2（`[data].cache`，detect 增强路径）**：同款内容贴片缓存——mosaic/mixup/
+flip/hsv/scale 全部在贴片上进行，全分辨率重采样一次性完成。dir 源为**流式构建**
+（逐文件解码→缩放→丢弃，可直接吃 5472×3648 原始数据集，无需预降采样）；avpack
+源就地转换；`off` 保留 raw 逐 epoch 路径（gpu 档未实现，按 ram）。none-plan 编码
+与 raw 路径逐位一致；mosaic/mixup 因重采样链不同像素有差（增强语义不变）。
+配套优化：批间双缓冲预取（编码线程与 GPU 计算重叠）+ SIMD 缩放
+（fast_image_resize，Bilinear 卷积核统一全部数据准备路径）。实测 glass-logo
+（5472×3648 原图直训，1280 输入）：195 → 43 秒/epoch（4.5×）。
+1280 输入建议 `batch_size ≤ 4` + `RAYON_NUM_THREADS ≤ 16`（commit 内存稳定 ~38GB；
+b8/24 线程在长训练后段有 commit 耗尽风险）。已知边界：detect/OBB/关键点尚无
+周期存盘，`--resume` 目前仅 seg 支持。
+
+**推理可视化**：`av infer --save-viz <DIR>` 把检测框（按类 8 色循环着色）与
+`C<id> <score>` 标签画在原图上存为 `<DIR>/<文件名>.jpg`（无第三方绘图依赖，
+内置 3×5 微型字模）。
+
+**AMP 混合精度（`[train].amp`，detect 路径）**：CUDA 上 fp16 autocast +
+动态梯度缩放（torch GradScaler 同款：放大 loss 反向、反缩放前检测 inf/NaN
+跳步回退、稳定后按 2000 步间隔放大）。tch 的 autocast 固定 fp16 且无原生
+GradScaler，缩放器为手写实现；CPU 自动 no-op。评测推理同走 autocast。
+实测同数据同 batch：步进 ~130ms → ~87ms（fp32 → fp16，b4）。
+
+**EMA + best 选择（detect 路径）**：EMA 影子权重每个 optimizer step 更新
+（前期衰减调度 `d = min(decay, (1+t)/(10+t))`，与 Ultralytics ModelEMA 同款），
+eval 与 checkpoint 消费影子权重；`best.ckpt` 按
+`fitness = 0.9·mAP50:95 + 0.1·mAP50` 保存最优 EMA 快照（不再是"最后一轮"）。
+
 **按里程碑排期（PLAN §8）**：mosaic/mixup 增强、heatmap/SimDR 关键点档、
-RoIAlign 精度分割档、RF-DETR 头（M6）、AMP/多卡/memmap 容器（M7，tch 无原生
-API 需自研）、ONNX/TensorRT 导出（M8，Python 侧车）、蒸馏/NAS（M9）。
+RoIAlign 精度分割档、RF-DETR 头（M6）、多卡/memmap 容器（M7）、
+ONNX/TensorRT 导出（M8，Python 侧车）、蒸馏/NAS（M9）。
 
 ---
 
@@ -278,8 +305,8 @@ cudnn/内核启动三级检查内建。
 | 1 | tch 0.26（libtorch 2.13）MSVC 14.44 胶水编译失败（C7555/C2059 级联，上游 bug） | 锁 tch 0.24（2.11 可编译）；勿擅自升级 |
 | 2 | tch 0.17 VarStore::save/load legacy 格式 Windows 损坏 | 自研目录式 checkpoint（blake3 校验） |
 | 3 | torch-sys ≥0.20 不自动加载 torch_cuda.dll | cuda_link.rs LoadLibrary shim |
-| 4 | avpack 读取为整集载入内存 | 大数据集 memmap 直读按 M3 优化 |
-| 5 | 训练不可逐位复现（CPU 多线程浮点非确定性） | deterministic 配置位已预留；PCK 跑间波动 ±0.09 属正常 |
+| 4 | avpack 读取为整集载入内存 | 已闭环：`AvPackReader` 持有 memmap 只读映射，容器不进堆、条目字节零拷贝切片、按名 O(1) 索引（新增 `entry`/`bytes`；`read` 保留条目级 blake3 校验语义） |
+| 5 | 训练不可逐位复现（模型初始权重走 torch 全局 RNG） | `deterministic = true` 已接线：训练入口播种 `tch::manual_seed(seed)`，实测两次运行 epoch1 loss 逐位一致；数据侧 shuffle/增强本就由 seed 驱动的 XorShift 决定 |
 | 6 | 直接运行 exe 需 libtorch\lib 在 PATH | cargo run 自动注入；setup-env.ps1 已设 |
 
 ---

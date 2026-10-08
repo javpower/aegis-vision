@@ -27,6 +27,8 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 image = { workspace = true }
 rayon = { workspace = true }
+# 容器直读（PLAN 附录 B：海量小文件 IO 的解法——mmap 数据区，避免整容器进堆）
+memmap2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 axum = { workspace = true, optional = true }
@@ -36,6 +38,7 @@ tokio = { workspace = true, optional = true, features = ["time"] }
 # 依赖树内——axum 传递依赖，锁 0.3.34；此处仅显式声明，零新增下载）
 futures-core = "0.3"
 tch = { workspace = true, optional = true }
+fast_image_resize = "6.1.0"
 
 [dev-dependencies]
 # 面板 SSE 集成测试用裸 TCP 收发，需要 AsyncRead/WriteExt（io-util 仅测试期启用）

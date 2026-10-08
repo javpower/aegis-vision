@@ -20,7 +20,7 @@ use av_core::error::AvResult;
 use burn_core as burn;
 use burn_core::module::Module;
 use burn_core::tensor::backend::Backend;
-use burn_core::tensor::{Tensor, TensorData, activation::log_sigmoid, activation::sigmoid};
+use burn_core::tensor::{activation::log_sigmoid, activation::sigmoid, Tensor, TensorData};
 
 use crate::backbone::{BackboneCfg, CspElanBackbone};
 use crate::head::MaskHead;
@@ -46,12 +46,7 @@ pub fn bce_with_logits_mean<B: Backend, const D: usize>(
 
 /// 掩码扁平质心 → stride16 cell 索引 (hi, wi)（与 tch SegModel::loss 逐式对齐：
 /// 质心以掩码画布像素为单位，cell 边 = 画布/网格数，末行/列钳位）。
-pub fn centroid_cell(
-    gt_mask: &[u8],
-    mw: usize,
-    gh: usize,
-    gw: usize,
-) -> Option<(usize, usize)> {
+pub fn centroid_cell(gt_mask: &[u8], mw: usize, gh: usize, gw: usize) -> Option<(usize, usize)> {
     let mh = mw;
     if gt_mask.len() != mh * mw {
         return None;
@@ -83,7 +78,9 @@ pub fn combine_proto_coef<B: Backend>(
     mh: usize,
     mw: usize,
 ) -> Tensor<B, 2> {
-    (proto_sigmoid * coef.reshape([k, 1, 1])).sum_dim(0).reshape([mh, mw])
+    (proto_sigmoid * coef.reshape([k, 1, 1]))
+        .sum_dim(0)
+        .reshape([mh, mw])
 }
 
 /// 分割模型装配参数。
@@ -114,7 +111,10 @@ impl<B: Backend> SegNet<B> {
     /// 装配（width/depth 传给骨干；头挂 P4 通道）。
     pub fn new(cfg: &SegNetCfg, device: &B::Device) -> AvResult<Self> {
         let backbone = CspElanBackbone::new(
-            &BackboneCfg { width: cfg.width, depth: cfg.depth },
+            &BackboneCfg {
+                width: cfg.width,
+                depth: cfg.depth,
+            },
             device,
         )?;
         let (_p3, p4, _p5) = backbone.pyramid_channels();
@@ -161,10 +161,14 @@ impl<B: Backend> SegNet<B> {
         // 掩码项累加器（恒连图的零张量，避免批内无实例时构建空 sum）。
         let mut mask_sum = Tensor::<B, 1>::zeros([1], &device);
         let mut mask_cnt = 0usize;
+        // 原型整批一次 sigmoid（逐元素，与逐实例 sigmoid 逐位一致；同 tch 路径优化）
+        let proto_sig = sigmoid(proto.clone());
 
         for i in 0..n.min(masks.len()).min(labels.len()) {
             for (g, &label) in labels[i].iter().enumerate() {
-                let Some(gt_mask) = masks[i].get(g) else { continue };
+                let Some(gt_mask) = masks[i].get(g) else {
+                    continue;
+                };
                 if label as usize >= c {
                     continue; // 标注类别越界（数据脏）整条跳过
                 }
@@ -185,7 +189,10 @@ impl<B: Backend> SegNet<B> {
                     .clone()
                     .slice([i..(i + 1), c..(c + k), hi..(hi + 1), wi..(wi + 1)])
                     .reshape([k]); // [K]
-                let proto_i = sigmoid(proto.clone().slice([i..(i + 1), 0..k]).reshape([k, mh, mw]));
+                let proto_i = proto_sig
+                    .clone()
+                    .slice([i..(i + 1), 0..k])
+                    .reshape([k, mh, mw]);
                 let logit = combine_proto_coef(proto_i, coef, k, mh, mw);
                 let gt_t = Tensor::<B, 2>::from_data(
                     TensorData::new(
@@ -196,15 +203,16 @@ impl<B: Backend> SegNet<B> {
                 );
                 let bce = bce_with_logits_mean(logit.clone(), gt_t.clone());
                 let dl = dice_loss(sigmoid(logit), gt_t);
-                mask_sum = mask_sum
-                    + (bce.mul_scalar(self.loss_w_bce) + dl.mul_scalar(self.loss_w_dice));
+                mask_sum =
+                    mask_sum + (bce.mul_scalar(self.loss_w_bce) + dl.mul_scalar(self.loss_w_dice));
                 mask_cnt += 1;
             }
         }
 
         // cls：正 cell 加权（负正失衡上限 50，同检测路径）
         if !pos_idx.is_empty() {
-            let boost = (((total - pos_idx.len()) as f32) / (pos_idx.len() as f32)).clamp(1.0, 50.0);
+            let boost =
+                (((total - pos_idx.len()) as f32) / (pos_idx.len() as f32)).clamp(1.0, 50.0);
             for &idx in &pos_idx {
                 cls_w[idx] = boost;
             }
@@ -212,10 +220,8 @@ impl<B: Backend> SegNet<B> {
         // cls BCE 只作用于前 C 通道（类别分数）；后 K 通道是原型系数，
         // 不应被推向 0（系数没有显式目标，梯度只经掩码损失回传——YOLACT 同款）。
         let cls_logits = coefcls.slice([0..n, 0..c]); // [N,C,gh,gw]
-        let targets =
-            Tensor::<B, 4>::from_data(TensorData::new(cls_t, [n, c, gh, gw]), &device);
-        let weights =
-            Tensor::<B, 4>::from_data(TensorData::new(cls_w, [n, c, gh, gw]), &device);
+        let targets = Tensor::<B, 4>::from_data(TensorData::new(cls_t, [n, c, gh, gw]), &device);
+        let weights = Tensor::<B, 4>::from_data(TensorData::new(cls_w, [n, c, gh, gw]), &device);
         // torch weighted-mean 语义：Σ w·ℓ / Σ w
         let per_elem = ((targets.clone().neg().add_scalar(1.0)) * cls_logits.clone()
             - log_sigmoid(cls_logits))
@@ -234,9 +240,9 @@ impl<B: Backend> SegNet<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NdArrayB;
     use crate::data::load_cocoseg_dir;
-    use crate::train::{TrainCfg, cosine_lr, make_optimizer, train_step};
+    use crate::train::{cosine_lr, make_optimizer, train_step, TrainCfg};
+    use crate::NdArrayB;
     use burn_core::module::AutodiffModule;
     use burn_core::tensor::activation::sigmoid;
     use std::path::Path;
@@ -292,10 +298,8 @@ mod tests {
     #[test]
     fn bce_with_logits_hand_computed() {
         let device = device();
-        let logits = Tensor::<NdArrayB, 1>::from_data(
-            TensorData::new(vec![0.0f32, 20.0], [2]),
-            &device,
-        );
+        let logits =
+            Tensor::<NdArrayB, 1>::from_data(TensorData::new(vec![0.0f32, 20.0], [2]), &device);
         let targets =
             Tensor::<NdArrayB, 1>::from_data(TensorData::new(vec![1.0f32, 0.0], [2]), &device);
         let l = bce_with_logits_mean(logits, targets).into_scalar();
@@ -310,8 +314,8 @@ mod tests {
     fn centroid_cell_hand_computed() {
         // 4×4 掩码（mw=4），块覆盖 (row1,col1..3)（第 1 行 col 1、2）
         let mut m = vec![0u8; 16];
-        m[1 * 4 + 1] = 1;
-        m[1 * 4 + 2] = 1;
+        m[4 + 1] = 1;
+        m[4 + 2] = 1;
         // 质心 col=(1+2)/2=1.5, row=1.0；gw=gh=2，cell=2.0 → (hi=0, wi=0)
         assert_eq!(centroid_cell(&m, 4, 2, 2), Some((0, 0)));
         // 右下块（3,3）单点：质心 (3.0,3.0) → cell (1,1)
@@ -384,7 +388,10 @@ mod tests {
             last < first * 0.35,
             "loss 应显著下降：first={first} last={last}"
         );
-        println!("coco8-seg 过拟合冒烟：loss first={first:.4} last={last:.4}（降到初值 {:.1}%）", 100.0 * last / first);
+        println!(
+            "coco8-seg 过拟合冒烟：loss first={first:.4} last={last:.4}（降到初值 {:.1}%）",
+            100.0 * last / first
+        );
 
         // 掩码链路证据：最大实例在训练后的掩码 IoU 应明显优于随机/未训练水平。
         let eval = model.valid();
@@ -402,7 +409,10 @@ mod tests {
         let coef_data = coefcls.into_data().convert::<f32>();
         let pd = proto_data.to_vec::<f32>().unwrap();
         let cd = coef_data.to_vec::<f32>().unwrap();
-        let p = pd.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect::<Vec<_>>();
+        let p = pd
+            .iter()
+            .map(|&v| 1.0 / (1.0 + (-v).exp()))
+            .collect::<Vec<_>>();
         let (hi, wi) = centroid_cell(gt_mask, mw, gh, gw).unwrap();
         let c = 80usize;
         // coef[i][c..c+k][hi][wi]
@@ -422,7 +432,11 @@ mod tests {
         let iou = |a: &[u8], b: &[u8]| -> f32 {
             let inter = a.iter().zip(b).filter(|(&u, &v)| u != 0 && v != 0).count();
             let union = a.iter().zip(b).filter(|(&u, &v)| u != 0 || v != 0).count();
-            if union == 0 { 0.0 } else { inter as f32 / union as f32 }
+            if union == 0 {
+                0.0
+            } else {
+                inter as f32 / union as f32
+            }
         };
         let iou_final = iou(&pred_mask, gt_mask);
         println!("coco8-seg 过拟合冒烟：最大实例掩码 IoU={iou_final:.3}");

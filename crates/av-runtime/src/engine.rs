@@ -21,7 +21,7 @@ use av_core::geometry::Aabb;
 use av_pretrain::av_weight as av_weight_store;
 use av_pretrain::weight_adapter::{self, LayerMap};
 use av_tasks::augment::{self, AugmentPlan};
-use av_tasks::mask::mask_iou;
+use av_tasks::mask::MaskSummary;
 use av_tasks::models::{
     build_model, KeypointModel, PredictOutput, SegModel, TaskModel, TrainBatch,
 };
@@ -33,6 +33,233 @@ use crate::eval_map::{CocoEvaluator, GtBox};
 const EVAL_BATCH: i64 = 256;
 const STEPS_PER_EPOCH: usize = 16;
 const CKPT_DIR: &str = "best.ckpt";
+
+/// epoch loss 设备端累加器：逐步在 loss 同设备上做 f32 累加，epoch 末读回一次。
+///
+/// 旧实现每步 `loss.double_value(&[])` 回读标量——这是一次强制设备同步，GPU
+/// 训练时会把「下一批 CPU 编码」挡在「本步 GPU 计算」之后（CPU 干等 GPU）。
+/// 累加挪到设备端后 CPU 可直接推进下一批；f32 加法仍按步序逐次进行、除法
+/// 同为 f32，最终均值与旧实现逐位一致。
+struct EpochLossAcc(Option<Tensor>);
+
+impl EpochLossAcc {
+    fn new() -> Self {
+        Self(None)
+    }
+
+    /// 累加一步的 loss（detach 后累加，不进计算图）。
+    fn add(&mut self, loss: &Tensor) {
+        let l = loss.detach();
+        self.0 = Some(match &self.0 {
+            Some(t) => t + &l,
+            None => l,
+        });
+    }
+
+    /// 读回 epoch 均值（epoch 末一次同步；steps=0 时恒 0，对齐旧 `0/1` 行为）。
+    /// f32 张量除标量不提升 dtype（整数千步内精确表示），与旧 f32 除法逐位一致。
+    fn mean(&self, steps: usize) -> f32 {
+        match &self.0 {
+            Some(t) if steps > 0 => (t / steps as f64).double_value(&[]) as f32,
+            _ => 0.0,
+        }
+    }
+}
+
+/// fp16 AMP 的动态梯度缩放器（torch GradScaler 同款策略）。tch 的 autocast
+/// 固定 fp16（torch_sys 未暴露 dtype 选择与原生 GradScaler），fp16 梯度存在
+/// 下溢/上溢区间，经典解法三步：loss × scale 反向 → 反缩放前检测 inf/NaN
+/// （异常则清零跳步并回退 scale）→ 连续正常步进则按间隔放大 scale。
+struct GradScaler {
+    scale: f64,
+    growth_factor: f64,
+    backoff_factor: f64,
+    growth_interval: u32,
+    steps_since_growth: u32,
+}
+
+impl GradScaler {
+    fn new() -> Self {
+        Self {
+            scale: 65536.0,
+            growth_factor: 2.0,
+            backoff_factor: 0.5,
+            growth_interval: 2000,
+            steps_since_growth: 0,
+        }
+    }
+
+    /// 放大后的 loss（强制 fp32：fp16 最大 ~65504，loss × 65536 在 fp16 必上溢）。
+    fn scaled(&self, loss: &Tensor) -> Tensor {
+        loss.to_kind(Kind::Float) * self.scale
+    }
+
+    /// 反缩放全部梯度。返回 false = 检出 inf/NaN（调用方应 zero_grad 跳步）。
+    ///
+    /// 有限性检查在 GPU 上归约成单个标量、只做**一次**同步——逐变量
+    /// `double_value` 是每变量一次强制同步（30 变量 ≈ +40ms/步，实测把
+    /// 步进从 90ms 拖到 130ms）。
+    fn unscale_and_check(&mut self, vars: &[Tensor]) -> bool {
+        // 先在 GPU 上求全部梯度的联合 max（无同步）
+        let mut max_t: Option<Tensor> = None;
+        for v in vars {
+            let g = v.grad();
+            if !g.defined() {
+                continue;
+            }
+            let m = g.abs().max();
+            max_t = Some(match &max_t {
+                Some(acc) => acc.maximum(&m),
+                None => m,
+            });
+        }
+        // 唯一一次同步读回
+        let worst = match &max_t {
+            Some(t) => t.double_value(&[]),
+            None => 0.0,
+        };
+        if worst.is_nan() || worst.is_infinite() {
+            return false;
+        }
+        tch::no_grad(|| {
+            for v in vars {
+                let mut g = v.grad();
+                if g.defined() {
+                    g /= self.scale;
+                }
+            }
+        });
+        true
+    }
+
+    fn update(&mut self, stepped: bool) {
+        if stepped {
+            self.steps_since_growth += 1;
+            if self.steps_since_growth >= self.growth_interval {
+                self.scale *= self.growth_factor;
+                self.steps_since_growth = 0;
+            }
+        } else {
+            self.scale *= self.backoff_factor;
+            self.steps_since_growth = 0;
+        }
+    }
+}
+
+/// 权重 EMA 影子（Ultralytics ModelEMA 同款前期衰减调度
+/// `d = min(decay, (1+t)/(10+t))`，影子权重快速跟上初期训练）。eval 与
+/// checkpoint 消费影子权重，训练始终用原始变量；每个 optimizer step 更新一次
+/// （GPU 两次逐元素运算，开销可忽略）。BN running 统计量用同款 EMA（ultralytics
+/// 对 buffer 直拷，等价平滑策略，行为差异记录在案）。
+struct WeightEma {
+    /// (变量名, 影子张量)，名字与 VarStore 变量一一对应（按名排序，确定性）
+    shadow: Vec<(String, Tensor)>,
+    decay: f32,
+    updates: u64,
+}
+
+impl WeightEma {
+    fn new(vs: &VarStore, decay: f32) -> Self {
+        let mut shadow: Vec<(String, Tensor)> = vs.variables().into_iter().collect();
+        shadow.sort_by(|a, b| a.0.cmp(&b.0));
+        Self {
+            shadow,
+            decay,
+            updates: 0,
+        }
+    }
+
+    fn update(&mut self, vs: &VarStore) {
+        self.updates += 1;
+        let t = self.updates as f64;
+        let d = (self.decay as f64).min((1.0 + t) / (10.0 + t));
+        let mut vars = vs.variables();
+        tch::no_grad(|| {
+            for (name, s) in self.shadow.iter_mut() {
+                if let Some(v) = vars.get_mut(name.as_str()) {
+                    *s = &*s * d + &*v * (1.0 - d);
+                }
+            }
+        });
+    }
+
+    /// 把影子权重写入实际变量（eval 前调用）。返回原值句柄供 [`Self::restore`]。
+    fn apply_to(&self, vs: &VarStore) -> Vec<(String, Tensor)> {
+        let mut vars = vs.variables();
+        let mut saved = Vec::new();
+        for (name, s) in &self.shadow {
+            if let Some(v) = vars.get_mut(name.as_str()) {
+                saved.push((name.clone(), v.copy()));
+                v.set_data(s);
+            }
+        }
+        saved
+    }
+
+    fn restore(&self, vs: &VarStore, saved: &[(String, Tensor)]) {
+        let mut vars = vs.variables();
+        for (name, old) in saved {
+            if let Some(v) = vars.get_mut(name.as_str()) {
+                v.set_data(old);
+            }
+        }
+    }
+
+    /// 影子权重的 CPU 快照（best 保存用，不占训练显存）。
+    fn snapshot_cpu(&self) -> Vec<(String, Tensor)> {
+        self.shadow
+            .iter()
+            .map(|(n, t)| (n.clone(), t.to_device(Device::Cpu)))
+            .collect()
+    }
+}
+
+/// 按既有 checkpoint 命名规则保存一组 (变量名, 张量)（[`save_checkpoint`] 的
+/// 任意变量集版本——EMA/best 快照走这里）。
+fn save_named_variables(vars: &[(String, Tensor)], dir: &Path) -> AvResult<()> {
+    fs::create_dir_all(dir)?;
+    for (name, t) in vars {
+        t.save(dir.join(ckpt_file_name(name)))
+            .map_err(|e| AvError::train(format!("保存张量 {name} 失败: {e}")))?;
+    }
+    Ok(())
+}
+
+/// 一次优化器步进（AMP 感知）：fp16 时先反缩放并检测 inf/NaN（异常清零跳步），
+/// 正常路径走梯度裁剪。返回是否真正步进。
+fn optimizer_step(
+    amp: bool,
+    scaler: &mut GradScaler,
+    vs: &VarStore,
+    opt: &mut tch::nn::Optimizer,
+    ema: &mut WeightEma,
+    grad_clip: f32,
+) -> bool {
+    if !amp {
+        if grad_clip > 0.0 {
+            opt.clip_grad_norm(grad_clip as f64);
+        }
+        opt.step();
+        opt.zero_grad();
+        ema.update(vs);
+        return true;
+    }
+    let vars = vs.trainable_variables();
+    if scaler.unscale_and_check(&vars) {
+        if grad_clip > 0.0 {
+            opt.clip_grad_norm(grad_clip as f64);
+        }
+        opt.step();
+        opt.zero_grad();
+        ema.update(vs);
+        scaler.update(true);
+        true
+    } else {
+        opt.zero_grad();
+        scaler.update(false);
+        false
+    }
+}
 
 /// checkpoint：tch 0.17 的 VarStore::save/load 在 Windows + libtorch 2.4 组合下
 /// 存在序列化不兼容（_load_parameters 报 Expected GenericDict but got Object），
@@ -51,11 +278,8 @@ fn save_checkpoint(vs: &VarStore, dir: &Path) -> AvResult<()> {
 /// 恢复点（last.ckpt）依此知道该从哪个 epoch 继续。
 fn save_checkpoint_epoch(vs: &VarStore, dir: &Path, epoch: u32) -> AvResult<()> {
     save_checkpoint(vs, dir)?;
-    fs::write(
-        dir.join("meta.json"),
-        format!("{{\"epoch\":{epoch}}}"),
-    )
-    .map_err(|e| AvError::train(format!("写 checkpoint 元数据失败: {e}")))
+    fs::write(dir.join("meta.json"), format!("{{\"epoch\":{epoch}}}"))
+        .map_err(|e| AvError::train(format!("写 checkpoint 元数据失败: {e}")))
 }
 
 /// 读 checkpoint 的 epoch 元数据；无 meta.json（旧格式/最终 best.ckpt）返回 None。
@@ -65,12 +289,13 @@ fn read_checkpoint_epoch(dir: &Path) -> Option<u32> {
     v.get("epoch")?.as_u64().map(|e| e as u32)
 }
 
-fn load_checkpoint(vs: &mut VarStore, dir: &Path) -> AvResult<()> {    // 变量是 requires_grad 的叶子，原地写入必须包在 no_grad 里
+fn load_checkpoint(vs: &mut VarStore, dir: &Path) -> AvResult<()> {
+    // 变量是 requires_grad 的叶子，原地写入必须包在 no_grad 里
     tch::no_grad(|| {
         for (name, mut t) in vs.variables() {
             let f = dir.join(ckpt_file_name(&name));
-            let loaded =
-                Tensor::load(&f).map_err(|e| AvError::train(format!("读取张量 {name} 失败: {e}")))?;
+            let loaded = Tensor::load(&f)
+                .map_err(|e| AvError::train(format!("读取张量 {name} 失败: {e}")))?;
             // 结构变更（如 DFL 头）后旧 checkpoint 与新模型形状不一致时给出可读错误，
             // 而不是让 libtorch 在 copy_ 里 panic
             if loaded.size() != t.size() {
@@ -103,16 +328,16 @@ pub fn export_checkpoint(vs: &VarStore, dir: &Path, fmt: &str) -> AvResult<()> {
                     "safetensors 导出的 out 必须以 .safetensors 结尾",
                 ));
             }
-            let named: Vec<(String, Tensor)> =
-                vs.variables().into_iter().collect();
-            let refs: Vec<(&str, &Tensor)> =
-                named.iter().map(|(n, t)| (n.as_str(), t)).collect();
+            let named: Vec<(String, Tensor)> = vs.variables().into_iter().collect();
+            let refs: Vec<(&str, &Tensor)> = named.iter().map(|(n, t)| (n.as_str(), t)).collect();
             tch::Tensor::write_safetensors(&refs, dir)
                 .map_err(|e| AvError::train(format!("safetensors 导出失败: {e}")))?;
             Ok(())
         }
         "torch" | "ckpt" => save_checkpoint(vs, dir),
-        other => Err(AvError::train(format!("不支持的导出格式: {other}（safetensors | torch）"))),
+        other => Err(AvError::train(format!(
+            "不支持的导出格式: {other}（safetensors | torch）"
+        ))),
     }
 }
 
@@ -164,6 +389,17 @@ fn train_impl(cfg: &RunConfig, resume: bool) -> AvResult<TrainReport> {
         let _ = fs::remove_file(run_dir.join(crate::metrics::METRICS_FILE));
     }
     fs::write(run_dir.join("config.snapshot.toml"), cfg.snapshot_toml()?)?;
+
+    // [train].deterministic：播种 torch 全局 RNG——模型权重初始化走 torch
+    // 全局 generator，不播种则每次运行的初始权重不同、loss 轨迹不可复现
+    // （cfg.seed 此前只驱动数据侧 XorShift：shuffle 与增强抽签）。
+    if cfg.train.deterministic {
+        tch::manual_seed(cfg.seed as i64);
+        println!(
+            "[deterministic] 已播种 torch 全局 RNG（seed={}），权重初始化可复现",
+            cfg.seed
+        );
+    }
 
     let report = match cfg.model.tasks.first() {
         Some(TaskCfg::Classify(_)) => train_classify(cfg, &run_id, &run_dir)?,
@@ -263,7 +499,10 @@ pub fn infer(cfg: &RunConfig, weights: &Path, input: &Path) -> AvResult<serde_js
                     (i64::MAX, i64::MAX, 0i64, 0i64, 0usize);
                 for (pi, &v) in it.mask.iter().enumerate() {
                     if v == 1 {
-                        let (py, px) = ((pi / mask_size as usize) as i64, (pi % mask_size as usize) as i64);
+                        let (py, px) = (
+                            (pi / mask_size as usize) as i64,
+                            (pi % mask_size as usize) as i64,
+                        );
                         x0 = x0.min(px);
                         y0 = y0.min(py);
                         x1 = x1.max(px);
@@ -309,8 +548,7 @@ pub fn infer_sliced(
     overlap_frac: f32,
 ) -> AvResult<serde_json::Value> {
     let (model, device) = load_model(cfg, weights)?;
-    let img =
-        image::open(input).map_err(|e| AvError::data(format!("读图失败 {input:?}: {e}")))?;
+    let img = image::open(input).map_err(|e| AvError::data(format!("读图失败 {input:?}: {e}")))?;
     let rgb = img.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
     let s_model = model.img_size();
@@ -473,10 +711,7 @@ pub fn merge_tile_fragments(
     });
     let mut out: Vec<av_core::types::Detection> = Vec::new();
     for d in dets {
-        let (dcx, dcy) = (
-            (d.bbox.x1 + d.bbox.x2) * 0.5,
-            (d.bbox.y1 + d.bbox.y2) * 0.5,
-        );
+        let (dcx, dcy) = ((d.bbox.x1 + d.bbox.x2) * 0.5, (d.bbox.y1 + d.bbox.y2) * 0.5);
         let mut merged = false;
         for k in out.iter_mut() {
             if k.class_id != d.class_id {
@@ -501,15 +736,14 @@ pub fn merge_tile_fragments(
     out
 }
 
-/// 实例分割（PLAN §4.3）真实数据训练：COCO 分割格式（coco8-seg）+ 掩码 BCE/Dice。
-///
-/// 验收指标取**训练集**掩码 mIoU（任务规范：真实分割从零小模型 200 epochs 的
-/// 诚实起点）；val split 每 interval 评测仅作泛化观察。
-///
-/// 数据管线 v2（`[data].cache`）：增强训练路径默认把 raw 全分辨率数据一次性
-/// 缓存成 letterbox 内容贴片，逐 epoch 只在小图上增强——`ram`（rayon 并行 +
-/// 双缓冲预取）或 `gpu`（显存驻留 + GPU 张量增强）；`auto` 按体积估算选层；
-/// `off` 保留历史全分辨率逐 epoch 重编码路径（单测与验收口径均逐位/容差对齐）。
+// 实例分割（PLAN §4.3）真实数据训练：COCO 分割格式（coco8-seg）+ 掩码 BCE/Dice。
+// 验收指标取**训练集**掩码 mIoU（任务规范：真实分割从零小模型 200 epochs 的
+// 诚实起点）；val split 每 interval 评测仅作泛化观察。
+//
+// 数据管线 v2（[data].cache）：增强训练路径默认把 raw 全分辨率数据一次性
+// 缓存成 letterbox 内容贴片，逐 epoch 只在小图上增强——ram（rayon 并行 +
+// 双缓冲预取）或 gpu（显存驻留 + GPU 张量增强）；auto 按体积估算选层；
+// off 保留历史全分辨率逐 epoch 重编码路径（单测与验收口径均逐位/容差对齐）。
 
 /// auto 模式下显存驻留的体积预算：画布堆 ≤ 4GiB 才选 gpu（16GB 卡留足
 /// 模型/激活/工作区余量；更小显存的卡自动落 ram，行为不劣化）。
@@ -524,7 +758,12 @@ enum SegCacheMode {
 
 /// 解析 `[data].cache`：auto 按画布堆体积估算（仅 CUDA 设备可选 gpu），
 /// 显式值非法时告警回落 auto（配置校验已拦，此处兜底）。
-fn resolve_seg_cache_mode(cfg_value: &str, n: usize, img_size: u32, device: Device) -> SegCacheMode {
+fn resolve_seg_cache_mode(
+    cfg_value: &str,
+    n: usize,
+    img_size: u32,
+    device: Device,
+) -> SegCacheMode {
     let bytes = n as u64 * 3 * img_size as u64 * img_size as u64 * 4;
     let is_cuda = matches!(device, Device::Cuda(_));
     match cfg_value {
@@ -535,7 +774,7 @@ fn resolve_seg_cache_mode(cfg_value: &str, n: usize, img_size: u32, device: Devi
         }
         "ram" => SegCacheMode::Ram,
         "off" => SegCacheMode::Off,
-        "auto" | _ => {
+        _ => {
             if is_cuda && bytes <= GPU_CACHE_BUDGET_BYTES {
                 SegCacheMode::Gpu
             } else {
@@ -580,21 +819,36 @@ enum SegEncoder {
 impl SegEncoder {
     fn encode(&self, idx: &[usize], plans: &[AugmentPlan]) -> AvResult<Vec<SegSample>> {
         match self {
-            SegEncoder::Off { raw, img_size, inorm } => idx
+            SegEncoder::Off {
+                raw,
+                img_size,
+                inorm,
+            } => idx
                 .par_iter()
                 .zip(plans)
                 .map(|(&i, plan)| {
                     dataset::encode_seg_sample(&raw[i], *img_size, Device::Cpu, plan, *inorm)
                 })
                 .collect(),
-            SegEncoder::Ram { cache, img_size, inorm } => {
+            SegEncoder::Ram {
+                cache,
+                img_size,
+                inorm,
+            } => {
                 dataset::encode_seg_batch_cached(cache, idx, plans, *img_size, Device::Cpu, *inorm)
             }
-            SegEncoder::Gpu { stack, meta, img_size, inorm } => idx
+            SegEncoder::Gpu {
+                stack,
+                meta,
+                img_size,
+                inorm,
+            } => idx
                 .par_iter()
                 .zip(plans)
                 .map(|(&i, plan)| {
-                    dataset::encode_seg_sample_gpu(&stack.0, i as u32, &meta[i], *img_size, plan, *inorm)
+                    dataset::encode_seg_sample_gpu(
+                        &stack.0, i as u32, &meta[i], *img_size, plan, *inorm,
+                    )
                 })
                 .collect(),
         }
@@ -798,7 +1052,7 @@ fn train_seg(cfg: &RunConfig, run_id: &str, run_dir: &Path, resume: bool) -> AvR
             .map(|a| strong_aug_on(a, cfg, epoch))
             .unwrap_or(false);
         let mut aug_rng = epoch_aug_rng(cfg.seed, epoch);
-        let mut epoch_loss = 0f32;
+        let mut epoch_loss = EpochLossAcc::new();
         let mut steps = 0usize;
         let acc_steps = cfg.train.accumulate_steps.max(1) as usize;
         opt.zero_grad();
@@ -814,22 +1068,47 @@ fn train_seg(cfg: &RunConfig, run_id: &str, run_dir: &Path, resume: bool) -> AvR
         let mut in_flight: Option<std::thread::JoinHandle<AvResult<Vec<SegSample>>>> = None;
         for (ci, &start) in chunk_starts.iter().enumerate() {
             let end = (start + bs).min(order.len());
-            // 当前块：优先收上一轮预热线程的货，否则同步编码（仅首个块）
-            let batch_samples: Vec<SegSample> = match in_flight.take() {
-                Some(h) => h.join().map_err(|_| AvError::train("数据编码线程崩溃"))??,
+            // 当前块：优先收上一轮预热线程的货，否则同步编码（仅首个块）。
+            // 返回 (输入张量, 掩码, 类别)——快速路径借用堆叠预解码张量，
+            // 仅掩码/类别按批拷进 TrainBatch
+            let (x, masks, labels) = match in_flight.take() {
+                Some(h) => {
+                    let batch_samples: Vec<SegSample> =
+                        h.join().map_err(|_| AvError::train("数据编码线程崩溃"))??;
+                    let x = dataset::stack_seg_samples(&batch_samples)?.to_device(device);
+                    (
+                        x,
+                        batch_samples.iter().map(|s| s.masks.clone()).collect(),
+                        batch_samples.iter().map(|s| s.labels.clone()).collect(),
+                    )
+                }
                 None => {
                     let idx = &order[start..end];
-                    let plans: Vec<AugmentPlan> = if strong_on {
-                        strong_plans[start..end].to_vec()
-                    } else {
-                        vec![AugmentPlan::none(); end - start]
-                    };
                     match &seg_encoder {
-                        Some(enc) => enc.encode(idx, &plans)?,
-                        None => order[start..end]
-                            .iter()
-                            .map(|&i| Ok(train[i].clone()))
-                            .collect::<AvResult<Vec<_>>>()?,
+                        Some(enc) => {
+                            let plans: Vec<AugmentPlan> = if strong_on {
+                                strong_plans[start..end].to_vec()
+                            } else {
+                                vec![AugmentPlan::none(); end - start]
+                            };
+                            let batch_samples = enc.encode(idx, &plans)?;
+                            let x = dataset::stack_seg_samples(&batch_samples)?.to_device(device);
+                            (
+                                x,
+                                batch_samples.iter().map(|s| s.masks.clone()).collect(),
+                                batch_samples.iter().map(|s| s.labels.clone()).collect(),
+                            )
+                        }
+                        // 无增强整集预解码：零拷贝借用堆叠（旧逐样本 clone +
+                        // 堆叠是每 epoch 多 memcpy 一遍整集）
+                        None => {
+                            let xs: Vec<&Tensor> = idx.iter().map(|&i| &train[i].x).collect();
+                            (
+                                Tensor::stack(&xs, 0).to_device(device),
+                                idx.iter().map(|&i| train[i].masks.clone()).collect(),
+                                idx.iter().map(|&i| train[i].labels.clone()).collect(),
+                            )
+                        }
                     }
                 }
             };
@@ -845,16 +1124,12 @@ fn train_seg(cfg: &RunConfig, run_id: &str, run_dir: &Path, resume: bool) -> AvR
                 let enc = Arc::clone(enc);
                 in_flight = Some(std::thread::spawn(move || enc.encode(&idx, &plans)));
             }
-            let x = dataset::stack_seg_samples(&batch_samples)?.to_device(device);
-            let batch = TrainBatch::Seg {
-                masks: batch_samples.iter().map(|s| s.masks.clone()).collect(),
-                labels: batch_samples.iter().map(|s| s.labels.clone()).collect(),
-            };
+            let batch = TrainBatch::Seg { masks, labels };
             let loss = model.loss(&x, &batch)?;
             loss.backward();
-            epoch_loss += loss.double_value(&[]) as f32;
+            epoch_loss.add(&loss);
             steps += 1;
-            if steps % acc_steps == 0 {
+            if steps.is_multiple_of(acc_steps) {
                 if cfg.train.grad_clip > 0.0 {
                     opt.clip_grad_norm(cfg.train.grad_clip as f64);
                 }
@@ -862,14 +1137,14 @@ fn train_seg(cfg: &RunConfig, run_id: &str, run_dir: &Path, resume: bool) -> AvR
                 opt.zero_grad();
             }
         }
-        if steps % acc_steps != 0 {
+        if !steps.is_multiple_of(acc_steps) {
             if cfg.train.grad_clip > 0.0 {
                 opt.clip_grad_norm(cfg.train.grad_clip as f64);
             }
             opt.step();
             opt.zero_grad();
         }
-        final_loss = epoch_loss / steps.max(1) as f32;
+        final_loss = epoch_loss.mean(steps);
         let eval_due = epoch == 1
             || epoch == cfg.train.epochs
             || cfg.eval.interval_epochs == 0
@@ -933,30 +1208,30 @@ fn train_seg(cfg: &RunConfig, run_id: &str, run_dir: &Path, resume: bool) -> AvR
         secondary: Some(("val_mask_miou".into(), val_miou)),
         run_dir: run_dir.display().to_string(),
     })
-    .map(|r| {
+    .inspect(|_| {
         println!(
             "[seg] 训练集验收：掩码 mIoU={train_miou:.3} R@0.5={train_r50:.3} P@0.5={train_p50:.3}（{n_inst} 个 gt 实例）\
              | val mIoU={val_miou:.3} val R@0.5={val_r50:.3} val P@0.5={val_p50:.3}",
         );
-        r
     })
 }
+
+/// 分割样本集评测输出：(miou, r50, p50, gt 实例数, 分类别 (类 id, mIoU, gt 数)，类 id 升序)。
+type SegEval = (f32, f32, f32, usize, Vec<(u32, f32, usize)>);
 
 /// 分割样本集评测：每 gt 实例取类无关最优掩码 IoU 的均值（掩码 mIoU）+
 /// 类别正确且 IoU ≥ 0.5 的实例占比（R@0.5）+ 预测侧查准率 P@0.5
 /// （按分数降序贪心一对一匹配：预测配对最佳未占用同类 gt，IoU ≥ 0.5 计 TP；
 /// P@0.5 = TP / 预测总数，无预测时为 0）。
 /// 返回 (miou, r50, p50, gt 实例数, 分类别 (类 id, mIoU, gt 数)，类 id 升序)。
-fn eval_seg_samples(
-    m: &SegModel,
-    val: &[SegSample],
-    device: Device,
-) -> AvResult<(f32, f32, f32, usize, Vec<(u32, f32, usize)>)> {
+fn eval_seg_samples(m: &SegModel, val: &[SegSample], device: Device) -> AvResult<SegEval> {
     if val.is_empty() {
         return Err(AvError::data("验证集为空"));
     }
     let mut per_image: Vec<Vec<av_tasks::models::SegInstance>> = Vec::new();
-    for chunk in val.chunks(4) {
+    // 16/批：过小的批把 GPU 拆成碎片内核 + 高 H2D 次数；上限受 seg predict
+    // 的原型平面显存约束（[B,K,mh,mw]，16 批 ≈ 0.5GB@640）
+    for chunk in val.chunks(16) {
         let x = dataset::stack_seg_samples(chunk)?.to_device(device);
         per_image.extend(m.predict(&x, 0.1, 0.5)?);
     }
@@ -971,17 +1246,24 @@ fn eval_seg_samples(
         let preds = &per_image[gi];
         n_gt += s.masks.len();
         n_pred += preds.len();
-        // 单图 IoU 矩阵（pred × gt）：mIoU / R@0.5 / P@0.5 三指标共用一次计算
+        // 单图 IoU 矩阵（pred × gt）：mIoU / R@0.5 / P@0.5 三指标共用一次计算。
+        // 外接框摘要逐实例预建：分离框对免整画布扫描（拥挤图 O(n²) 对的
+        // popcount 是隐形大头），数值与全量 mask_iou 逐位一致
+        let gt_sum: Vec<MaskSummary> = s.masks.iter().map(|m| MaskSummary::of(m)).collect();
         let ious: Vec<Vec<f32>> = preds
             .iter()
-            .map(|d| s.masks.iter().map(|gt| mask_iou(gt, &d.mask)).collect())
+            .map(|d| {
+                let ds = MaskSummary::of(&d.mask);
+                s.masks
+                    .iter()
+                    .zip(&gt_sum)
+                    .map(|(gt, gs)| ds.iou(&d.mask, gs, gt))
+                    .collect()
+            })
             .collect();
         for (g, _gt_mask) in s.masks.iter().enumerate() {
             let label = s.labels[g];
-            let best = ious
-                .iter()
-                .map(|row| row[g])
-                .fold(0f32, f32::max);
+            let best = ious.iter().map(|row| row[g]).fold(0f32, f32::max);
             sum_best += best;
             let acc = per_class_acc.entry(label).or_insert((0.0, 0));
             acc.0 += best as f64;
@@ -1004,7 +1286,11 @@ fn eval_seg_samples(
     if n_gt == 0 {
         return Err(AvError::data("验证集无 gt 实例"));
     }
-    let p50 = if n_pred == 0 { 0.0 } else { tp as f32 / n_pred as f32 };
+    let p50 = if n_pred == 0 {
+        0.0
+    } else {
+        tp as f32 / n_pred as f32
+    };
     let per_class = per_class_acc
         .into_iter()
         .map(|(cls, (sum, n))| (cls, (sum / n as f64) as f32, n))
@@ -1099,7 +1385,9 @@ fn train_keypoint(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<Tra
             Device::Cpu,
             imagenet_norm(cfg),
         )?,
-        None => dataset::load_cocopose_dir(&root, "val", img_size, Device::Cpu, imagenet_norm(cfg))?,
+        None => {
+            dataset::load_cocopose_dir(&root, "val", img_size, Device::Cpu, imagenet_norm(cfg))?
+        }
     };
     // 关键点模板一致性：标注点数必须与配置 num_keypoints 一致（头通道数在
     // 建模期固定；COCO 17 点模板混入其他点数的数据会静默错位，宁可报错）
@@ -1161,40 +1449,67 @@ fn train_keypoint(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<Tra
             .map(|a| strong_aug_on(a, cfg, epoch))
             .unwrap_or(false);
         let mut aug_rng = epoch_aug_rng(cfg.seed, epoch);
-        let mut epoch_loss = 0f32;
+        // 本 epoch 的增强 plan 按 shuffle 序在主线程一次抽完（与旧实现的逐样本
+        // 抽签 RNG 消耗序逐位一致）——编码阶段变为纯函数，rayon 并行执行。
+        let plans: Vec<AugmentPlan> = match (&train_raw, &aug_cfg) {
+            (Some(_), Some(a)) if strong_on => (0..order.len())
+                .map(|_| augment::draw_plan(a, &mut aug_rng))
+                .collect(),
+            (Some(_), Some(_)) => vec![AugmentPlan::none(); order.len()],
+            _ => Vec::new(),
+        };
+        let mut epoch_loss = EpochLossAcc::new();
         let mut steps = 0usize;
         let acc_steps = cfg.train.accumulate_steps.max(1) as usize;
         opt.zero_grad();
-        for chunk in order.chunks(bs) {
-            let batch_samples: Vec<KeypointSample> = chunk
-                .iter()
-                .map(|&i| -> AvResult<KeypointSample> {
-                    match (&train_raw, &aug_cfg) {
-                        // 增强路径：每样本抽一份 plan（像素与坐标同 plan ⇒ 坐标同步）
-                        (Some(raw), Some(a)) => {
-                            let plan = if strong_on {
-                                augment::draw_plan(a, &mut aug_rng)
-                            } else {
-                                AugmentPlan::none()
-                            };
-                            dataset::encode_keypoint_sample(&raw[i], img_size, Device::Cpu, &plan, imagenet_norm(cfg))
-                        }
-                        // 快速路径：整集预解码直接克隆（历史行为，逐位一致）
-                        _ => Ok(train[i].clone()),
-                    }
-                })
-                .collect::<AvResult<Vec<_>>>()?;
-            let x = dataset::stack_kp_samples(&batch_samples)?.to_device(device);
+        for (ci, chunk) in order.chunks(bs).enumerate() {
+            let (x, boxes, kpts, labels) = match (&train_raw, &aug_cfg) {
+                // 增强路径：像素与坐标同 plan ⇒ 坐标同步；rayon 并行编码
+                // （plan 预抽，编码不再消费 RNG，保序 collect 结果与串行逐位一致）
+                (Some(raw), Some(_)) => {
+                    let batch_samples: Vec<KeypointSample> = chunk
+                        .par_iter()
+                        .zip(&plans[ci * bs..ci * bs + chunk.len()])
+                        .map(|(&i, plan)| {
+                            dataset::encode_keypoint_sample(
+                                &raw[i],
+                                img_size,
+                                Device::Cpu,
+                                plan,
+                                imagenet_norm(cfg),
+                            )
+                        })
+                        .collect::<AvResult<Vec<_>>>()?;
+                    let x = dataset::stack_kp_samples(&batch_samples)?.to_device(device);
+                    (
+                        x,
+                        batch_samples.iter().map(|s| s.boxes.clone()).collect(),
+                        batch_samples.iter().map(|s| s.kpts.clone()).collect(),
+                        batch_samples.iter().map(|s| s.labels.clone()).collect(),
+                    )
+                }
+                // 快速路径：预解码张量借用堆叠（历史逐样本 clone + 堆叠是每
+                // epoch 多 memcpy 一遍整集），仅框/点/类别按批拷进 TrainBatch
+                _ => {
+                    let xs: Vec<&Tensor> = chunk.iter().map(|&i| &train[i].x).collect();
+                    (
+                        Tensor::stack(&xs, 0).to_device(device),
+                        chunk.iter().map(|&i| train[i].boxes.clone()).collect(),
+                        chunk.iter().map(|&i| train[i].kpts.clone()).collect(),
+                        chunk.iter().map(|&i| train[i].labels.clone()).collect(),
+                    )
+                }
+            };
             let batch = TrainBatch::Keypoint {
-                boxes: batch_samples.iter().map(|s| s.boxes.clone()).collect(),
-                kpts: batch_samples.iter().map(|s| s.kpts.clone()).collect(),
-                labels: batch_samples.iter().map(|s| s.labels.clone()).collect(),
+                boxes,
+                kpts,
+                labels,
             };
             let loss = model.loss(&x, &batch)?;
             loss.backward();
-            epoch_loss += loss.double_value(&[]) as f32;
+            epoch_loss.add(&loss);
             steps += 1;
-            if steps % acc_steps == 0 {
+            if steps.is_multiple_of(acc_steps) {
                 if cfg.train.grad_clip > 0.0 {
                     opt.clip_grad_norm(cfg.train.grad_clip as f64);
                 }
@@ -1202,14 +1517,14 @@ fn train_keypoint(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<Tra
                 opt.zero_grad();
             }
         }
-        if steps % acc_steps != 0 {
+        if !steps.is_multiple_of(acc_steps) {
             if cfg.train.grad_clip > 0.0 {
                 opt.clip_grad_norm(cfg.train.grad_clip as f64);
             }
             opt.step();
             opt.zero_grad();
         }
-        final_loss = epoch_loss / steps.max(1) as f32;
+        final_loss = epoch_loss.mean(steps);
         let eval_due = epoch == 1
             || epoch == cfg.train.epochs
             || cfg.eval.interval_epochs == 0
@@ -1272,12 +1587,11 @@ fn train_keypoint(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<Tra
         secondary: Some(("val_pck@0.5".into(), val_pck)),
         run_dir: run_dir.display().to_string(),
     })
-    .map(|r| {
+    .inspect(|_| {
         println!(
             "[keypoint] 训练集验收：PCK@0.5={train_pck:.3} meanOKS={train_oks:.3}\
              （{n_inst} 个 gt 实例 / {n_vis} 个可见 gt 点）| val PCK@0.5={val_pck:.3} val meanOKS={val_oks:.3}",
         );
-        r
     })
 }
 
@@ -1300,7 +1614,8 @@ fn eval_kp_samples(
     }
     let thr = 0.1 * m.img_size() as f32;
     let mut per_image: Vec<Vec<av_core::types::Detection>> = Vec::new();
-    for chunk in samples.chunks(4) {
+    // 16/批：与 seg 评测同一理由（见 eval_seg_samples）
+    for chunk in samples.chunks(16) {
         let x = dataset::stack_kp_samples(chunk)?.to_device(device);
         per_image.extend(m.predict(&x, 0.1, 0.5)?);
     }
@@ -1329,7 +1644,9 @@ fn eval_kp_samples(
             if best_iou < 0.1 {
                 continue;
             }
-            let Some(kps) = d.keypoints.as_ref() else { continue };
+            let Some(kps) = d.keypoints.as_ref() else {
+                continue;
+            };
             // OKS（有可见点的实例才计均值）
             if n_vis_here > 0 {
                 let scale = (bw * bh).sqrt().max(1e-3);
@@ -1435,37 +1752,59 @@ fn train_detect_obb(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<T
             .map(|a| strong_aug_on(a, cfg, epoch))
             .unwrap_or(false);
         let mut aug_rng = epoch_aug_rng(cfg.seed, epoch);
-        let mut epoch_loss = 0f32;
+        // 本 epoch 的增强 plan 按 shuffle 序在主线程一次抽完（与旧实现的逐样本
+        // 抽签 RNG 消耗序逐位一致），编码阶段 rayon 并行（同 keypoint 路径）。
+        let plans: Vec<AugmentPlan> = match (&train_raw, &aug_cfg) {
+            (Some(_), Some(a)) if strong_on => (0..order.len())
+                .map(|_| augment::draw_plan(a, &mut aug_rng))
+                .collect(),
+            (Some(_), Some(_)) => vec![AugmentPlan::none(); order.len()],
+            _ => Vec::new(),
+        };
+        let mut epoch_loss = EpochLossAcc::new();
         let mut steps = 0usize;
         let acc_steps = cfg.train.accumulate_steps.max(1) as usize;
         opt.zero_grad();
-        for chunk in order.chunks(bs) {
-            let batch_samples: Vec<dataset::ObbSample> = chunk
-                .iter()
-                .map(|&i| -> AvResult<dataset::ObbSample> {
-                    match (&train_raw, &aug_cfg) {
-                        (Some(raw), Some(a)) => {
-                            let plan = if strong_on {
-                                augment::draw_plan(a, &mut aug_rng)
-                            } else {
-                                AugmentPlan::none()
-                            };
-                            dataset::encode_obb_sample(&raw[i], img_size, Device::Cpu, &plan, imagenet_norm(cfg))
-                        }
-                        _ => Ok(train[i].clone()),
-                    }
-                })
-                .collect::<AvResult<Vec<_>>>()?;
-            let x = dataset::stack_obb_samples(&batch_samples)?.to_device(device);
-            let batch = TrainBatch::Obb {
-                boxes: batch_samples.iter().map(|s| s.boxes.clone()).collect(),
-                labels: batch_samples.iter().map(|s| s.labels.clone()).collect(),
+        for (ci, chunk) in order.chunks(bs).enumerate() {
+            let (x, boxes, labels) = match (&train_raw, &aug_cfg) {
+                (Some(raw), Some(_)) => {
+                    let batch_samples: Vec<dataset::ObbSample> = chunk
+                        .par_iter()
+                        .zip(&plans[ci * bs..ci * bs + chunk.len()])
+                        .map(|(&i, plan)| {
+                            dataset::encode_obb_sample(
+                                &raw[i],
+                                img_size,
+                                Device::Cpu,
+                                plan,
+                                imagenet_norm(cfg),
+                            )
+                        })
+                        .collect::<AvResult<Vec<_>>>()?;
+                    let x = dataset::stack_obb_samples(&batch_samples)?.to_device(device);
+                    (
+                        x,
+                        batch_samples.iter().map(|s| s.boxes.clone()).collect(),
+                        batch_samples.iter().map(|s| s.labels.clone()).collect(),
+                    )
+                }
+                // 快速路径：预解码张量借用堆叠（历史逐样本 clone + 堆叠是每
+                // epoch 多 memcpy 一遍整集），仅框/类别按批拷进 TrainBatch
+                _ => {
+                    let xs: Vec<&Tensor> = chunk.iter().map(|&i| &train[i].x).collect();
+                    (
+                        Tensor::stack(&xs, 0).to_device(device),
+                        chunk.iter().map(|&i| train[i].boxes.clone()).collect(),
+                        chunk.iter().map(|&i| train[i].labels.clone()).collect(),
+                    )
+                }
             };
+            let batch = TrainBatch::Obb { boxes, labels };
             let loss = model.loss(&x, &batch)?;
             loss.backward();
-            epoch_loss += loss.double_value(&[]) as f32;
+            epoch_loss.add(&loss);
             steps += 1;
-            if steps % acc_steps == 0 {
+            if steps.is_multiple_of(acc_steps) {
                 if cfg.train.grad_clip > 0.0 {
                     opt.clip_grad_norm(cfg.train.grad_clip as f64);
                 }
@@ -1473,14 +1812,14 @@ fn train_detect_obb(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<T
                 opt.zero_grad();
             }
         }
-        if steps % acc_steps != 0 {
+        if !steps.is_multiple_of(acc_steps) {
             if cfg.train.grad_clip > 0.0 {
                 opt.clip_grad_norm(cfg.train.grad_clip as f64);
             }
             opt.step();
             opt.zero_grad();
         }
-        final_loss = epoch_loss / steps.max(1) as f32;
+        final_loss = epoch_loss.mean(steps);
         // epoch 末评测：先切 BN 推理语义，评完恢复训练态（下一 epoch 继续训练）
         model.set_train(false);
         let TaskModel::Detect(m) = &model else {
@@ -1529,8 +1868,10 @@ fn eval_obb_samples(
         return Err(AvError::data("验证集为空"));
     }
     let mut per_image: Vec<Vec<av_core::types::Detection>> = Vec::new();
-    for chunk in val.chunks(8) {
-        let xs: Vec<Tensor> = chunk.iter().map(|s| s.x.copy()).collect();
+    // 32/批：检测类 head 显存占用小，取更大批减少 H2D 次数；
+    // 借用堆叠（不再逐样本 copy 出中间张量）
+    for chunk in val.chunks(32) {
+        let xs: Vec<&Tensor> = chunk.iter().map(|s| &s.x).collect();
         let x = Tensor::stack(&xs, 0).to_device(device);
         per_image.extend(m.predict(&x, 0.1, 0.5)?);
     }
@@ -1619,9 +1960,14 @@ pub fn eval(cfg: &RunConfig, weights: &Path) -> AvResult<serde_json::Value> {
                         .ok_or_else(|| AvError::config("dir 数据源缺失"))?;
                     let split = cfg.data.sources.val.split.as_deref().unwrap_or("val");
                     // 预解码固定 CPU，评测批内再搬到模型设备
-                    let val =
-                        dataset::load_yolo_dir(dir, split, d.img_size, Device::Cpu, imagenet_norm(cfg))?;
-                    let evm = eval_detect_samples(m, &val, device)?;
+                    let val = dataset::load_yolo_dir(
+                        dir,
+                        split,
+                        d.img_size,
+                        Device::Cpu,
+                        imagenet_norm(cfg),
+                    )?;
+                    let evm = eval_detect_samples(m, &val, device, false)?;
                     Ok(serde_json::json!({
                         "task": "detect",
                         "mean_iou": evm.miou,
@@ -1642,7 +1988,9 @@ pub fn eval(cfg: &RunConfig, weights: &Path) -> AvResult<serde_json::Value> {
                 return Err(AvError::train("模型与任务不匹配"));
             };
             if cfg.data.pipeline != DataPipeline::Dir {
-                return Err(AvError::config("seg 评测需要 data.pipeline = \"dir\"（COCO 分割格式）"));
+                return Err(AvError::config(
+                    "seg 评测需要 data.pipeline = \"dir\"（COCO 分割格式）",
+                ));
             }
             let dir = cfg
                 .data
@@ -1653,11 +2001,22 @@ pub fn eval(cfg: &RunConfig, weights: &Path) -> AvResult<serde_json::Value> {
                 .or(cfg.data.sources.train.dir.as_ref())
                 .ok_or_else(|| AvError::config("dir 数据源缺失"))?;
             let split = cfg.data.sources.val.split.as_deref().unwrap_or("val");
-            let val = dataset::load_cocoseg_dir(dir, split, m.img_size(), Device::Cpu, imagenet_norm(cfg))?;
+            let val = dataset::load_cocoseg_dir(
+                dir,
+                split,
+                m.img_size(),
+                Device::Cpu,
+                imagenet_norm(cfg),
+            )?;
             let (miou, r50, p50, n_gt, per_class) = eval_seg_samples(m, &val, device)?;
             let per_class_json: serde_json::Map<String, serde_json::Value> = per_class
                 .into_iter()
-                .map(|(cls, v, n)| (cls.to_string(), serde_json::json!({ "mask_miou": v, "gt": n })))
+                .map(|(cls, v, n)| {
+                    (
+                        cls.to_string(),
+                        serde_json::json!({ "mask_miou": v, "gt": n }),
+                    )
+                })
                 .collect();
             Ok(serde_json::json!({
                 "task": "seg",
@@ -1686,7 +2045,13 @@ pub fn eval(cfg: &RunConfig, weights: &Path) -> AvResult<serde_json::Value> {
                 .or(cfg.data.sources.train.dir.as_ref())
                 .ok_or_else(|| AvError::config("dir 数据源缺失"))?;
             let split = cfg.data.sources.val.split.as_deref().unwrap_or("val");
-            let val = dataset::load_cocopose_dir(dir, split, m.img_size(), Device::Cpu, imagenet_norm(cfg))?;
+            let val = dataset::load_cocopose_dir(
+                dir,
+                split,
+                m.img_size(),
+                Device::Cpu,
+                imagenet_norm(cfg),
+            )?;
             let (pck, mean_oks, n_vis, n_inst) = eval_kp_samples(m, &val, device)?;
             Ok(serde_json::json!({
                 "task": "keypoint",
@@ -1723,12 +2088,18 @@ pub fn resolve_device(cfg: &RunConfig) -> Device {
         _ if spec.starts_with("cuda:") => match spec["cuda:".len()..].parse::<usize>() {
             Ok(idx) => Device::Cuda(idx),
             Err(_) => {
-                tracing::warn!("无法解析 device = {:?}（支持 cpu / cuda[:N]），回退 CPU", cfg.device);
+                tracing::warn!(
+                    "无法解析 device = {:?}（支持 cpu / cuda[:N]），回退 CPU",
+                    cfg.device
+                );
                 return Device::Cpu;
             }
         },
         _ => {
-            tracing::warn!("未知 device = {:?}（支持 cpu / cuda[:N]），回退 CPU", cfg.device);
+            tracing::warn!(
+                "未知 device = {:?}（支持 cpu / cuda[:N]），回退 CPU",
+                cfg.device
+            );
             return Device::Cpu;
         }
     };
@@ -1750,7 +2121,10 @@ pub fn resolve_device(cfg: &RunConfig) -> Device {
                     "device = {:?} 超出可用范围（device_count = {}），回退 {}",
                     cfg.device,
                     tch::Cuda::device_count(),
-                    match available { Device::Cuda(i) => format!("cuda:{i}"), _ => "cpu".into() }
+                    match available {
+                        Device::Cuda(i) => format!("cuda:{i}"),
+                        _ => "cpu".into(),
+                    }
                 );
                 return available;
             }
@@ -1833,9 +2207,10 @@ fn apply_pretrain(vs: &VarStore, cfg: &RunConfig) -> AvResult<()> {
     if !pre.enable {
         return Ok(());
     }
-    let weight_path = pre.weight_path.as_deref().ok_or_else(|| {
-        AvError::config("pretrain.enable = true 但未指定 pretrain.weight_path")
-    })?;
+    let weight_path = pre
+        .weight_path
+        .as_deref()
+        .ok_or_else(|| AvError::config("pretrain.enable = true 但未指定 pretrain.weight_path"))?;
 
     let sources: Vec<(String, Tensor)> = if weight_path.is_dir() {
         let manifest = av_weight_store::read_manifest(weight_path)?;
@@ -1933,13 +2308,12 @@ fn strong_aug_on(a: &av_core::config::AugmentCfg, cfg: &RunConfig, epoch: u32) -
 /// 每 epoch 独立播种的增强 RNG（与洗牌 RNG 分流：增强抽样不扰动洗牌序列，
 /// 同 seed 同 epoch ⇒ 同一串 plan，实验可复现）。
 fn epoch_aug_rng(seed: u64, epoch: u32) -> XorShift {
-    XorShift::new(
-        seed ^ (epoch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA065_5EED,
-    )
+    XorShift::new(seed ^ (epoch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA065_5EED)
 }
 
 /// warmup + 余弦退火（PLAN §5.2）。
-fn schedule_lr(cfg: &RunConfig, epoch: u32) -> f64 {    let lr0 = cfg.train.optimizer.lr as f64;
+fn schedule_lr(cfg: &RunConfig, epoch: u32) -> f64 {
+    let lr0 = cfg.train.optimizer.lr as f64;
     let warm = cfg.train.warmup_epochs;
     if warm > 0.0 && (epoch as f32) <= warm {
         return lr0 * (epoch as f32 / warm).min(1.0) as f64;
@@ -1954,9 +2328,7 @@ fn train_classify(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<Tra
     match cfg.data.pipeline {
         DataPipeline::Synthetic => train_classify_synthetic(cfg, run_id, run_dir),
         DataPipeline::Dir => train_classify_imagenette(cfg, run_id, run_dir),
-        DataPipeline::AvPack => Err(AvError::config(
-            "avpack 数据源按 M2 落地（PLAN 附录 B）",
-        )),
+        DataPipeline::AvPack => Err(AvError::config("avpack 数据源按 M2 落地（PLAN 附录 B）")),
     }
 }
 
@@ -1968,16 +2340,9 @@ fn classify_data_root(cfg: &RunConfig) -> AvResult<PathBuf> {
             return Ok(d.clone());
         }
     }
-    cfg.data
-        .sources
-        .train
-        .dir
-        .clone()
-        .ok_or_else(|| {
-            AvError::config(
-                "分类 dir 数据源缺失：需指定 classify.data_dir 或 data.sources.train.dir",
-            )
-        })
+    cfg.data.sources.train.dir.clone().ok_or_else(|| {
+        AvError::config("分类 dir 数据源缺失：需指定 classify.data_dir 或 data.sources.train.dir")
+    })
 }
 
 /// 分类 dir 源 val 侧解析：val 源缺省回落 train 根 + "val" split。
@@ -2012,8 +2377,14 @@ fn train_classify_imagenette(
     let root = classify_data_root(cfg)?;
     let train_split = cfg.data.sources.train.split.as_deref().unwrap_or("train");
     // 预解码固定 CPU（与检测侧同策略），训练批 stack 后再搬到模型设备
-    let (train, train_labels, class_map) =
-        dataset::load_imagefolder(&root, train_split, img_size, true, Device::Cpu, imagenet_norm(cfg))?;
+    let (train, train_labels, class_map) = dataset::load_imagefolder(
+        &root,
+        train_split,
+        img_size,
+        true,
+        Device::Cpu,
+        imagenet_norm(cfg),
+    )?;
     if class_map.len() != num_classes as usize {
         return Err(AvError::config(format!(
             "classify.num_classes = {num_classes} 与 ImageFolder 目录类别数 {} 不一致",
@@ -2059,21 +2430,23 @@ fn train_classify_imagenette(
             let j = rng.next_usize(i + 1);
             order.swap(i, j);
         }
-        let mut epoch_loss = 0f32;
+        let mut epoch_loss = EpochLossAcc::new();
         let mut steps = 0usize;
         let acc_steps = cfg.train.accumulate_steps.max(1) as usize;
         opt.zero_grad();
         for chunk in order.chunks(bs) {
-            let batch: Vec<ClassifySample> = chunk.iter().map(|&i| train[i].clone()).collect();
-            let x = dataset::stack_classify(&batch)?.to_device(device);
+            // 预解码张量零拷贝借用堆叠（旧的逐样本 clone + 堆叠 = 每 epoch 把
+            // 整集像素多 memcpy 一遍）；`stack_classify` 的借用版仅剩 eval 在用
+            let xs: Vec<&Tensor> = chunk.iter().map(|&i| &train[i].x).collect();
+            let x = Tensor::stack(&xs, 0).to_device(device);
             let y: Vec<i64> = chunk.iter().map(|&i| train_labels[i] as i64).collect();
             let labels = Tensor::from_slice(&y).to_device(device);
             let loss = model.loss(&x, &TrainBatch::Classify { labels })?;
             loss.backward();
-            epoch_loss += loss.double_value(&[]) as f32;
+            epoch_loss.add(&loss);
             // 梯度累加（PLAN §5.2）：每 acc_steps 个 micro-step 才步进一次
             steps += 1;
-            if steps % acc_steps == 0 {
+            if steps.is_multiple_of(acc_steps) {
                 if cfg.train.grad_clip > 0.0 {
                     opt.clip_grad_norm(cfg.train.grad_clip as f64);
                 }
@@ -2081,7 +2454,7 @@ fn train_classify_imagenette(
                 opt.zero_grad();
             }
         }
-        if steps % acc_steps != 0 {
+        if !steps.is_multiple_of(acc_steps) {
             // 尾部不足 acc_steps 的梯度也要落一次步进
             if cfg.train.grad_clip > 0.0 {
                 opt.clip_grad_norm(cfg.train.grad_clip as f64);
@@ -2089,7 +2462,7 @@ fn train_classify_imagenette(
             opt.step();
             opt.zero_grad();
         }
-        final_loss = epoch_loss / steps.max(1) as f32;
+        final_loss = epoch_loss.mean(steps);
         // 评测按间隔执行（val 全量推理在大验证集时不可忽略）
         let eval_due = epoch == 1
             || epoch == cfg.train.epochs
@@ -2146,14 +2519,14 @@ fn train_classify_synthetic(
     for epoch in 1..=cfg.train.epochs {
         model.set_train(bn_train);
         opt.set_lr(schedule_lr(cfg, epoch));
-        let mut epoch_loss = 0f32;
+        let mut epoch_loss = EpochLossAcc::new();
         let acc_steps = cfg.train.accumulate_steps.max(1) as usize;
         opt.zero_grad();
         for si in 0..STEPS_PER_EPOCH {
             let (x, y, _) = synthetic_classify(&mut rng, bs, num_classes, img_size, device);
             let loss = model.loss(&x, &TrainBatch::Classify { labels: y })?;
             loss.backward();
-            epoch_loss += loss.double_value(&[]) as f32;
+            epoch_loss.add(&loss);
             // 梯度累加（PLAN §5.2）：每 acc_steps 个 micro-step 才步进一次
             if (si + 1) % acc_steps == 0 {
                 if cfg.train.grad_clip > 0.0 {
@@ -2163,7 +2536,7 @@ fn train_classify_synthetic(
                 opt.zero_grad();
             }
         }
-        if STEPS_PER_EPOCH % acc_steps != 0 {
+        if !STEPS_PER_EPOCH.is_multiple_of(acc_steps) {
             // 尾部不足 acc_steps 的梯度也要落一次步进
             if cfg.train.grad_clip > 0.0 {
                 opt.clip_grad_norm(cfg.train.grad_clip as f64);
@@ -2171,7 +2544,7 @@ fn train_classify_synthetic(
             opt.step();
             opt.zero_grad();
         }
-        final_loss = epoch_loss / STEPS_PER_EPOCH as f32;
+        final_loss = epoch_loss.mean(STEPS_PER_EPOCH);
         model.set_train(false); // 评测 = BN 推理语义
         acc = eval_classify(&model, num_classes, img_size, device)?;
         model.set_train(bn_train); // 恢复训练态
@@ -2195,11 +2568,7 @@ fn train_classify_synthetic(
     })
 }
 
-fn train_detect_synthetic(
-    cfg: &RunConfig,
-    run_id: &str,
-    run_dir: &Path,
-) -> AvResult<TrainReport> {
+fn train_detect_synthetic(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<TrainReport> {
     let (num_classes, img_size) = match cfg.model.tasks.first() {
         Some(TaskCfg::Detect(d)) => (d.num_classes as u32, d.img_size),
         _ => unreachable!("train_detect 只处理检测任务"),
@@ -2224,12 +2593,11 @@ fn train_detect_synthetic(
     for epoch in 1..=cfg.train.epochs {
         model.set_train(bn_train);
         opt.set_lr(schedule_lr(cfg, epoch));
-        let mut epoch_loss = 0f32;
+        let mut epoch_loss = EpochLossAcc::new();
         let acc_steps = cfg.train.accumulate_steps.max(1) as usize;
         opt.zero_grad();
         for si in 0..STEPS_PER_EPOCH {
-            let (x, boxes, labels) =
-                synthetic_detect(&mut rng, bs, num_classes, img_size, device);
+            let (x, boxes, labels) = synthetic_detect(&mut rng, bs, num_classes, img_size, device);
             let batch = TrainBatch::Detect {
                 boxes: boxes.iter().map(|b| vec![*b]).collect(),
                 labels: labels.iter().map(|&l| vec![l]).collect(),
@@ -2239,7 +2607,7 @@ fn train_detect_synthetic(
             }
             let loss = model.loss(&x, &batch)?;
             loss.backward();
-            epoch_loss += loss.double_value(&[]) as f32;
+            epoch_loss.add(&loss);
             if (si + 1) % acc_steps == 0 {
                 if cfg.train.grad_clip > 0.0 {
                     opt.clip_grad_norm(cfg.train.grad_clip as f64);
@@ -2248,7 +2616,7 @@ fn train_detect_synthetic(
                 opt.zero_grad();
             }
         }
-        final_loss = epoch_loss / STEPS_PER_EPOCH as f32;
+        final_loss = epoch_loss.mean(STEPS_PER_EPOCH);
         model.set_train(false); // 评测 = BN 推理语义
         (miou, r50, det_stats, dbg) = eval_detect(&model, num_classes, img_size, device)?;
         model.set_train(bn_train); // 恢复训练态
@@ -2283,11 +2651,74 @@ fn train_detect_synthetic(
 
 /// YOLO 目录数据源训练：整集预解码（CPU）→ 每 epoch 洗牌 → 分批搬到模型设备训练
 /// → val 冒烟指标。
-fn train_detect_yolo(
-    cfg: &RunConfig,
-    run_id: &str,
-    run_dir: &Path,
-) -> AvResult<TrainReport> {
+/// 检测贴片缓存的统计行（与 seg 缓存打印同款格式）。
+fn print_detect_cache_stats(tiles: &[dataset::RawDetectSample]) {
+    let mb: usize = tiles.iter().map(|t| t.rgb.len()).sum::<usize>() / (1024 * 1024);
+    println!(
+        "[detect] 数据缓存: ram（{} 张内容贴片，{mb}MB；全分辨率重采样一次性完成，逐 epoch 零大图编码）",
+        tiles.len()
+    );
+}
+
+/// 单样本增强决策（预抽）：组合增强硬币 + 伙伴下标 + 像素/坐标 plan。
+#[derive(Debug, Clone, Copy)]
+struct DetectDraw {
+    comp: augment::CompositeDraw,
+    partners: [usize; 3],
+    mix_partner: usize,
+    plan: AugmentPlan,
+}
+
+/// 单批检测编码（纯函数：像素/坐标串联顺序 mosaic → mixup → flip → hsv →
+/// scale，决策已预抽 ⇒ rayon 并行或跨线程执行都不改随机流、不改数值）。
+/// 供训练循环同步（首块）与预热线程（双缓冲）共用。
+fn encode_detect_batch(
+    raw: &[dataset::RawDetectSample],
+    idx: &[usize],
+    draws: &[DetectDraw],
+    img_size: u32,
+    inorm: bool,
+) -> AvResult<Vec<SampleTensor>> {
+    idx.par_iter()
+        .zip(draws)
+        .map(|(&i, d)| -> AvResult<SampleTensor> {
+            let mosaic_img = if d.comp.mosaic {
+                // 4 图组 batch：锚点 + 3 个随机重复采样填充的伙伴
+                Some(dataset::mosaic4_raw([
+                    &raw[i],
+                    &raw[d.partners[0]],
+                    &raw[d.partners[1]],
+                    &raw[d.partners[2]],
+                ])?)
+            } else {
+                None
+            };
+            let mix_img = if d.comp.mixup {
+                // 双样本融合（标签双份并集）：伙伴也随机重复采样
+                let base = mosaic_img.as_ref().unwrap_or(&raw[i]);
+                Some(dataset::mixup_raw(
+                    base,
+                    &raw[d.mix_partner],
+                    d.comp.mixup_lam,
+                )?)
+            } else {
+                None
+            };
+            let composed: &dataset::RawDetectSample =
+                mix_img.as_ref().or(mosaic_img.as_ref()).unwrap_or(&raw[i]);
+            dataset::encode_detect_sample(
+                composed,
+                img_size,
+                Device::Cpu,
+                dataset::ResizeMode::Letterbox,
+                &d.plan,
+                inorm,
+            )
+        })
+        .collect()
+}
+
+fn train_detect_yolo(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<TrainReport> {
     let (num_classes, img_size) = match cfg.model.tasks.first() {
         Some(TaskCfg::Detect(d)) => (d.num_classes as u32, d.img_size),
         _ => unreachable!("train_detect_yolo 只处理检测任务"),
@@ -2295,28 +2726,26 @@ fn train_detect_yolo(
     let device = resolve_device(cfg);
     // 数据源：dir 管线用 YOLO 目录根；avpack 管线用 `.avpack` 容器路径
     // （容器名约定 = 打包时的相对路径，加载器按 images/<split> + labels/<split> 过滤）
-    let (root, pack) = match cfg.data.pipeline {
-        DataPipeline::AvPack => {
-            let p = cfg
-                .data
-                .sources
-                .train
-                .avpack
-                .clone()
-                .ok_or_else(|| AvError::config("avpack 数据源缺 data.sources.train.avpack"))?;
-            (p.clone(), Some(p))
-        }
-        _ => {
-            let d = cfg
-                .data
-                .sources
-                .train
-                .dir
-                .clone()
-                .ok_or_else(|| AvError::config("dir 数据源缺 data.sources.train.dir"))?;
-            (d, None)
-        }
-    };
+    let (root, pack) =
+        match cfg.data.pipeline {
+            DataPipeline::AvPack => {
+                let p =
+                    cfg.data.sources.train.avpack.clone().ok_or_else(|| {
+                        AvError::config("avpack 数据源缺 data.sources.train.avpack")
+                    })?;
+                (p.clone(), Some(p))
+            }
+            _ => {
+                let d = cfg
+                    .data
+                    .sources
+                    .train
+                    .dir
+                    .clone()
+                    .ok_or_else(|| AvError::config("dir 数据源缺 data.sources.train.dir"))?;
+                (d, None)
+            }
+        };
     let train_split = cfg.data.sources.train.split.as_deref().unwrap_or("train");
     // 数据集预解码固定在 CPU（预解码成本在图像管线，与模型设备解耦），
     // 训练批 stack 后再 .to_device(model_device)，见下方训练循环。
@@ -2330,10 +2759,36 @@ fn train_detect_yolo(
         println!(
             "[augment] detect 串联顺序: mosaic → mixup → flip → hsv → scale（mixup 仅检测/分类语义，关键点不适用）"
         );
-        Some(match &pack {
-            Some(p) => dataset::load_yolo_avpack_raw(p, train_split)?,
-            None => dataset::load_yolo_dir_raw(&root, train_split)?,
-        })
+        // 数据管线 v2（[data].cache）：增强路径默认构建内容贴片缓存——全分辨率
+        // 重采样一次性完成，逐 epoch 只在贴片上增强（60MP 原图可直接训练，
+        // 无需预降采样）；"off" 保留 raw 逐 epoch 路径。detect 的 gpu 档未实现，
+        // auto/ram/gpu 均按 ram 语义。
+        let cache_on = cfg.data.cache != "off";
+        let raws: Vec<dataset::RawDetectSample> = match &pack {
+            Some(p) => {
+                let raws = dataset::load_yolo_avpack_raw(p, train_split)?;
+                if cache_on {
+                    let tiles = dataset::build_detect_tile_cache(raws, img_size)?;
+                    print_detect_cache_stats(&tiles);
+                    tiles
+                } else {
+                    println!("[detect] 数据缓存: off（raw 逐 epoch 全分辨率路径）");
+                    raws
+                }
+            }
+            None => {
+                if cache_on {
+                    let tiles = dataset::build_detect_cache_from_dir(&root, train_split, img_size)?;
+                    print_detect_cache_stats(&tiles);
+                    tiles
+                } else {
+                    println!("[detect] 数据缓存: off（raw 逐 epoch 全分辨率路径）");
+                    dataset::load_yolo_dir_raw(&root, train_split)?
+                }
+            }
+        };
+        // 双缓冲预取的编码线程要跨线程读贴片 → Arc 共享（训练期只读）
+        Some(Arc::new(raws))
     } else {
         None
     };
@@ -2341,16 +2796,36 @@ fn train_detect_yolo(
         Vec::new()
     } else {
         match &pack {
-            Some(p) => dataset::load_yolo_avpack(p, train_split, img_size, Device::Cpu, imagenet_norm(cfg))?,
-            None => dataset::load_yolo_dir(&root, train_split, img_size, Device::Cpu, imagenet_norm(cfg))?,
+            Some(p) => dataset::load_yolo_avpack(
+                p,
+                train_split,
+                img_size,
+                Device::Cpu,
+                imagenet_norm(cfg),
+            )?,
+            None => dataset::load_yolo_dir(
+                &root,
+                train_split,
+                img_size,
+                Device::Cpu,
+                imagenet_norm(cfg),
+            )?,
         }
     };
     let val = if cfg.data.pipeline == DataPipeline::AvPack {
         let val_split = cfg.data.sources.val.split.as_deref().unwrap_or("val");
         match cfg.data.sources.val.avpack.as_ref() {
-            Some(p) => dataset::load_yolo_avpack(p, val_split, img_size, Device::Cpu, imagenet_norm(cfg))?,
+            Some(p) => {
+                dataset::load_yolo_avpack(p, val_split, img_size, Device::Cpu, imagenet_norm(cfg))?
+            }
             // val 源缺省：同一容器的 val split
-            None => dataset::load_yolo_avpack(&root, val_split, img_size, Device::Cpu, imagenet_norm(cfg))?,
+            None => dataset::load_yolo_avpack(
+                &root,
+                val_split,
+                img_size,
+                Device::Cpu,
+                imagenet_norm(cfg),
+            )?,
         }
     } else {
         match cfg.data.sources.val.dir.as_ref() {
@@ -2362,7 +2837,9 @@ fn train_detect_yolo(
                 imagenet_norm(cfg),
             )?,
             // val 源缺省：同一数据集根下的 val split
-            None => dataset::load_yolo_dir(&root, "val", img_size, Device::Cpu, imagenet_norm(cfg))?,
+            None => {
+                dataset::load_yolo_dir(&root, "val", img_size, Device::Cpu, imagenet_norm(cfg))?
+            }
         }
     };
     let train_n = train_raw.as_ref().map_or(train.len(), |r| r.len());
@@ -2387,6 +2864,20 @@ fn train_detect_yolo(
     let mut r50 = 0f32;
     // BN train/eval 装配（resnet18 骨干生效；冻结骨干时恒 eval）
     let bn_train = bn_train_mode(cfg);
+    // AV_LOSS_TIMING=1 时按 1/20 采样打印 loss/step 耗时（性能归因诊断用）
+    let loss_timing = std::env::var("AV_LOSS_TIMING").is_ok();
+    let step_clock = std::sync::atomic::AtomicUsize::new(0);
+    // AMP（[train].amp）：CUDA fp16 autocast + 动态梯度缩放（CPU 自动 no-op）
+    let amp = cfg.train.amp && device != Device::Cpu;
+    if amp {
+        println!("[amp] fp16 autocast + 动态梯度缩放启用");
+    }
+    let mut scaler = GradScaler::new();
+    // EMA 影子权重 + best 追踪：fitness = 0.9·mAP50:95 + 0.1·mAP50
+    // （Ultralytics 同款）；best.ckpt 保存 fitness 最高的 EMA 权重
+    let mut ema = WeightEma::new(&vs, cfg.train.ema_decay);
+    let mut best_fitness = f32::NEG_INFINITY;
+    let mut best_state: Option<Vec<(String, Tensor)>> = None;
 
     for epoch in 1..=cfg.train.epochs {
         model.set_train(bn_train);
@@ -2401,92 +2892,168 @@ fn train_detect_yolo(
             .map(|a| strong_aug_on(a, cfg, epoch))
             .unwrap_or(false);
         let mut aug_rng = epoch_aug_rng(cfg.seed, epoch);
-        let mut epoch_loss = 0f32;
+        // 组合增强决策按 shuffle 序在主线程一次抽完。抽签顺序与旧实现的逐样本
+        // 消耗序逐位一致：composite 硬币 →（mosaic 开）3 个伙伴 →（mixup 开）
+        // 1 个伙伴 → draw_plan(flip→scale→gains)。条件抽签的消耗次数也一致
+        // （硬币未开时对应伙伴抽取不消耗 RNG）。编码阶段变为纯函数，可并行/预取。
+        let draws: Vec<DetectDraw> = match (&train_raw, &aug_cfg) {
+            (Some(raw), Some(a)) => (0..order.len())
+                .map(|_| -> DetectDraw {
+                    if strong_on {
+                        let comp = augment::draw_composite(a, &mut aug_rng);
+                        let partners = if comp.mosaic {
+                            [
+                                aug_rng.next_usize(raw.len()),
+                                aug_rng.next_usize(raw.len()),
+                                aug_rng.next_usize(raw.len()),
+                            ]
+                        } else {
+                            [0; 3]
+                        };
+                        let mix_partner = if comp.mixup {
+                            aug_rng.next_usize(raw.len())
+                        } else {
+                            0
+                        };
+                        let plan = augment::draw_plan(a, &mut aug_rng);
+                        DetectDraw {
+                            comp,
+                            partners,
+                            mix_partner,
+                            plan,
+                        }
+                    } else {
+                        DetectDraw {
+                            comp: augment::CompositeDraw::none(),
+                            partners: [0; 3],
+                            mix_partner: 0,
+                            plan: AugmentPlan::none(),
+                        }
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut epoch_loss = EpochLossAcc::new();
         let mut steps = 0usize;
         let acc_steps = cfg.train.accumulate_steps.max(1) as usize;
         opt.zero_grad();
-        for chunk in order.chunks(bs) {
-            let batch_samples: Vec<SampleTensor> = chunk
-                .iter()
-                .map(|&i| -> AvResult<SampleTensor> {
-                    match (&train_raw, &aug_cfg) {
-                        (Some(raw), Some(a)) => {
-                            // 组合增强（数据增强官二波）：抽签顺序固定
-                            // mosaic 硬币 → mixup 硬币+λ → draw_plan(flip→scale→gains)，
-                            // 与像素/坐标串联顺序 mosaic → mixup → flip → hsv → scale 对应。
-                            // mosaic/mixup 概率全 0 时零消耗 RNG，行为与历史版本逐位一致。
-                            let comp = if strong_on {
-                                augment::draw_composite(a, &mut aug_rng)
-                            } else {
-                                augment::CompositeDraw::none()
-                            };
-                            let mosaic_img = if comp.mosaic {
-                                // 4 图组 batch：锚点 + 3 个随机重复采样填充的伙伴
-                                let j1 = aug_rng.next_usize(raw.len());
-                                let j2 = aug_rng.next_usize(raw.len());
-                                let j3 = aug_rng.next_usize(raw.len());
-                                Some(dataset::mosaic4_raw([
-                                    &raw[i], &raw[j1], &raw[j2], &raw[j3],
-                                ])?)
-                            } else {
-                                None
-                            };
-                            let mix_img = if comp.mixup {
-                                // 双样本融合（标签双份并集）：伙伴也随机重复采样
-                                let k = aug_rng.next_usize(raw.len());
-                                let base = mosaic_img.as_ref().unwrap_or(&raw[i]);
-                                Some(dataset::mixup_raw(base, &raw[k], comp.mixup_lam)?)
-                            } else {
-                                None
-                            };
-                            let plan = if strong_on {
-                                augment::draw_plan(a, &mut aug_rng)
-                            } else {
-                                AugmentPlan::none()
-                            };
-                            let composed: &dataset::RawDetectSample = mix_img
-                                .as_ref()
-                                .or(mosaic_img.as_ref())
-                                .unwrap_or(&raw[i]);
-                            dataset::encode_detect_sample(
-                                composed,
-                                img_size,
-                                Device::Cpu,
-                                dataset::ResizeMode::Letterbox,
-                                &plan,
-                                imagenet_norm(cfg),
-                            )
-                        }
-                        _ => Ok(train[i].clone()),
-                    }
-                })
-                .collect::<AvResult<Vec<_>>>()?;
-            // 样本张量在 CPU 预解码，进模型前整批搬到模型设备
-            let x = dataset::stack_samples(&batch_samples)?.to_device(device);
-            let batch = TrainBatch::Detect {
-                boxes: batch_samples.iter().map(|s| s.boxes.clone()).collect(),
-                labels: batch_samples.iter().map(|s| s.labels.clone()).collect(),
-            };
-            let loss = model.loss(&x, &batch)?;
-            loss.backward();
-            epoch_loss += loss.double_value(&[]) as f32;
-            steps += 1;
-            if steps % acc_steps == 0 {
-                if cfg.train.grad_clip > 0.0 {
-                    opt.clip_grad_norm(cfg.train.grad_clip as f64);
+        // 双缓冲预取（seg 同款）：批 N+1 的 CPU 编码在独立线程与批 N 的 GPU
+        // 前向/反向重叠——编码决策已预抽、编码为纯函数，跨线程不改随机流与
+        // 数值；首块同步编码仅一次，此后每块先收上一块的货再预热下一块。
+        let chunk_starts: Vec<usize> = (0..order.len()).step_by(bs).collect();
+        let mut in_flight: Option<std::thread::JoinHandle<AvResult<Vec<SampleTensor>>>> = None;
+        for (ci, &start) in chunk_starts.iter().enumerate() {
+            let end = (start + bs).min(order.len());
+            let (x, boxes, labels) = match in_flight.take() {
+                Some(h) => {
+                    let batch_samples: Vec<SampleTensor> =
+                        h.join().map_err(|_| AvError::train("数据编码线程崩溃"))??;
+                    let x = dataset::stack_samples(&batch_samples)?.to_device(device);
+                    (
+                        x,
+                        batch_samples.iter().map(|s| s.boxes.clone()).collect(),
+                        batch_samples.iter().map(|s| s.labels.clone()).collect(),
+                    )
                 }
-                opt.step();
-                opt.zero_grad();
+                None => match (&train_raw, &aug_cfg) {
+                    (Some(raw), Some(_)) => {
+                        let batch_samples = encode_detect_batch(
+                            raw,
+                            &order[start..end],
+                            &draws[start..end],
+                            img_size,
+                            imagenet_norm(cfg),
+                        )?;
+                        let x = dataset::stack_samples(&batch_samples)?.to_device(device);
+                        (
+                            x,
+                            batch_samples.iter().map(|s| s.boxes.clone()).collect(),
+                            batch_samples.iter().map(|s| s.labels.clone()).collect(),
+                        )
+                    }
+                    // 快速路径：预解码张量借用堆叠（历史逐样本 clone + 堆叠是每
+                    // epoch 多 memcpy 一遍整集），仅框/类别按批拷进 TrainBatch
+                    _ => {
+                        let xs: Vec<&Tensor> =
+                            order[start..end].iter().map(|&i| &train[i].x).collect();
+                        (
+                            Tensor::stack(&xs, 0).to_device(device),
+                            order[start..end]
+                                .iter()
+                                .map(|&i| train[i].boxes.clone())
+                                .collect(),
+                            order[start..end]
+                                .iter()
+                                .map(|&i| train[i].labels.clone())
+                                .collect(),
+                        )
+                    }
+                },
+            };
+            // 预热下一块：编码线程与本次 GPU 计算重叠
+            if let (Some(raw), Some(_)) = (&train_raw, &aug_cfg) {
+                if let Some(&next_start) = chunk_starts.get(ci + 1) {
+                    let next_end = (next_start + bs).min(order.len());
+                    let idx = order[next_start..next_end].to_vec();
+                    let draws_next = draws[next_start..next_end].to_vec();
+                    let raw = Arc::clone(raw);
+                    let inorm = imagenet_norm(cfg);
+                    in_flight = Some(std::thread::spawn(move || {
+                        encode_detect_batch(&raw, &idx, &draws_next, img_size, inorm)
+                    }));
+                }
+            }
+            // 样本张量在 CPU 预解码，进模型前整批搬到模型设备
+            let batch = TrainBatch::Detect { boxes, labels };
+            let timing = loss_timing;
+            let t0 = std::time::Instant::now();
+            // AMP：前向 + loss 在 fp16 autocast 内；反缩放前的 backward 用放大
+            // 后的 fp32 loss（防止 fp16 上溢）
+            let loss = if amp {
+                tch::autocast(true, || model.loss(&x, &batch))?.to_kind(Kind::Float)
+            } else {
+                model.loss(&x, &batch)?
+            };
+            let t_loss = t0.elapsed();
+            let backward_from = if amp {
+                scaler.scaled(&loss)
+            } else {
+                loss.copy()
+            };
+            backward_from.backward();
+            epoch_loss.add(&loss);
+            steps += 1;
+            if steps.is_multiple_of(acc_steps) {
+                optimizer_step(
+                    amp,
+                    &mut scaler,
+                    &vs,
+                    &mut opt,
+                    &mut ema,
+                    cfg.train.grad_clip,
+                );
+            }
+            if timing {
+                let t_all = t0.elapsed();
+                let k = step_clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if k.is_multiple_of(20) {
+                    let bwd = t_all - t_loss;
+                    eprintln!("[timing] loss={t_loss:?} backward+step={bwd:?} total={t_all:?}");
+                }
             }
         }
-        if steps % acc_steps != 0 {
-            if cfg.train.grad_clip > 0.0 {
-                opt.clip_grad_norm(cfg.train.grad_clip as f64);
-            }
-            opt.step();
-            opt.zero_grad();
+        if !steps.is_multiple_of(acc_steps) {
+            optimizer_step(
+                amp,
+                &mut scaler,
+                &vs,
+                &mut opt,
+                &mut ema,
+                cfg.train.grad_clip,
+            );
         }
-        final_loss = epoch_loss / steps.max(1) as f32;
+        final_loss = epoch_loss.mean(steps);
         let TaskModel::Detect(m) = &model else {
             unreachable!("检测任务模型类型")
         };
@@ -2497,13 +3064,21 @@ fn train_detect_yolo(
             || epoch % cfg.eval.interval_epochs == 0;
         if eval_due {
             model.set_train(false); // 评测 = BN 推理语义（running 统计量）
-            let evm = eval_detect_samples(m, &val, device)?;
+                                    // EMA 影子权重参与评测，评测后还原（训练继续用原始变量）
+            let ema_saved = ema.apply_to(&vs);
+            let evm = eval_detect_samples(m, &val, device, amp)?;
+            ema.restore(&vs, &ema_saved);
             model.set_train(bn_train); // 恢复训练态
             (miou, r50) = (evm.miou, evm.r50);
             println!(
                 "[detect-yolo] run={run_id} epoch={epoch}/{} loss={final_loss:.4} mIoU={miou:.3} R@0.5={r50:.3} mAP50={:.3} mAP50:95={:.3}",
                 cfg.train.epochs, evm.map50, evm.map50_95
             );
+            let fitness = 0.9 * evm.map50_95 + 0.1 * evm.map50;
+            if fitness > best_fitness {
+                best_fitness = fitness;
+                best_state = Some(ema.snapshot_cpu());
+            }
         }
         log_epoch_metrics(
             run_dir,
@@ -2515,7 +3090,9 @@ fn train_detect_yolo(
         );
     }
 
-    save_checkpoint(&vs, &run_dir.join(CKPT_DIR))?;
+    // best.ckpt = val fitness 最高的 EMA 影子权重（无评测运行时退化为最终 EMA）
+    let final_state = best_state.unwrap_or_else(|| ema.snapshot_cpu());
+    save_named_variables(&final_state, &run_dir.join(CKPT_DIR))?;
     Ok(TrainReport {
         run_id: run_id.to_string(),
         task: "detect".into(),
@@ -2548,16 +3125,24 @@ fn eval_detect_samples(
     m: &av_tasks::models::DetectModel,
     val: &[SampleTensor],
     device: Device,
+    amp: bool,
 ) -> AvResult<DetectEvalMetrics> {
     let n = val.len();
     if n == 0 {
         return Err(AvError::data("验证集为空"));
     }
     let mut per_image: Vec<Vec<av_core::types::Detection>> = Vec::new();
-    for chunk in val.chunks(8) {
+    // 32/批：与 OBB 评测同一理由（见 eval_obb_samples）
+    for chunk in val.chunks(32) {
         // 预解码样本在 CPU，推理批内搬到模型设备
         let x = dataset::stack_samples(chunk)?.to_device(device);
-        per_image.extend(m.predict(&x, 0.1, 0.5)?);
+        let pred = if amp {
+            // AMP：推理也走 fp16 autocast（与训练一致的速度收益与数值域）
+            tch::autocast(true, || m.predict(&x, 0.1, 0.5))?
+        } else {
+            m.predict(&x, 0.1, 0.5)?
+        };
+        per_image.extend(pred);
     }
     // 指标定义（v0.1 冒烟）：best_ious = 无类过滤定位 IoU（纯定位能力）；
     // class_ok/R@0.5 = 类别也正确才计（定位+分类联合）。真实 mAP 协议由 eval_map 接管。
@@ -2613,21 +3198,20 @@ fn eval_detect_samples(
     })
 }
 
-fn eval_classify(model: &TaskModel, num_classes: u32, img_size: u32, device: Device) -> AvResult<f32> {
+fn eval_classify(
+    model: &TaskModel,
+    num_classes: u32,
+    img_size: u32,
+    device: Device,
+) -> AvResult<f32> {
     let mut rng = XorShift::new(0x5EED_0001);
     // 合成评测集直接生成在模型设备上，与模型权重同侧
-    let (x, _, labels) =
-        synthetic_classify(&mut rng, EVAL_BATCH, num_classes, img_size, device);
+    let (x, _, labels) = synthetic_classify(&mut rng, EVAL_BATCH, num_classes, img_size, device);
     let TaskModel::Classify(m) = model else {
         return Err(AvError::train("模型与任务不匹配"));
     };
     let (pred, _) = m.predict(&x)?;
-    Ok(pred
-        .iter()
-        .zip(&labels)
-        .filter(|(a, b)| a == b)
-        .count() as f32
-        / labels.len() as f32)
+    Ok(pred.iter().zip(&labels).filter(|(a, b)| a == b).count() as f32 / labels.len() as f32)
 }
 
 /// 在（预解码）分类样本集上算 top1：按 EVAL_BATCH 分批推理，
@@ -2668,8 +3252,7 @@ fn eval_detect(
     let mut rng = XorShift::new(0x5EED_0002);
     let n = 64usize;
     // 合成评测集直接生成在模型设备上，与模型权重同侧
-    let (x, boxes, labels) =
-        synthetic_detect(&mut rng, n as i64, num_classes, img_size, device);
+    let (x, boxes, labels) = synthetic_detect(&mut rng, n as i64, num_classes, img_size, device);
     let TaskModel::Detect(m) = model else {
         return Err(AvError::train("模型与任务不匹配"));
     };
@@ -2758,9 +3341,9 @@ fn synthetic_classify(
     let n = n as usize;
     let mut buf = vec![0f32; n * 3 * s * s];
     let mut labels = vec![0u32; n];
-    for ni in 0..n {
+    for (ni, lbl) in labels.iter_mut().enumerate() {
         let c = rng.next_usize(num_classes as usize);
-        labels[ni] = c as u32;
+        *lbl = c as u32;
         let base = ni * 3 * s * s;
         for v in buf[base..base + 3 * s * s].iter_mut() {
             *v = rng.next_f32() * 0.3;
@@ -2861,7 +3444,14 @@ mod fragment_merge_tests {
     use super::merge_tile_fragments;
     use av_core::geometry::Aabb;
 
-    fn det(x1: f32, y1: f32, x2: f32, y2: f32, score: f32, class_id: u32) -> av_core::types::Detection {
+    fn det(
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        score: f32,
+        class_id: u32,
+    ) -> av_core::types::Detection {
         av_core::types::Detection {
             bbox: Aabb::new(x1, y1, x2, y2),
             score,
@@ -2878,7 +3468,10 @@ mod fragment_merge_tests {
     #[test]
     fn two_overlapping_fragments_merge_into_one() {
         let out = merge_tile_fragments(
-            vec![det(0.0, 0.0, 40.0, 40.0, 0.9, 0), det(20.0, 0.0, 60.0, 40.0, 0.6, 0)],
+            vec![
+                det(0.0, 0.0, 40.0, 40.0, 0.9, 0),
+                det(20.0, 0.0, 60.0, 40.0, 0.6, 0),
+            ],
             0.3,
             25.0,
         );
@@ -2886,7 +3479,11 @@ mod fragment_merge_tests {
         assert!((out[0].score - 0.9).abs() < 1e-6, "代表取分数最高者");
         let b = &out[0].bbox;
         assert!((b.x1 - 0.0).abs() < 1e-6 && (b.y1 - 0.0).abs() < 1e-6);
-        assert!((b.x2 - 60.0).abs() < 1e-6 && (b.y2 - 40.0).abs() < 1e-6, "并集框 {:?}", b);
+        assert!(
+            (b.x2 - 60.0).abs() < 1e-6 && (b.y2 - 40.0).abs() < 1e-6,
+            "并集框 {:?}",
+            b
+        );
     }
 
     /// 手算对照：IoU 与中心距须同时满足，且只合并同类。
@@ -2898,10 +3495,10 @@ mod fragment_merge_tests {
     #[test]
     fn merge_requires_iou_and_distance_and_same_class() {
         let dets = vec![
-            det(20.0, 0.0, 60.0, 40.0, 0.6, 0),     // b（应并入 a）
-            det(100.0, 100.0, 300.0, 300.0, 0.7, 0), // d
-            det(0.0, 0.0, 40.0, 40.0, 0.9, 0),       // a（代表）
-            det(0.0, 0.0, 300.0, 300.0, 0.8, 0),     // c
+            det(20.0, 0.0, 60.0, 40.0, 0.6, 0),          // b（应并入 a）
+            det(100.0, 100.0, 300.0, 300.0, 0.7, 0),     // d
+            det(0.0, 0.0, 40.0, 40.0, 0.9, 0),           // a（代表）
+            det(0.0, 0.0, 300.0, 300.0, 0.8, 0),         // c
             det(1000.0, 1000.0, 1020.0, 1020.0, 0.5, 0), // e
             det(2000.0, 2000.0, 2040.0, 2040.0, 0.9, 1), // f（类 1）
             det(2020.0, 2000.0, 2060.0, 2040.0, 0.6, 0), // g（类 0，与 f 不同类）
@@ -2918,8 +3515,13 @@ mod fragment_merge_tests {
         assert!(out.iter().any(|k| (k.score - 0.8).abs() < 1e-6));
         assert!(out.iter().any(|k| (k.score - 0.7).abs() < 1e-6));
         // f/g（同几何不同类）都活着
-        assert_eq!(out.iter().filter(|k| (k.score - 0.9).abs() < 1e-6).count(), 2);
-        assert!(out.iter().any(|k| (k.score - 0.6).abs() < 1e-6 && k.class_id == 0));
+        assert_eq!(
+            out.iter().filter(|k| (k.score - 0.9).abs() < 1e-6).count(),
+            2
+        );
+        assert!(out
+            .iter()
+            .any(|k| (k.score - 0.6).abs() < 1e-6 && k.class_id == 0));
         assert!(out.iter().any(|k| (k.score - 0.5).abs() < 1e-6));
     }
 
@@ -2996,25 +3598,43 @@ mod seg_cache_mode_tests {
         let cuda = Device::Cuda(0);
         let cpu = Device::Cpu;
         // 526×640²×3×4B ≈ 2.6GB ≤ 4GiB 预算 → gpu
-        assert_eq!(resolve_seg_cache_mode("auto", 526, 640, cuda), SegCacheMode::Gpu);
+        assert_eq!(
+            resolve_seg_cache_mode("auto", 526, 640, cuda),
+            SegCacheMode::Gpu
+        );
         // 20 万张远超预算 → ram
         assert_eq!(
             resolve_seg_cache_mode("auto", 200_000, 640, cuda),
             SegCacheMode::Ram
         );
         // 无 CUDA 永不选 gpu
-        assert_eq!(resolve_seg_cache_mode("auto", 526, 640, cpu), SegCacheMode::Ram);
+        assert_eq!(
+            resolve_seg_cache_mode("auto", 526, 640, cpu),
+            SegCacheMode::Ram
+        );
     }
 
     #[test]
     fn explicit_values_override_auto() {
         let cuda = Device::Cuda(0);
         let cpu = Device::Cpu;
-        assert_eq!(resolve_seg_cache_mode("off", 526, 640, cuda), SegCacheMode::Off);
-        assert_eq!(resolve_seg_cache_mode("ram", 526, 640, cuda), SegCacheMode::Ram);
-        assert_eq!(resolve_seg_cache_mode("gpu", 526, 640, cuda), SegCacheMode::Gpu);
+        assert_eq!(
+            resolve_seg_cache_mode("off", 526, 640, cuda),
+            SegCacheMode::Off
+        );
+        assert_eq!(
+            resolve_seg_cache_mode("ram", 526, 640, cuda),
+            SegCacheMode::Ram
+        );
+        assert_eq!(
+            resolve_seg_cache_mode("gpu", 526, 640, cuda),
+            SegCacheMode::Gpu
+        );
         // 显式 gpu 但无 CUDA → 回落 ram（引擎侧 warn）
-        assert_eq!(resolve_seg_cache_mode("gpu", 526, 640, cpu), SegCacheMode::Ram);
+        assert_eq!(
+            resolve_seg_cache_mode("gpu", 526, 640, cpu),
+            SegCacheMode::Ram
+        );
     }
 }
 
@@ -3036,5 +3656,108 @@ mod ckpt_epoch_tests {
         assert_eq!(read_checkpoint_epoch(&dir), Some(57));
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(read_checkpoint_epoch(&dir), None, "目录不存在应返回 None");
+    }
+}
+
+/// AMP 梯度缩放器与 EMA 影子权重的行为契约（CPU 张量，无 CUDA 依赖）。
+#[cfg(test)]
+mod amp_ema_tests {
+    use super::*;
+
+    #[test]
+    fn grad_scaler_grows_on_stable_steps_and_backs_off_on_inf() {
+        let mut s = GradScaler::new();
+        assert_eq!(s.scale, 65536.0);
+        for _ in 0..(s.growth_interval - 1) {
+            s.update(true);
+        }
+        assert_eq!(s.scale, 65536.0, "未达 interval 不放大");
+        s.update(true);
+        assert_eq!(s.scale, 131072.0, "达到 interval 放大 2×");
+        s.update(false);
+        assert_eq!(s.scale, 65536.0, "异常步进回退 0.5× 并重置计数");
+        assert_eq!(s.steps_since_growth, 0);
+    }
+
+    #[test]
+    fn grad_scaler_unscale_divides_finite_grads() {
+        let vs = VarStore::new(Device::Cpu);
+        let a = vs.root().var("a", &[2_i64], tch::nn::Init::Const(1.0));
+        let loss = (&a * &a).sum(Kind::Float);
+        loss.backward();
+        let mut scaler = GradScaler::new();
+        scaler.scale = 2.0;
+        let vars = vs.trainable_variables();
+        assert!(scaler.unscale_and_check(&vars), "有限梯度应通过检测");
+        let g = vars[0].grad();
+        let (g1, g2) = (g.double_value(&[0]), g.double_value(&[1]));
+        // 初始 a=1 → grad=2a=[2,2]；÷2 后 = [1,1]
+        assert!((g1 - 1.0).abs() < 1e-6 && (g2 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn grad_scaler_rejects_nan_grads() {
+        let t = Tensor::from_slice(&[f32::NAN]).set_requires_grad(true);
+        let loss = (&t * &t).sum(Kind::Float);
+        loss.backward();
+        let holder = VarStore::new(Device::Cpu);
+        let mut vars = holder.trainable_variables(); // 空——直接构造参数列表
+        vars.push(t);
+        let mut scaler = GradScaler::new();
+        assert!(!scaler.unscale_and_check(&vars), "NaN 梯度必须被检出");
+    }
+
+    #[test]
+    fn weight_ema_scheduled_decay_update_and_swap_roundtrip() {
+        let vs = VarStore::new(Device::Cpu);
+        let v = vs.root().var("w", &[1_i64], tch::nn::Init::Const(1.0));
+        let mut ema = WeightEma::new(&vs, 0.999);
+        // 影子置为已知值 1.0（new 捕获的是随机初始化）
+        ema.shadow[0].1 = Tensor::from_slice(&[1.0f32]);
+        let mut v = v;
+        v.set_data(&Tensor::from_slice(&[3.0f32]));
+        ema.update(&vs);
+        // updates=1：d = min(0.999, 2/11)；shadow = 1·d + 3·(1-d) = 3 - 2d
+        let d = 2.0 / 11.0;
+        let expect = 3.0 - 2.0 * d;
+        let got = ema.shadow[0].1.double_value(&[0]);
+        assert!(
+            (got - expect).abs() < 1e-5,
+            "EMA 更新偏差: {got} vs {expect}"
+        );
+        // apply → 实际变量变成影子值；restore → 还原为 3.0
+        let saved = ema.apply_to(&vs);
+        assert!(
+            (v.double_value(&[0]) - expect).abs() < 1e-6,
+            "apply 后应为影子值"
+        );
+        ema.restore(&vs, &saved);
+        assert!(
+            (v.double_value(&[0]) - 3.0).abs() < 1e-6,
+            "restore 后应还原原值"
+        );
+    }
+
+    #[test]
+    fn save_named_variables_roundtrip_matches_checkpoint_naming() {
+        let vs = VarStore::new(Device::Cpu);
+        let a = vs
+            .root()
+            .var("head/cls_weight", &[1_i64], tch::nn::Init::Const(5.0));
+        let dir = std::env::temp_dir().join(format!("av-named-ckpt-{}", std::process::id()));
+        let vars = vec![("head/cls_weight".to_string(), a.copy())];
+        save_named_variables(&vars, &dir).unwrap();
+        // 命名与 save_checkpoint 同规则（load_checkpoint 按 vs 变量名可找到）
+        let mut vs2 = VarStore::new(Device::Cpu);
+        let b = vs2
+            .root()
+            .var("head/cls_weight", &[1_i64], tch::nn::Init::Const(0.0));
+        load_checkpoint(&mut vs2, &dir).unwrap();
+        assert!(
+            (b.double_value(&[0]) - a.double_value(&[0])).abs() < 1e-6,
+            "保存-加载应逐位一致"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let _ = b;
     }
 }

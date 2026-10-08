@@ -59,7 +59,7 @@ fn main() {
     let ws = Tensor::randn([8, 3, 3, 3], (Kind::Float, device)).set_requires_grad(true);
     let bs = Tensor::randn([8], (Kind::Float, device)).set_requires_grad(true);
     let x = Tensor::randn([2, 3, 64, 64], (Kind::Float, device));
-    let y = x.conv2d(&ws, Some(&bs), &[1, 1], &[1, 1], &[1, 1], 1);
+    let y = x.conv2d(&ws, Some(&bs), [1, 1], [1, 1], [1, 1], 1);
     let loss = y.square().mean(Kind::Float);
     loss.backward();
     println!(

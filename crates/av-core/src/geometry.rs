@@ -19,7 +19,12 @@ impl Aabb {
     }
 
     pub fn from_xywh(x: f32, y: f32, w: f32, h: f32) -> Self {
-        Self { x1: x, y1: y, x2: x + w, y2: y + h }
+        Self {
+            x1: x,
+            y1: y,
+            x2: x + w,
+            y2: y + h,
+        }
     }
 
     pub fn w(&self) -> f32 {
@@ -88,11 +93,14 @@ impl RotBox {
     }
 
     /// 旋转 IoU：凸多边形裁剪求交面积。
+    ///
+    /// 面积直接用 w·h（旋转矩形，省两次鞋带公式）；裁剪在栈上完成
+    /// （两四边形凸交顶点 ≤ 8，零堆分配——旋转 NMS 每图要做 O(n²) 次本函数）。
     pub fn iou(&self, o: &RotBox) -> f32 {
         let a = self.corners();
         let b = o.corners();
-        let inter = convex_polygon_intersection_area(&a, &b);
-        let union = polygon_area(&a) + polygon_area(&b) - inter;
+        let inter = quad_intersection_area(&a, &b);
+        let union = self.w * self.h + o.w * o.h - inter;
         if union <= 1e-12 {
             0.0
         } else {
@@ -128,8 +136,13 @@ fn line_intersect(a: [f32; 2], b: [f32; 2], c: [f32; 2], d: [f32; 2]) -> [f32; 2
 }
 
 /// Sutherland–Hodgman 凸多边形裁剪：返回交多边形面积（顶点须为逆时针/顺时针一致序）。
+///
+/// 通用入口（任意顶点数）。`RotBox::iou` 走 [`quad_intersection_area`] 栈上特化路径。
 pub fn convex_polygon_intersection_area(subject: &[[f32; 2]], clip: &[[f32; 2]]) -> f32 {
-    let mut output: Vec<[f32; 2]> = subject.to_vec();
+    let cap = subject.len() + clip.len();
+    let mut output: Vec<[f32; 2]> = Vec::with_capacity(cap);
+    let mut scratch: Vec<[f32; 2]> = Vec::with_capacity(cap);
+    output.extend_from_slice(subject);
     let n = clip.len();
     for i in 0..n {
         if output.is_empty() {
@@ -137,7 +150,10 @@ pub fn convex_polygon_intersection_area(subject: &[[f32; 2]], clip: &[[f32; 2]])
         }
         let a = clip[i];
         let b = clip[(i + 1) % n];
+        // 双缓冲交换：两块缓冲容量全程复用（旧实现 mem::take 后从零扩容，
+        // 每条裁剪边都触发一次 realloc）
         let input = std::mem::take(&mut output);
+        scratch.clear();
         let m = input.len();
         for j in 0..m {
             let cur = input[j];
@@ -145,19 +161,63 @@ pub fn convex_polygon_intersection_area(subject: &[[f32; 2]], clip: &[[f32; 2]])
             let cur_in = cross(a, b, cur) >= 0.0;
             let nxt_in = cross(a, b, nxt) >= 0.0;
             if cur_in {
-                output.push(cur);
+                scratch.push(cur);
                 if !nxt_in {
-                    output.push(line_intersect(a, b, cur, nxt));
+                    scratch.push(line_intersect(a, b, cur, nxt));
                 }
             } else if nxt_in {
-                output.push(line_intersect(a, b, cur, nxt));
+                scratch.push(line_intersect(a, b, cur, nxt));
             }
         }
+        output = std::mem::take(&mut scratch);
+        scratch = input;
+        scratch.clear();
     }
     if output.len() < 3 {
         0.0
     } else {
         polygon_area(&output)
+    }
+}
+
+/// 四边形 × 四边形裁剪特化：交多边形顶点 ≤ 8（每条裁剪边至多 +1 顶点），
+/// 全程栈上定长数组，零堆分配。
+fn quad_intersection_area(subject: &[[f32; 2]; 4], clip: &[[f32; 2]; 4]) -> f32 {
+    let mut out = [[0.0f32; 2]; 8];
+    out[..4].copy_from_slice(subject);
+    let mut out_len = 4usize;
+    let mut tmp = [[0.0f32; 2]; 8];
+    for i in 0..clip.len() {
+        if out_len == 0 {
+            return 0.0;
+        }
+        let a = clip[i];
+        let b = clip[(i + 1) % clip.len()];
+        let mut tmp_len = 0usize;
+        for j in 0..out_len {
+            let cur = out[j];
+            let nxt = out[(j + 1) % out_len];
+            let cur_in = cross(a, b, cur) >= 0.0;
+            let nxt_in = cross(a, b, nxt) >= 0.0;
+            if cur_in {
+                tmp[tmp_len] = cur;
+                tmp_len += 1;
+                if !nxt_in {
+                    tmp[tmp_len] = line_intersect(a, b, cur, nxt);
+                    tmp_len += 1;
+                }
+            } else if nxt_in {
+                tmp[tmp_len] = line_intersect(a, b, cur, nxt);
+                tmp_len += 1;
+            }
+        }
+        std::mem::swap(&mut out, &mut tmp);
+        out_len = tmp_len;
+    }
+    if out_len < 3 {
+        0.0
+    } else {
+        polygon_area(&out[..out_len])
     }
 }
 
@@ -201,7 +261,11 @@ impl Letterbox {
 
     /// 画布坐标 → 原图坐标（裁剪回原图范围）。
     pub fn restore_box(&self, b: Aabb, orig_w: u32, orig_h: u32) -> Aabb {
-        let inv = if self.scale > 0.0 { 1.0 / self.scale } else { 0.0 };
+        let inv = if self.scale > 0.0 {
+            1.0 / self.scale
+        } else {
+            0.0
+        };
         Aabb::new(
             ((b.x1 - self.pad_left) * inv).clamp(0.0, orig_w as f32),
             ((b.y1 - self.pad_top) * inv).clamp(0.0, orig_h as f32),
@@ -229,35 +293,89 @@ mod tests {
 
     #[test]
     fn rot_iou_matches_aabb_at_zero_angle() {
-        let a = RotBox { cx: 5.0, cy: 5.0, w: 10.0, h: 10.0, theta: 0.0 };
-        let b = RotBox { cx: 10.0, cy: 5.0, w: 10.0, h: 10.0, theta: 0.0 };
+        let a = RotBox {
+            cx: 5.0,
+            cy: 5.0,
+            w: 10.0,
+            h: 10.0,
+            theta: 0.0,
+        };
+        let b = RotBox {
+            cx: 10.0,
+            cy: 5.0,
+            w: 10.0,
+            h: 10.0,
+            theta: 0.0,
+        };
         assert!(close(a.iou(&b), 1.0 / 3.0));
     }
 
     #[test]
     fn rot_iou_identical_is_one() {
-        let a = RotBox { cx: 3.0, cy: 7.0, w: 8.0, h: 5.0, theta: 0.7 };
+        let a = RotBox {
+            cx: 3.0,
+            cy: 7.0,
+            w: 8.0,
+            h: 5.0,
+            theta: 0.7,
+        };
         assert!(close(a.iou(&a), 1.0));
     }
 
     #[test]
     fn rot_iou_quarter_turn_with_wh_swap_is_one() {
-        let a = RotBox { cx: 5.0, cy: 5.0, w: 10.0, h: 5.0, theta: 0.0 };
-        let b = RotBox { cx: 5.0, cy: 5.0, w: 5.0, h: 10.0, theta: FRAC_PI_2 };
+        let a = RotBox {
+            cx: 5.0,
+            cy: 5.0,
+            w: 10.0,
+            h: 5.0,
+            theta: 0.0,
+        };
+        let b = RotBox {
+            cx: 5.0,
+            cy: 5.0,
+            w: 5.0,
+            h: 10.0,
+            theta: FRAC_PI_2,
+        };
         assert!(close(a.iou(&b), 1.0));
     }
 
     #[test]
     fn rot_iou_period_pi() {
-        let a = RotBox { cx: 0.0, cy: 0.0, w: 4.0, h: 3.0, theta: 0.2 };
-        let b = RotBox { cx: 0.0, cy: 0.0, w: 4.0, h: 3.0, theta: 0.2 + PI };
+        let a = RotBox {
+            cx: 0.0,
+            cy: 0.0,
+            w: 4.0,
+            h: 3.0,
+            theta: 0.2,
+        };
+        let b = RotBox {
+            cx: 0.0,
+            cy: 0.0,
+            w: 4.0,
+            h: 3.0,
+            theta: 0.2 + PI,
+        };
         assert!(close(a.iou(&b), 1.0));
     }
 
     #[test]
     fn disjoint_is_zero() {
-        let a = RotBox { cx: 0.0, cy: 0.0, w: 2.0, h: 2.0, theta: 0.3 };
-        let b = RotBox { cx: 100.0, cy: 100.0, w: 2.0, h: 2.0, theta: 1.1 };
+        let a = RotBox {
+            cx: 0.0,
+            cy: 0.0,
+            w: 2.0,
+            h: 2.0,
+            theta: 0.3,
+        };
+        let b = RotBox {
+            cx: 100.0,
+            cy: 100.0,
+            w: 2.0,
+            h: 2.0,
+            theta: 1.1,
+        };
         assert!(a.iou(&b) < 1e-6);
     }
 

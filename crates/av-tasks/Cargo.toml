@@ -15,4 +15,5 @@ torch = ["av-core/torch", "dep:tch"]
 
 [dependencies]
 av-core = { workspace = true }
+rayon = { workspace = true }
 tch = { workspace = true, optional = true }

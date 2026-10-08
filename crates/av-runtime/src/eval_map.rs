@@ -13,13 +13,13 @@
 
 use std::collections::BTreeMap;
 
+use rayon::prelude::*;
+
 use av_core::geometry::Aabb;
 use av_core::types::Detection;
 
 /// IoU 阈值档位：0.50:0.05:0.95 共 10 档（COCO 惯例）。
-pub const IOU_THRESHOLDS: [f64; 10] = [
-    0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95,
-];
+pub const IOU_THRESHOLDS: [f64; 10] = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95];
 
 /// 真值框（与预测同一像素空间）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -105,11 +105,25 @@ impl CocoEvaluator {
             return report;
         }
 
+        // 逐类独立评测，rayon 按类并行：每类只构建一次上下文（det 列表 +
+        // det×gt IoU 矩阵），10 个 IoU 档位复用同一份 IoU——旧实现每档重算
+        // 全部 IoU，评测是 10 倍重复计算。保序 collect 后仍按类 id 升序、
+        // 档位序累加，f64 求和顺序与串行逐位一致。
+        let per_class: Vec<[f64; 10]> = classes
+            .par_iter()
+            .map(|&c| {
+                let ctx = self.class_context(c);
+                let mut aps = [0.0f64; 10];
+                for (ti, &thr) in IOU_THRESHOLDS.iter().enumerate() {
+                    aps[ti] = class_ap_at(&ctx, thr);
+                }
+                aps
+            })
+            .collect();
         let mut sum_all = 0.0f64; // Σ AP over (class, 10 thresholds)
         let mut sum_50 = 0.0f64; // Σ AP at IoU=0.50
-        for &c in &classes {
-            for (ti, &thr) in IOU_THRESHOLDS.iter().enumerate() {
-                let ap = self.class_ap(c, thr);
+        for aps in &per_class {
+            for (ti, &ap) in aps.iter().enumerate() {
                 sum_all += ap;
                 if ti == 0 {
                     sum_50 += ap;
@@ -124,75 +138,89 @@ impl CocoEvaluator {
         }
     }
 
-    /// 单类别、单 IoU 档位的 AP（101 点插值）。
-    fn class_ap(&self, cls: u32, thr: f64) -> f64 {
-        struct DetRef {
-            img: usize,
-            score: f64,
-            bbox: Aabb,
-        }
-
+    /// 单类别的评测上下文：按图归组的 gt、跨图合并后按 score 降序的 det，
+    /// 以及每个 det 与同图全部 gt 的 IoU（阈值无关，只算一次）。
+    fn class_context(&self, cls: u32) -> ClassContext {
         let mut gt_boxes: Vec<Vec<Aabb>> = Vec::with_capacity(self.images.len());
-        let mut gt_matched: Vec<Vec<bool>> = Vec::with_capacity(self.images.len());
-        let mut dets: Vec<DetRef> = Vec::new();
+        // (图下标, score, 框)——收集后统一按 score 降序
+        let mut dets: Vec<(usize, f64, Aabb)> = Vec::new();
         let mut n_gt = 0usize;
         for (idx, rec) in self.images.values().enumerate() {
-            let mut g: Vec<Aabb> = Vec::new();
-            for gt in &rec.gts {
-                if gt.class_id == cls {
-                    g.push(gt.bbox);
-                }
-            }
+            let g: Vec<Aabb> = rec
+                .gts
+                .iter()
+                .filter(|gt| gt.class_id == cls)
+                .map(|gt| gt.bbox)
+                .collect();
             n_gt += g.len();
-            gt_matched.push(vec![false; g.len()]);
             gt_boxes.push(g);
             for d in &rec.dets {
                 if d.class_id == cls {
-                    dets.push(DetRef {
-                        img: idx,
-                        score: d.score as f64,
-                        bbox: d.bbox,
-                    });
+                    dets.push((idx, d.score as f64, d.bbox));
                 }
             }
-        }
-        if n_gt == 0 {
-            return 0.0;
         }
 
         // 跨图合并后按 score 降序（稳定排序：同分按图序/插入序，保证确定性）
-        dets.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        dets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // 贪心匹配 → TP/FP 序列 → PR 曲线
-        let mut rec = Vec::with_capacity(dets.len());
-        let mut prec = Vec::with_capacity(dets.len());
-        let (mut tp, mut fp) = (0usize, 0usize);
-        for d in &dets {
-            let mut best = (0.0f64, usize::MAX); // (IoU, 未匹配 gt 下标)
-            for (gi, g) in gt_boxes[d.img].iter().enumerate() {
-                if gt_matched[d.img][gi] {
-                    continue;
-                }
-                let iou = g.iou(&d.bbox) as f64;
-                if iou >= thr && iou > best.0 {
-                    best = (iou, gi);
-                }
-            }
-            if best.1 != usize::MAX {
-                gt_matched[d.img][best.1] = true;
-                tp += 1;
-            } else {
-                fp += 1;
-            }
-            rec.push(tp as f64 / n_gt as f64);
-            prec.push(tp as f64 / (tp + fp) as f64);
+        // det×gt IoU 矩阵（与排序后的 det 对齐；阈值无关，只算一次）
+        let ious: Vec<Vec<f64>> = dets
+            .iter()
+            .map(|(img, _, bbox)| gt_boxes[*img].iter().map(|g| g.iou(bbox) as f64).collect())
+            .collect();
+
+        ClassContext {
+            gt_boxes,
+            dets_img: dets.iter().map(|(img, _, _)| *img).collect(),
+            ious,
+            n_gt,
         }
-        ap_101(&rec, &prec)
     }
+}
+
+/// 单类别评测上下文（IoU 矩阵跨 10 个阈值档位复用）。
+struct ClassContext {
+    /// 每图该类的 gt 框。
+    gt_boxes: Vec<Vec<Aabb>>,
+    /// 按 score 降序排列的预测所属图下标。
+    dets_img: Vec<usize>,
+    /// `ious[i][g]` = 第 i 个预测与其同图第 g 个 gt 的 IoU。
+    ious: Vec<Vec<f64>>,
+    n_gt: usize,
+}
+
+/// 在给定 IoU 阈值下对缓存上下文做贪心匹配 → TP/FP 序列 → 101 点插值 AP。
+fn class_ap_at(ctx: &ClassContext, thr: f64) -> f64 {
+    if ctx.n_gt == 0 {
+        return 0.0;
+    }
+    let mut gt_matched: Vec<Vec<bool>> =
+        ctx.gt_boxes.iter().map(|g| vec![false; g.len()]).collect();
+    let mut rec = Vec::with_capacity(ctx.dets_img.len());
+    let mut prec = Vec::with_capacity(ctx.dets_img.len());
+    let (mut tp, mut fp) = (0usize, 0usize);
+    for (di, &img) in ctx.dets_img.iter().enumerate() {
+        let mut best = (0.0f64, usize::MAX); // (IoU, 未匹配 gt 下标)
+        for (gi, _) in ctx.gt_boxes[img].iter().enumerate() {
+            if gt_matched[img][gi] {
+                continue;
+            }
+            let iou = ctx.ious[di][gi];
+            if iou >= thr && iou > best.0 {
+                best = (iou, gi);
+            }
+        }
+        if best.1 != usize::MAX {
+            gt_matched[img][best.1] = true;
+            tp += 1;
+        } else {
+            fp += 1;
+        }
+        rec.push(tp as f64 / ctx.n_gt as f64);
+        prec.push(tp as f64 / (tp + fp) as f64);
+    }
+    ap_101(&rec, &prec)
 }
 
 /// 101 点插值 AP：对 r ∈ {0.00, 0.01, …, 1.00} 取 recall ≥ r 的最大 precision，

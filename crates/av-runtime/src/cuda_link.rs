@@ -19,7 +19,7 @@ pub fn ensure_torch_cuda_loaded() -> bool {
     extern "system" {
         fn LoadLibraryA(name: *const u8) -> *mut std::ffi::c_void;
     }
-    let ok = unsafe { !LoadLibraryA(b"torch_cuda.dll\0".as_ptr()).is_null() };
+    let ok = unsafe { !LoadLibraryA(c"torch_cuda.dll".as_ptr().cast()).is_null() };
     if !ok {
         tracing::debug!(
             "torch_cuda.dll 加载失败（CPU 版 libtorch 或非 CUDA 环境），按 CUDA 不可用处理"

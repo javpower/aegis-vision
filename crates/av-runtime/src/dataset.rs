@@ -13,8 +13,8 @@ use rayon::prelude::*;
 use tch::{Device, Kind, Tensor};
 
 use av_core::error::{AvError, AvResult};
-use av_core::geometry::{Aabb, Letterbox, letterbox};
-use av_tasks::augment::{AugmentPlan, scaled_dims};
+use av_core::geometry::{letterbox, Aabb, Letterbox};
+use av_tasks::augment::{scaled_dims, AugmentPlan};
 
 /// 单样本：图片张量 + 输入画布空间绝对像素 xyxy 框 + 类别（与框一一对应）。
 pub struct SampleTensor {
@@ -57,7 +57,14 @@ pub fn load_yolo_dir(
     device: Device,
     imagenet_norm: bool,
 ) -> AvResult<Vec<SampleTensor>> {
-    load_yolo_dir_with_mode(root, split, img_size, device, ResizeMode::Letterbox, imagenet_norm)
+    load_yolo_dir_with_mode(
+        root,
+        split,
+        img_size,
+        device,
+        ResizeMode::Letterbox,
+        imagenet_norm,
+    )
 }
 
 /// 同 [`load_yolo_dir`]，可显式选择预处理模式（letterbox / stretch）。
@@ -118,44 +125,24 @@ pub fn load_yolo_dir_with_mode(
             let (mut boxes, mut labels) = (Vec::new(), Vec::new());
             if lbl_path.exists() {
                 let text = std::fs::read_to_string(&lbl_path)?;
-                for line in text.lines() {
-                    let mut it = line.split_whitespace();
-                    let (Some(cls), Some(cx), Some(cy), Some(w), Some(h)) =
-                        (it.next(), it.next(), it.next(), it.next(), it.next())
-                    else {
-                        continue;
-                    };
-                    let (cls, cx, cy, w, h): (f32, f32, f32, f32, f32) = (
-                        cls.parse().map_err(|_| bad_label(&lbl_path))?,
-                        cx.parse().map_err(|_| bad_label(&lbl_path))?,
-                        cy.parse().map_err(|_| bad_label(&lbl_path))?,
-                        w.parse().map_err(|_| bad_label(&lbl_path))?,
-                        h.parse().map_err(|_| bad_label(&lbl_path))?,
-                    );
-                    boxes.push(match lb {
-                        // 归一化 cxcywh → 原图像素 xyxy → letterbox 画布 xyxy
+                let (px_boxes, px_labels) =
+                    parse_yolo_label_text(&text, ow, oh, &lbl_path.display().to_string())?;
+                // 原图像素 xyxy → 画布 xyxy（letterbox / 拉伸两条映射，公式与旧内联版一致）
+                boxes = px_boxes
+                    .iter()
+                    .map(|g| match lb {
                         Some(lb) => {
-                            let (bw, bh) = (w * ow as f32, h * oh as f32);
-                            let (bcx, bcy) = (cx * ow as f32, cy * oh as f32);
-                            let g = Aabb::new(
-                                bcx - bw / 2.0,
-                                bcy - bh / 2.0,
-                                bcx + bw / 2.0,
-                                bcy + bh / 2.0,
-                            );
-                            let m = lb.map_box(g);
+                            let m = lb.map_box(Aabb::new(g[0], g[1], g[2], g[3]));
                             [m.x1, m.y1, m.x2, m.y2]
                         }
-                        // 归一化 cxcywh → 拉伸 resize 后的绝对像素 xyxy
                         None => {
-                            let s = img_size as f32;
-                            let (bw, bh) = (w * s, h * s);
-                            let (bcx, bcy) = (cx * s, cy * s);
-                            [bcx - bw / 2.0, bcy - bh / 2.0, bcx + bw / 2.0, bcy + bh / 2.0]
+                            let (sx, sy) =
+                                (img_size as f32 / ow as f32, img_size as f32 / oh as f32);
+                            [g[0] * sx, g[1] * sy, g[2] * sx, g[3] * sy]
                         }
-                    });
-                    labels.push(cls as u32);
-                }
+                    })
+                    .collect();
+                labels = px_labels;
             }
             let x = rgb_to_input_tensor(&rgb, img_size, lb, device, imagenet_norm)?;
             Ok(SampleTensor { x, boxes, labels })
@@ -184,14 +171,16 @@ fn label_entry_name(img_name: &str) -> Option<String> {
 }
 
 /// 解析 YOLO txt 标注全文（每行 `cls cx cy w h`，归一化）→ (原图像素 xyxy 框, 类别)。
-/// 空行跳过、坏行报错（与 [`load_yolo_dir`] 同款严格解析与换算公式）；供
-/// avpack 容器加载器复用（容器里没有文件路径，只有字节与条目名）。
-fn parse_yolo_label_text(
+/// 空行跳过；坏 token / NaN / Inf / 负类别一律报错（可审计，不静默错位——
+/// 宽松 filter_map 会把坏行整条丢弃甚至错位成脏几何，训练中极难察觉）。目录加载器
+/// 与 avpack 容器加载器共用本实现（容器里没有文件路径，只有字节与条目名）。
+pub(crate) fn parse_yolo_label_text(
     text: &str,
     ow: u32,
     oh: u32,
     lbl_disp: &str,
 ) -> AvResult<(Vec<[f32; 4]>, Vec<u32>)> {
+    let bad = || AvError::data(format!("标注解析失败: {lbl_disp}"));
     let mut boxes = Vec::new();
     let mut labels = Vec::new();
     for line in text.lines() {
@@ -202,21 +191,28 @@ fn parse_yolo_label_text(
             continue;
         };
         let (cls, cx, cy, w, h): (f32, f32, f32, f32, f32) = (
-            cls.parse()
-                .map_err(|_| AvError::data(format!("标注解析失败: {lbl_disp}")))?,
-            cx.parse()
-                .map_err(|_| AvError::data(format!("标注解析失败: {lbl_disp}")))?,
-            cy.parse()
-                .map_err(|_| AvError::data(format!("标注解析失败: {lbl_disp}")))?,
-            w.parse()
-                .map_err(|_| AvError::data(format!("标注解析失败: {lbl_disp}")))?,
-            h.parse()
-                .map_err(|_| AvError::data(format!("标注解析失败: {lbl_disp}")))?,
+            cls.parse().map_err(|_| bad())?,
+            cx.parse().map_err(|_| bad())?,
+            cy.parse().map_err(|_| bad())?,
+            w.parse().map_err(|_| bad())?,
+            h.parse().map_err(|_| bad())?,
         );
+        if !(cls.is_finite() && cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite())
+        {
+            return Err(AvError::data(format!("标注含 NaN/Inf 值: {lbl_disp}")));
+        }
+        if cls < 0.0 {
+            return Err(AvError::data(format!("标注类别为负: {lbl_disp}")));
+        }
         // 归一化 cxcywh → 原图像素 xyxy（letterbox 映射由调用方按需叠加）
         let (bw, bh) = (w * ow as f32, h * oh as f32);
         let (bcx, bcy) = (cx * ow as f32, cy * oh as f32);
-        boxes.push([bcx - bw / 2.0, bcy - bh / 2.0, bcx + bw / 2.0, bcy + bh / 2.0]);
+        boxes.push([
+            bcx - bw / 2.0,
+            bcy - bh / 2.0,
+            bcx + bw / 2.0,
+            bcy + bh / 2.0,
+        ]);
         labels.push(cls as u32);
     }
     Ok((boxes, labels))
@@ -233,10 +229,12 @@ pub fn load_yolo_avpack(
     device: Device,
     imagenet_norm: bool,
 ) -> AvResult<Vec<SampleTensor>> {
-    Ok(load_yolo_avpack_named(pack, split, img_size, device, imagenet_norm)?
-        .into_iter()
-        .map(|(_, s)| s)
-        .collect())
+    Ok(
+        load_yolo_avpack_named(pack, split, img_size, device, imagenet_norm)?
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect(),
+    )
 }
 
 /// 同 [`load_yolo_avpack`]，附带每个样本的容器条目名（`images/<split>/...`，
@@ -264,12 +262,13 @@ pub fn load_yolo_avpack_named(
         )));
     }
 
-    // rayon 并行解码（与 load_yolo_dir 同策略：par_iter 保序 collect）
+    // rayon 并行解码（与 load_yolo_dir 同策略：par_iter 保序 collect）；
+    // 条目经 mmap 零拷贝借用解码（无 per-entry blake3 与字节拷贝）
     let samples: Vec<(String, SampleTensor)> = names
         .par_iter()
         .map(|name| -> AvResult<(String, SampleTensor)> {
-            let bytes = reader.read(name)?;
-            let rgb = image::load_from_memory(&bytes)
+            let bytes = reader.bytes(name)?;
+            let rgb = image::load_from_memory(bytes)
                 .map_err(|e| AvError::data(format!("读图失败（容器条目 {name}）: {e}")))?
                 .to_rgb8();
             let (ow, oh) = (rgb.width(), rgb.height());
@@ -277,11 +276,10 @@ pub fn load_yolo_avpack_named(
 
             let (mut boxes, mut labels) = (Vec::new(), Vec::new());
             if let Some(lbl_name) = label_entry_name(name) {
-                if reader.entries().iter().any(|e| e.name == lbl_name) {
-                    let bytes = reader.read(&lbl_name)?;
-                    let text = String::from_utf8(bytes)
+                if reader.entry(&lbl_name).is_some() {
+                    let text = std::str::from_utf8(reader.bytes(&lbl_name)?)
                         .map_err(|_| AvError::data(format!("标注非 UTF-8: {lbl_name}")))?;
-                    let (px_boxes, cls) = parse_yolo_label_text(&text, ow, oh, &lbl_name)?;
+                    let (px_boxes, cls) = parse_yolo_label_text(text, ow, oh, &lbl_name)?;
                     // 原图像素 xyxy → letterbox 画布 xyxy（load_yolo_dir 同款 map_box 路径）
                     boxes = px_boxes
                         .iter()
@@ -321,18 +319,17 @@ pub fn load_yolo_avpack_raw(pack: &Path, split: &str) -> AvResult<Vec<RawDetectS
 
     let mut out = Vec::new();
     for name in &names {
-        let bytes = reader.read(name)?;
-        let rgb = image::load_from_memory(&bytes)
+        let bytes = reader.bytes(name)?;
+        let rgb = image::load_from_memory(bytes)
             .map_err(|e| AvError::data(format!("读图失败（容器条目 {name}）: {e}")))?
             .to_rgb8();
         let (ow, oh) = (rgb.width(), rgb.height());
         let (mut boxes, mut labels) = (Vec::new(), Vec::new());
         if let Some(lbl_name) = label_entry_name(name) {
-            if reader.entries().iter().any(|e| e.name == lbl_name) {
-                let bytes = reader.read(&lbl_name)?;
-                let text = String::from_utf8(bytes)
+            if reader.entry(&lbl_name).is_some() {
+                let text = std::str::from_utf8(reader.bytes(&lbl_name)?)
                     .map_err(|_| AvError::data(format!("标注非 UTF-8: {lbl_name}")))?;
-                (boxes, labels) = parse_yolo_label_text(&text, ow, oh, &lbl_name)?;
+                (boxes, labels) = parse_yolo_label_text(text, ow, oh, &lbl_name)?;
             }
         }
         out.push(RawDetectSample {
@@ -378,7 +375,8 @@ pub fn decode_image_with_meta(
     mode: ResizeMode,
     imagenet_norm: bool,
 ) -> AvResult<(Tensor, Option<Letterbox>, u32, u32)> {
-    let img = image::open(path).map_err(|e| AvError::data(format!("读图失败 {}: {e}", path.display())))?;
+    let img = image::open(path)
+        .map_err(|e| AvError::data(format!("读图失败 {}: {e}", path.display())))?;
     let rgb = img.to_rgb8();
     let (ow, oh) = (rgb.width(), rgb.height());
     let lb = match mode {
@@ -405,6 +403,37 @@ pub fn decode_rgb_with_meta(
     Ok((x, lb))
 }
 
+thread_local! {
+    /// SIMD 缩放器按线程复用（内部卷积缓冲不反复分配）
+    static FIR_RESIZER: std::cell::RefCell<fast_image_resize::Resizer> =
+        std::cell::RefCell::new(fast_image_resize::Resizer::new());
+}
+
+/// RGB8 缩放（SIMD）：Bilinear 卷积核（与 image crate 的 Triangle 同族滤波）。
+/// 统一替换训练热路径上的 `imageops::resize`——mosaic 的 2:1 降采样从
+/// ~300ms 降到 ~10ms；所有任务的数据准备共用同一实现，raw 与贴片两条编码
+/// 路径的一致性不受影响。
+fn resize_rgb8(rgb: &image::RgbImage, tw: u32, th: u32) -> AvResult<image::RgbImage> {
+    use fast_image_resize as fir;
+    let src = fir::images::ImageRef::new(
+        rgb.width(),
+        rgb.height(),
+        rgb.as_raw(),
+        fir::PixelType::U8x3,
+    )
+    .map_err(|_| AvError::data("RGB8 缓冲长度与宽高不符"))?;
+    let mut dst = fir::images::Image::new(tw, th, fir::PixelType::U8x3);
+    let opts = fir::ResizeOptions::new()
+        .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Bilinear));
+    FIR_RESIZER.with(|r| {
+        r.borrow_mut()
+            .resize(&src, &mut dst, Some(&opts))
+            .map_err(|e| AvError::data(format!("RGB 缩放失败: {e}")))
+    })?;
+    image::RgbImage::from_raw(tw, th, dst.into_vec())
+        .ok_or_else(|| AvError::data("RGB 缩放输出长度异常"))
+}
+
 /// RGB 图 → [3,S,S] 张量。letterbox 模式下等比缩放后贴到 114 灰画布
 /// （对齐参数取 img_size，保证画布恰为 img_size 方形、内容居中）。
 ///
@@ -422,8 +451,14 @@ fn rgb_to_input_tensor(
         Some(lb) => {
             let nw = ((rgb.width() as f32 * lb.scale).round() as u32).clamp(1, img_size);
             let nh = ((rgb.height() as f32 * lb.scale).round() as u32).clamp(1, img_size);
-            let resized =
-                image::imageops::resize(rgb, nw, nh, image::imageops::FilterType::Triangle);
+            // 恒等快路径：内容贴片缓存（[`build_detect_cache_from_dir`]）产出的
+            // 贴片恰为 letterbox 内容尺寸，encode 时 scale=1.0——缩放数学恒等，
+            // 直接拷贝保证与 raw 逐位一致且省一次重采样
+            let resized = if (nw, nh) == (rgb.width(), rgb.height()) {
+                rgb.clone()
+            } else {
+                resize_rgb8(rgb, nw, nh)?
+            };
             let mut c =
                 image::RgbImage::from_pixel(img_size, img_size, image::Rgb([114, 114, 114]));
             // 粘贴偏移取整（与 map_box 的 pad 差 ≤0.5px，框映射仍统一走 map_box）
@@ -435,12 +470,7 @@ fn rgb_to_input_tensor(
             );
             c
         }
-        None => image::imageops::resize(
-            rgb,
-            img_size,
-            img_size,
-            image::imageops::FilterType::Triangle,
-        ),
+        None => resize_rgb8(rgb, img_size, img_size)?,
     };
     canvas_to_input_tensor(canvas, device, imagenet_norm)
 }
@@ -478,8 +508,12 @@ fn canvas_to_input_tensor(
 }
 
 /// 把一批样本堆成训练张量 [B,3,S,S]。
+///
+/// 借用堆叠：`Tensor::stack` 直接读各样本的 `x`（`Borrow<Tensor>`），不再对每
+/// 样本先 `copy()` 出一份中间张量——预解码张量本身在训练期只读，旧实现每 epoch
+/// 等于把整集数据多 memcpy 一遍。
 pub fn stack_samples(samples: &[SampleTensor]) -> AvResult<Tensor> {
-    let xs: Vec<Tensor> = samples.iter().map(|s| s.x.copy()).collect();
+    let xs: Vec<&Tensor> = samples.iter().map(|s| &s.x).collect();
     Ok(Tensor::stack(&xs, 0))
 }
 
@@ -501,11 +535,14 @@ impl Clone for ClassifySample {
     }
 }
 
-/// 把一批分类样本堆成 [B,3,S,S] 张量。
+/// 把一批分类样本堆成 [B,3,S,S] 张量（借用堆叠，见 [`stack_samples`]）。
 pub fn stack_classify(samples: &[ClassifySample]) -> AvResult<Tensor> {
-    let xs: Vec<Tensor> = samples.iter().map(|s| s.x.copy()).collect();
+    let xs: Vec<&Tensor> = samples.iter().map(|s| &s.x).collect();
     Ok(Tensor::stack(&xs, 0))
 }
+
+/// ImageFolder 加载返回：(样本, 平行标签, wnid→类id 映射)。
+pub type ImageFolderData = (Vec<ClassifySample>, Vec<u32>, HashMap<String, u32>);
 
 /// ImageFolder 加载（类 id 由 wnid 目录名排序推导，ImageFolder 惯例）。
 ///
@@ -521,7 +558,7 @@ pub fn load_imagefolder(
     num_classes_from_dir: bool,
     device: Device,
     imagenet_norm: bool,
-) -> AvResult<(Vec<ClassifySample>, Vec<u32>, HashMap<String, u32>)> {
+) -> AvResult<ImageFolderData> {
     let _ = num_classes_from_dir; // 语义见 doc；行为恒为「从目录推导」
     load_imagefolder_with_classes(root, split, img_size, None, device, imagenet_norm)
 }
@@ -536,7 +573,7 @@ pub fn load_imagefolder_with_classes(
     classes: Option<&HashMap<String, u32>>,
     device: Device,
     imagenet_norm: bool,
-) -> AvResult<(Vec<ClassifySample>, Vec<u32>, HashMap<String, u32>)> {
+) -> AvResult<ImageFolderData> {
     let split_dir = root.join(split);
     if !split_dir.is_dir() {
         return Err(AvError::data(format!(
@@ -604,19 +641,15 @@ pub fn load_imagefolder_with_classes(
     let decoded: Vec<(ClassifySample, u32)> = jobs
         .par_iter()
         .map(|(img_path, label)| -> AvResult<(ClassifySample, u32)> {
-            let img = image::open(img_path).map_err(|e| {
-                AvError::data(format!("读图失败 {}: {e}", img_path.display()))
-            })?;
+            let img = image::open(img_path)
+                .map_err(|e| AvError::data(format!("读图失败 {}: {e}", img_path.display())))?;
             // 分类预处理：拉伸 resize 到 img_size 方形（rgb_to_input_tensor 的
             // lb=None 路径），RGB [0,1]（imagenet_norm = true 时 ImageNet 域）
             let x = rgb_to_input_tensor(&img.to_rgb8(), img_size, None, device, imagenet_norm)?;
             Ok((ClassifySample { x }, *label))
         })
         .collect::<Result<Vec<_>, AvError>>()?;
-    let (samples, labels): (Vec<ClassifySample>, Vec<u32>) = decoded
-        .into_iter()
-        .map(|(s, l)| (s, l))
-        .unzip();
+    let (samples, labels): (Vec<ClassifySample>, Vec<u32>) = decoded.into_iter().unzip();
     if samples.is_empty() {
         return Err(AvError::data(format!(
             "ImageFolder split 无图片: {}",
@@ -626,8 +659,31 @@ pub fn load_imagefolder_with_classes(
     Ok((samples, labels, class_map))
 }
 
-fn bad_label(p: &Path) -> AvError {
-    AvError::data(format!("标注解析失败: {}", p.display()))
+/// 单行标注 token → f32（严格：坏 token / NaN / Inf 一律报错，防止错位或脏值
+/// 静默流入训练——宽松 filter_map 会让坏 token 之后的坐标整体前移一位）。
+fn parse_row_f32(tokens: &[&str], lbl_disp: &str) -> AvResult<Vec<f32>> {
+    tokens
+        .iter()
+        .map(|t| {
+            let v: f32 = t
+                .parse()
+                .map_err(|_| AvError::data(format!("标注解析失败: {lbl_disp}")))?;
+            if v.is_finite() {
+                Ok(v)
+            } else {
+                Err(AvError::data(format!("标注含 NaN/Inf 值: {lbl_disp}")))
+            }
+        })
+        .collect()
+}
+
+/// 行首类别值 → u32（负类别在 `as u32` 下会回绕成超大值，显式拒绝）。
+fn label_class(v: f32, lbl_disp: &str) -> AvResult<u32> {
+    if v >= 0.0 {
+        Ok(v as u32)
+    } else {
+        Err(AvError::data(format!("标注类别为负: {lbl_disp}")))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -696,22 +752,24 @@ pub fn load_dota_dir(
             .ok_or_else(|| AvError::data("文件名非法"))?
             .to_string();
         let lbl_path = lbl_dir.join(format!("{stem}.txt"));
-        let img = image::open(&p)
-            .map_err(|e| AvError::data(format!("读图失败 {p:?}: {e}")))?;
+        let img = image::open(&p).map_err(|e| AvError::data(format!("读图失败 {p:?}: {e}")))?;
         let rgb = img.to_rgb8();
         let (ow, oh) = (rgb.width() as f32, rgb.height() as f32);
-        let (x, lb) = decode_rgb_with_meta(&rgb, img_size, device, ResizeMode::Letterbox, imagenet_norm)?;
+        let (x, lb) =
+            decode_rgb_with_meta(&rgb, img_size, device, ResizeMode::Letterbox, imagenet_norm)?;
         let lb = lb.ok_or_else(|| AvError::data("dota 加载要求 letterbox 模式"))?;
 
         let mut boxes = Vec::new();
         let mut labels = Vec::new();
         if lbl_path.exists() {
+            let disp = lbl_path.display().to_string();
             for line in std::fs::read_to_string(&lbl_path)?.lines() {
-                let vals: Vec<f32> =
-                    line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-                if vals.len() < 9 {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                if tokens.len() < 9 {
                     continue;
                 }
+                // 前 9 token 严格解析（第 10 个 = DOTA difficulty 位，忽略）
+                let vals = parse_row_f32(&tokens[..9], &disp)?;
                 // 4 角点：归一化 → 原图像素 → letterbox 映射（等比+平移，角度不变）
                 let mut pts = [[0f32; 2]; 4];
                 for k in 0..4 {
@@ -735,7 +793,7 @@ pub fn load_dota_dir(
                 }
                 let theta = dy.atan2(dx);
                 boxes.push([cx, cy, w, h, AngleDomain::Le90.normalize(theta)]);
-                labels.push(vals[0] as u32);
+                labels.push(label_class(vals[0], &disp)?);
             }
         }
         out.push(ObbSample { x, boxes, labels });
@@ -743,9 +801,9 @@ pub fn load_dota_dir(
     Ok(out)
 }
 
-/// 把一批 OBB 样本堆成训练张量 [B,3,S,S]。
+/// 把一批 OBB 样本堆成训练张量 [B,3,S,S]（借用堆叠，见 [`stack_samples`]）。
 pub fn stack_obb_samples(samples: &[ObbSample]) -> AvResult<Tensor> {
-    let xs: Vec<Tensor> = samples.iter().map(|s| s.x.copy()).collect();
+    let xs: Vec<&Tensor> = samples.iter().map(|s| &s.x).collect();
     Ok(Tensor::stack(&xs, 0))
 }
 
@@ -788,7 +846,10 @@ pub fn rasterize_polygon(points: &[[f32; 2]], w: usize, h: usize) -> Vec<u8> {
         return mask;
     }
     let min_y = points.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
-    let max_y = points.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max);
+    let max_y = points
+        .iter()
+        .map(|p| p[1])
+        .fold(f32::NEG_INFINITY, f32::max);
     for y in 0..h {
         let cy = y as f32 + 0.5;
         if cy < min_y || cy > max_y {
@@ -874,19 +935,27 @@ pub fn load_cocoseg_dir(
         let img = image::open(&p).map_err(|e| AvError::data(format!("读图失败 {p:?}: {e}")))?;
         let rgb = img.to_rgb8();
         let (ow, oh) = (rgb.width() as f32, rgb.height() as f32);
-        let (x, lb) = decode_rgb_with_meta(&rgb, img_size, device, ResizeMode::Letterbox, imagenet_norm)?;
+        let (x, lb) =
+            decode_rgb_with_meta(&rgb, img_size, device, ResizeMode::Letterbox, imagenet_norm)?;
         let lb = lb.ok_or_else(|| AvError::data("coco seg 加载要求 letterbox 模式"))?;
 
         let mut masks = Vec::new();
         let mut labels = Vec::new();
         if lbl_path.exists() {
+            let disp = lbl_path.display().to_string();
             for line in std::fs::read_to_string(&lbl_path)?.lines() {
-                let vals: Vec<f32> =
-                    line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                let tokens: Vec<&str> = line.split_whitespace().collect();
                 // 多边形 = 1 类别 + 2n 坐标，n >= 3 → 至少 7 个值；5 值行为纯检测框，跳过
-                if vals.len() < 7 {
+                if tokens.len() < 7 {
                     continue;
                 }
+                // 坐标必须成对（奇数坐标 = 标注错位，报错而非静默丢尾点）
+                if !(tokens.len() - 1).is_multiple_of(2) {
+                    return Err(AvError::data(format!(
+                        "分割多边形坐标数为奇数（标注错位）: {disp}"
+                    )));
+                }
+                let vals = parse_row_f32(&tokens, &disp)?;
                 let n_pts = (vals.len() - 1) / 2;
                 // 归一化 → 原图像素 → letterbox 画布 → 掩码画布（÷4）
                 let k = mw as f32 / img_size as f32;
@@ -903,7 +972,7 @@ pub fn load_cocoseg_dir(
                     continue; // 退化标注（画布外/面积 0）整条跳过
                 }
                 masks.push(mask);
-                labels.push(vals[0] as u32);
+                labels.push(label_class(vals[0], &disp)?);
             }
         }
         out.push(SegSample { x, masks, labels });
@@ -911,9 +980,9 @@ pub fn load_cocoseg_dir(
     Ok(out)
 }
 
-/// 把一批分割样本堆成训练张量 [B,3,S,S]。
+/// 把一批分割样本堆成训练张量 [B,3,S,S]（借用堆叠，见 [`stack_samples`]）。
 pub fn stack_seg_samples(samples: &[SegSample]) -> AvResult<Tensor> {
-    let xs: Vec<Tensor> = samples.iter().map(|s| s.x.copy()).collect();
+    let xs: Vec<&Tensor> = samples.iter().map(|s| &s.x).collect();
     Ok(Tensor::stack(&xs, 0))
 }
 
@@ -994,20 +1063,28 @@ pub fn load_cocopose_dir(
         let img = image::open(&p).map_err(|e| AvError::data(format!("读图失败 {p:?}: {e}")))?;
         let rgb = img.to_rgb8();
         let (ow, oh) = (rgb.width() as f32, rgb.height() as f32);
-        let (x, lb) = decode_rgb_with_meta(&rgb, img_size, device, ResizeMode::Letterbox, imagenet_norm)?;
+        let (x, lb) =
+            decode_rgb_with_meta(&rgb, img_size, device, ResizeMode::Letterbox, imagenet_norm)?;
         let lb = lb.ok_or_else(|| AvError::data("cocopose 加载要求 letterbox 模式"))?;
 
         let mut boxes = Vec::new();
         let mut kpts = Vec::new();
         let mut labels = Vec::new();
         if lbl_path.exists() {
+            let disp = lbl_path.display().to_string();
             for line in std::fs::read_to_string(&lbl_path)?.lines() {
-                let vals: Vec<f32> =
-                    line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-                // 行 = 1 类别 + 4 框 + 3K 关键点；K >= 1 → 至少 8 个值
-                if vals.len() < 8 || (vals.len() - 5) % 3 != 0 {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                // 行 = 1 类别 + 4 框 + 3K 关键点；K >= 1 → 至少 8 个值；
+                // 3|坐标数不成行 = 标注错位，报错而非静默丢实例
+                if tokens.len() < 8 {
                     continue;
                 }
+                if !(tokens.len() - 5).is_multiple_of(3) {
+                    return Err(AvError::data(format!(
+                        "姿态行关键点字段非 3 的倍数（标注错位）: {disp}"
+                    )));
+                }
+                let vals = parse_row_f32(&tokens, &disp)?;
                 let n_k = (vals.len() - 5) / 3;
                 let kp: Vec<[f32; 3]> = (0..n_k)
                     .map(|j| {
@@ -1026,7 +1103,7 @@ pub fn load_cocopose_dir(
                     (vals[4] * oh * lb.scale).max(1e-3),
                 ]);
                 kpts.push(kp);
-                labels.push(vals[0] as u32);
+                labels.push(label_class(vals[0], &disp)?);
             }
         }
         out.push(KeypointSample {
@@ -1039,9 +1116,9 @@ pub fn load_cocopose_dir(
     Ok(out)
 }
 
-/// 把一批关键点样本堆成训练张量 [B,3,S,S]。
+/// 把一批关键点样本堆成训练张量 [B,3,S,S]（借用堆叠，见 [`stack_samples`]）。
 pub fn stack_kp_samples(samples: &[KeypointSample]) -> AvResult<Tensor> {
-    let xs: Vec<Tensor> = samples.iter().map(|s| s.x.copy()).collect();
+    let xs: Vec<&Tensor> = samples.iter().map(|s| &s.x).collect();
     Ok(Tensor::stack(&xs, 0))
 }
 
@@ -1147,26 +1224,12 @@ pub fn load_yolo_dir_raw(root: &Path, split: &str) -> AvResult<Vec<RawDetectSamp
         let (mut boxes, mut labels) = (Vec::new(), Vec::new());
         if lbl_path.exists() {
             let text = std::fs::read_to_string(&lbl_path)?;
-            for line in text.lines() {
-                let mut it = line.split_whitespace();
-                let (Some(cls), Some(cx), Some(cy), Some(w), Some(h)) =
-                    (it.next(), it.next(), it.next(), it.next(), it.next())
-                else {
-                    continue;
-                };
-                let (cls, cx, cy, w, h): (f32, f32, f32, f32, f32) = (
-                    cls.parse().map_err(|_| bad_label(&lbl_path))?,
-                    cx.parse().map_err(|_| bad_label(&lbl_path))?,
-                    cy.parse().map_err(|_| bad_label(&lbl_path))?,
-                    w.parse().map_err(|_| bad_label(&lbl_path))?,
-                    h.parse().map_err(|_| bad_label(&lbl_path))?,
-                );
-                // 归一化 cxcywh → 原图像素 xyxy（letterbox 延迟到 encode）
-                let (bw, bh) = (w * ow as f32, h * oh as f32);
-                let (bcx, bcy) = (cx * ow as f32, cy * oh as f32);
-                boxes.push([bcx - bw / 2.0, bcy - bh / 2.0, bcx + bw / 2.0, bcy + bh / 2.0]);
-                labels.push(cls as u32);
-            }
+            // 归一化 cxcywh → 原图像素 xyxy（letterbox 延迟到 encode，与
+            // [`load_yolo_dir`] 共用同一严格解析实现）
+            let (px_boxes, px_labels) =
+                parse_yolo_label_text(&text, ow, oh, &lbl_path.display().to_string())?;
+            boxes = px_boxes;
+            labels = px_labels;
         }
         out.push(RawDetectSample {
             w: ow,
@@ -1177,6 +1240,103 @@ pub fn load_yolo_dir_raw(root: &Path, split: &str) -> AvResult<Vec<RawDetectSamp
         });
     }
     Ok(out)
+}
+
+/// 检测数据管线 v2：内容贴片缓存（移植自 seg 缓存方案）。
+///
+/// raw 全分辨率图**一次性**等比缩到 img_size 内容贴片（无补边，保留原始宽高比，
+/// 尺寸公式与 [`crate::av_core::geometry::letterbox`] 的内容尺寸完全一致），
+/// 框同乘 scale。训练期 mosaic/mixup/flip/hsv/scale 全部在贴片上进行——60MP
+/// 原图的重采样与解码只发生一次，逐 epoch 零大图编码（本轮 glass-logo 实测
+/// GPU 利用率 <5% 的瓶颈即此）。两个来源：
+/// - [`build_detect_cache_from_dir`]：流式（rayon 逐文件解码→缩放→丢弃 raw），
+///   全程不持有第二张全分辨率图，可直接吃 5472×3648 原始数据集，无需预降采样；
+/// - [`build_detect_tile_cache`]：已载入内存的 raw 批就地转换（avpack 路径）。
+///
+/// 编码兼容性：none-plan 与 raw 路径**逐位一致**（同一 Triangle 重采样 +
+/// [`rgb_to_input_tensor`] 的同尺寸恒等快路径 + 框同乘同值）；mosaic/mixup
+/// 因重采样链不同像素有差异（训练增强语义不变，验收评测走 val 预解码集不受影响）。
+fn detect_content_tile(raw: &RawDetectSample, img_size: u32) -> AvResult<RawDetectSample> {
+    let s = (img_size as f32 / raw.w as f32).min(img_size as f32 / raw.h as f32);
+    // round/max 公式与 letterbox() 的 new_w/new_h 逐字一致 ⇒ none-plan 编码时
+    // lb'.scale 恰为 1.0，走恒等快路径
+    let tw = ((raw.w as f32 * s).round() as u32).max(1);
+    let th = ((raw.h as f32 * s).round() as u32).max(1);
+    let img = image::RgbImage::from_raw(raw.w, raw.h, raw.rgb.clone())
+        .ok_or_else(|| AvError::data("RGB8 缓冲长度与宽高不符"))?;
+    let rgb = resize_rgb8(&img, tw, th)?.into_raw();
+    let boxes = raw
+        .boxes
+        .iter()
+        .map(|b| [b[0] * s, b[1] * s, b[2] * s, b[3] * s])
+        .collect();
+    Ok(RawDetectSample {
+        w: tw,
+        h: th,
+        rgb,
+        boxes,
+        labels: raw.labels.clone(),
+    })
+}
+
+/// 目录源流式贴片缓存：逐文件 rayon 解码 → 缩放 → 立即丢弃 raw，内存峰值 =
+/// 贴片全集 + 并发度 × 单张原图（原始 60MP 数据集可直接训练，无需预降采样）。
+/// 条目序 = [`load_yolo_dir_raw`] 同一 `list_image_files` 序（保序 collect），
+/// shuffle RNG 消耗序不变。
+pub fn build_detect_cache_from_dir(
+    root: &Path,
+    split: &str,
+    img_size: u32,
+) -> AvResult<Vec<RawDetectSample>> {
+    let img_dir = root.join("images").join(split);
+    let lbl_dir = root.join("labels").join(split);
+    let tiles: Vec<RawDetectSample> = list_image_files(&img_dir)?
+        .into_par_iter()
+        .map(|p| -> AvResult<RawDetectSample> {
+            let stem = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| AvError::data("文件名非法"))?
+                .to_string();
+            let lbl_path = lbl_dir.join(format!("{stem}.txt"));
+            let (ow, oh, rgb) = decode_raw_rgb(&p)?;
+            let (boxes, labels) = if lbl_path.exists() {
+                let text = std::fs::read_to_string(&lbl_path)?;
+                let (px_boxes, px_labels) =
+                    parse_yolo_label_text(&text, ow, oh, &lbl_path.display().to_string())?;
+                (px_boxes, px_labels)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            detect_content_tile(
+                &RawDetectSample {
+                    w: ow,
+                    h: oh,
+                    rgb,
+                    boxes,
+                    labels,
+                },
+                img_size,
+            )
+        })
+        .collect::<AvResult<Vec<_>>>()?;
+    if tiles.is_empty() {
+        return Err(AvError::data(format!(
+            "贴片缓存为空: {}",
+            img_dir.display()
+        )));
+    }
+    Ok(tiles)
+}
+
+/// 内存 raw 批就地转贴片（avpack 路径：容器 mmap 解码后转换，消耗传入的 raw）。
+pub fn build_detect_tile_cache(
+    raws: Vec<RawDetectSample>,
+    img_size: u32,
+) -> AvResult<Vec<RawDetectSample>> {
+    raws.into_par_iter()
+        .map(|raw| detect_content_tile(&raw, img_size))
+        .collect()
 }
 
 /// COCO 姿态目录 → 关键点原始样本（解析规则与 [`load_cocopose_dir`] 一致：
@@ -1195,15 +1355,27 @@ pub fn load_cocopose_dir_raw(root: &Path, split: &str) -> AvResult<Vec<RawKeypoi
         let (ow, oh, rgb) = decode_raw_rgb(&p)?;
         let (mut boxes, mut kpts, mut labels) = (Vec::new(), Vec::new(), Vec::new());
         if lbl_path.exists() {
+            let disp = lbl_path.display().to_string();
             for line in std::fs::read_to_string(&lbl_path)?.lines() {
-                let vals: Vec<f32> =
-                    line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-                if vals.len() < 8 || (vals.len() - 5) % 3 != 0 {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                if tokens.len() < 8 {
                     continue;
                 }
+                if !(tokens.len() - 5).is_multiple_of(3) {
+                    return Err(AvError::data(format!(
+                        "姿态行关键点字段非 3 的倍数（标注错位）: {disp}"
+                    )));
+                }
+                let vals = parse_row_f32(&tokens, &disp)?;
                 let n_k = (vals.len() - 5) / 3;
                 let kp: Vec<[f32; 3]> = (0..n_k)
-                    .map(|j| [vals[5 + 3 * j] * ow as f32, vals[6 + 3 * j] * oh as f32, vals[7 + 3 * j]])
+                    .map(|j| {
+                        [
+                            vals[5 + 3 * j] * ow as f32,
+                            vals[6 + 3 * j] * oh as f32,
+                            vals[7 + 3 * j],
+                        ]
+                    })
                     .collect();
                 // 框存原图像素（1e-3 下限在 encode 映射后施加，与既有加载器同序）
                 boxes.push([
@@ -1213,7 +1385,7 @@ pub fn load_cocopose_dir_raw(root: &Path, split: &str) -> AvResult<Vec<RawKeypoi
                     vals[4] * oh as f32,
                 ]);
                 kpts.push(kp);
-                labels.push(vals[0] as u32);
+                labels.push(label_class(vals[0], &disp)?);
             }
         }
         out.push(RawKeypointSample {
@@ -1246,20 +1418,26 @@ pub fn load_cocoseg_dir_raw(root: &Path, split: &str) -> AvResult<Vec<RawSegSamp
             let (ow, oh, rgb) = decode_raw_rgb(p)?;
             let (mut polys, mut labels) = (Vec::new(), Vec::new());
             if lbl_path.exists() {
+                let disp = lbl_path.display().to_string();
                 for line in std::fs::read_to_string(&lbl_path)?.lines() {
-                    let vals: Vec<f32> =
-                        line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                    let tokens: Vec<&str> = line.split_whitespace().collect();
                     // 与 load_cocoseg_dir 同规则：≥7 值（1 类 + 3 点）才算多边形行
-                    if vals.len() < 7 {
+                    if tokens.len() < 7 {
                         continue;
                     }
+                    if !(tokens.len() - 1).is_multiple_of(2) {
+                        return Err(AvError::data(format!(
+                            "分割多边形坐标数为奇数（标注错位）: {disp}"
+                        )));
+                    }
+                    let vals = parse_row_f32(&tokens, &disp)?;
                     let n_pts = (vals.len() - 1) / 2;
                     polys.push(
                         (0..n_pts)
                             .map(|i| [vals[1 + 2 * i] * ow as f32, vals[2 + 2 * i] * oh as f32])
                             .collect(),
                     );
-                    labels.push(vals[0] as u32);
+                    labels.push(label_class(vals[0], &disp)?);
                 }
             }
             Ok(RawSegSample {
@@ -1289,18 +1467,20 @@ pub fn load_dota_dir_raw(root: &Path, split: &str) -> AvResult<Vec<RawObbSample>
         let (ow, oh, rgb) = decode_raw_rgb(&p)?;
         let (mut corners, mut labels) = (Vec::new(), Vec::new());
         if lbl_path.exists() {
+            let disp = lbl_path.display().to_string();
             for line in std::fs::read_to_string(&lbl_path)?.lines() {
-                let vals: Vec<f32> =
-                    line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-                if vals.len() < 9 {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                if tokens.len() < 9 {
                     continue;
                 }
+                // 前 9 token 严格解析（第 10 个 = DOTA difficulty 位，忽略）
+                let vals = parse_row_f32(&tokens[..9], &disp)?;
                 let mut pts = [[0f32; 2]; 4];
                 for k in 0..4 {
                     pts[k] = [vals[1 + 2 * k] * ow as f32, vals[2 + 2 * k] * oh as f32];
                 }
                 corners.push(pts);
-                labels.push(vals[0] as u32);
+                labels.push(label_class(vals[0], &disp)?);
             }
         }
         out.push(RawObbSample {
@@ -1316,12 +1496,7 @@ pub fn load_dota_dir_raw(root: &Path, split: &str) -> AvResult<Vec<RawObbSample>
 
 /// 原始 RGB8 缓冲按 plan 做像素增强（flip → HSV 通道增益 → 缩放 resize），
 /// 返回增强后图像与其尺寸（坐标侧由各 encode_* 用同一 plan 走同一步骤）。
-fn augment_rgb_image(
-    w: u32,
-    h: u32,
-    rgb: &[u8],
-    plan: &AugmentPlan,
-) -> AvResult<image::RgbImage> {
+fn augment_rgb_image(w: u32, h: u32, rgb: &[u8], plan: &AugmentPlan) -> AvResult<image::RgbImage> {
     let mut buf = rgb.to_vec();
     if plan.flip {
         av_tasks::augment::hflip_rgb(w as usize, h as usize, &mut buf);
@@ -1332,7 +1507,7 @@ fn augment_rgb_image(
     if plan.scale != 1.0 {
         let (aw, ah) = scaled_dims(w, h, plan.scale);
         if (aw, ah) != (w, h) {
-            img = image::imageops::resize(&img, aw, ah, image::imageops::FilterType::Triangle);
+            img = resize_rgb8(&img, aw, ah)?;
         }
     }
     Ok(img)
@@ -1356,10 +1531,7 @@ pub fn mosaic4_raw(items: [&RawDetectSample; 4]) -> AvResult<RawDetectSample> {
         if (it.w, it.h) != (qw, qh) {
             let img = image::RgbImage::from_raw(it.w, it.h, it.rgb.clone())
                 .ok_or_else(|| AvError::data("RGB8 缓冲长度与宽高不符"))?;
-            *slot = Some(
-                image::imageops::resize(&img, qw, qh, image::imageops::FilterType::Triangle)
-                    .into_raw(),
-            );
+            *slot = Some(resize_rgb8(&img, qw, qh)?.into_raw());
         }
     }
     let mitems: [av_tasks::augment::MosaicItem<'_>; 4] = std::array::from_fn(|k| {
@@ -1377,7 +1549,13 @@ pub fn mosaic4_raw(items: [&RawDetectSample; 4]) -> AvResult<RawDetectSample> {
     });
     let (rgb, boxes, labels) = av_tasks::augment::mosaic_compose(qw, qh, &mitems);
     let (w, h) = av_tasks::augment::mosaic_canvas_dims(qw, qh);
-    Ok(RawDetectSample { w, h, rgb, boxes, labels })
+    Ok(RawDetectSample {
+        w,
+        h,
+        rgb,
+        boxes,
+        labels,
+    })
 }
 
 /// mixup 双样本融合（检测惯例）：b stretch 到 a 的尺寸后像素加权
@@ -1389,7 +1567,7 @@ pub fn mixup_raw(a: &RawDetectSample, b: &RawDetectSample, lam: f32) -> AvResult
     } else {
         let img = image::RgbImage::from_raw(b.w, b.h, b.rgb.clone())
             .ok_or_else(|| AvError::data("RGB8 缓冲长度与宽高不符"))?;
-        image::imageops::resize(&img, a.w, a.h, image::imageops::FilterType::Triangle).into_raw()
+        resize_rgb8(&img, a.w, a.h)?.into_raw()
     };
     Ok(RawDetectSample {
         w: a.w,
@@ -1570,11 +1748,7 @@ pub fn encode_seg_sample(
     }
     let img = augment_rgb_image(raw.w, raw.h, &raw.rgb, plan)?;
     let x = rgb_to_input_tensor(&img, img_size, Some(lb), device, imagenet_norm)?;
-    Ok(SegSample {
-        x,
-        masks,
-        labels,
-    })
+    Ok(SegSample { x, masks, labels })
 }
 
 // ---------------------------------------------------------------------------
@@ -1616,7 +1790,7 @@ pub fn build_seg_cache_sample(raw: &RawSegSample, img_size: u32) -> AvResult<Cac
     let lb = letterbox(raw.w, raw.h, img_size, 1); // align=1：贴片本身不补边
     let nw = ((raw.w as f32 * lb.scale).round() as u32).clamp(1, img_size);
     let nh = ((raw.h as f32 * lb.scale).round() as u32).clamp(1, img_size);
-    let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+    let resized = resize_rgb8(&img, nw, nh)?;
     Ok(CachedSegSample {
         w: raw.w,
         h: raw.h,
@@ -1666,7 +1840,7 @@ pub fn encode_seg_sample_cached(
     let content = if plan.scale != 1.0 {
         let img = image::RgbImage::from_raw(c.cw, c.ch, buf)
             .ok_or_else(|| AvError::data("缓存贴片长度与宽高不符"))?;
-        image::imageops::resize(&img, nw_t, nh_t, image::imageops::FilterType::Triangle)
+        resize_rgb8(&img, nw_t, nh_t)?
     } else {
         image::RgbImage::from_raw(c.cw, c.ch, buf)
             .ok_or_else(|| AvError::data("缓存贴片长度与宽高不符"))?
@@ -1679,21 +1853,13 @@ pub fn encode_seg_sample_cached(
         lb.pad_top.round() as i64,
     );
     let x = canvas_to_input_tensor(canvas, device, imagenet_norm)?;
-    Ok(SegSample {
-        x,
-        masks,
-        labels,
-    })
+    Ok(SegSample { x, masks, labels })
 }
 
 /// plan 缩放下内容贴片的目标尺寸与 letterbox 参数（CPU/GPU 两条编码路径
 /// 共用：nw/nh 与全分辨率路径「raw 缩放 → letterbox 再缩放」的目标一致，
 /// 贴片粘贴偏移同样取 round(pad)）。
-fn scaled_content_target(
-    c: &CachedSegSample,
-    img_size: u32,
-    scale: f32,
-) -> (u32, u32, Letterbox) {
+fn scaled_content_target(c: &CachedSegSample, img_size: u32, scale: f32) -> (u32, u32, Letterbox) {
     let (aw, ah) = scaled_dims(c.w, c.h, scale);
     let lb = letterbox(aw, ah, img_size, img_size);
     let nw = ((aw as f32 * lb.scale).round() as u32).clamp(1, img_size);
@@ -1749,7 +1915,9 @@ pub fn encode_seg_batch_cached(
 ) -> AvResult<Vec<SegSample>> {
     idx.par_iter()
         .zip(plans)
-        .map(|(&i, plan)| encode_seg_sample_cached(&cache[i], img_size, device, plan, imagenet_norm))
+        .map(|(&i, plan)| {
+            encode_seg_sample_cached(&cache[i], img_size, device, plan, imagenet_norm)
+        })
         .collect()
 }
 
@@ -1797,11 +1965,10 @@ pub fn encode_seg_sample_gpu(
     let lb1 = letterbox(c.w, c.h, img_size, img_size);
     let (pl1, pt1) = (lb1.pad_left.round() as i64, lb1.pad_top.round() as i64);
     let mut x = stack.select(0, i as i64).copy(); // [3,S,S] 视图共享存储，copy 脱离
-    // flip：只翻内容区（padding 灰底对称不可见），与「全图翻转再 letterbox」等价
+                                                  // flip：只翻内容区（padding 灰底对称不可见），与「全图翻转再 letterbox」等价
     if plan.flip {
         let region = x.narrow(2, pl1, c.cw as i64).copy();
-        x.narrow(2, pl1, c.cw as i64)
-            .copy_(&region.flip([2i64]));
+        x.narrow(2, pl1, c.cw as i64).copy_(&region.flip([2i64]));
     }
     // 增益：内容区逐通道乘 + clamp（画布 padding 保持 114 灰）
     if plan.rgb_gains != [1.0; 3] {
@@ -1845,11 +2012,7 @@ pub fn encode_seg_sample_gpu(
             .reshape([3i64, 1, 1]);
         x = (x - mean) / std;
     }
-    Ok(SegSample {
-        x,
-        masks,
-        labels,
-    })
+    Ok(SegSample { x, masks, labels })
 }
 
 /// OBB 原始样本 → 画布样本（4 角点经增强 + letterbox 等比映射后推导
@@ -1899,11 +2062,7 @@ pub fn encode_obb_sample(
     }
     let img = augment_rgb_image(raw.w, raw.h, &raw.rgb, plan)?;
     let x = rgb_to_input_tensor(&img, img_size, Some(lb), device, imagenet_norm)?;
-    Ok(ObbSample {
-        x,
-        boxes,
-        labels,
-    })
+    Ok(ObbSample { x, boxes, labels })
 }
 
 #[cfg(test)]
@@ -1953,7 +2112,8 @@ mod tests {
             .unwrap();
 
         // 64x32 → scale=0.5，内容 32x16，pad_top=8：画布第 0 行是灰、第 16 行是红
-        let x = decode_image_tensor_with_mode(&p, 32, Device::Cpu, ResizeMode::Letterbox, false).unwrap();
+        let x = decode_image_tensor_with_mode(&p, 32, Device::Cpu, ResizeMode::Letterbox, false)
+            .unwrap();
         let px = |c: usize, y: usize, xx: usize| x.double_value(&[c as i64, y as i64, xx as i64]);
         // 补边（画布 (0,0)）：114/255 灰，三通道一致
         for c in 0..3 {
@@ -1981,7 +2141,8 @@ mod tests {
             .save(&p)
             .unwrap();
 
-        let x = decode_image_tensor_with_mode(&p, 32, Device::Cpu, ResizeMode::Stretch, false).unwrap();
+        let x =
+            decode_image_tensor_with_mode(&p, 32, Device::Cpu, ResizeMode::Stretch, false).unwrap();
         let px = |c: usize, y: usize, xx: usize| x.double_value(&[c as i64, y as i64, xx as i64]);
         // 32x32 全是红，无灰补边
         assert!((px(0, 0, 0) - 1.0).abs() < 1e-6);
@@ -2002,12 +2163,14 @@ mod tests {
             .unwrap();
 
         // 默认 false：[0,1] 历史语义（零变化）
-        let x01 = decode_image_tensor_with_mode(&p, 8, Device::Cpu, ResizeMode::Stretch, false).unwrap();
+        let x01 =
+            decode_image_tensor_with_mode(&p, 8, Device::Cpu, ResizeMode::Stretch, false).unwrap();
         assert!((x01.double_value(&[0, 0, 0]) - 1.0).abs() < 1e-6);
         assert!(x01.double_value(&[1, 0, 0]).abs() < 1e-6);
 
         // true：ImageNet mean/std 域：(1−0.485)/0.229, (0−0.456)/0.224, (0−0.406)/0.225
-        let xn = decode_image_tensor_with_mode(&p, 8, Device::Cpu, ResizeMode::Stretch, true).unwrap();
+        let xn =
+            decode_image_tensor_with_mode(&p, 8, Device::Cpu, ResizeMode::Stretch, true).unwrap();
         let expect = [
             (1.0f32 - 0.485) / 0.229,
             (0.0f32 - 0.456) / 0.224,
@@ -2092,8 +2255,16 @@ mod tests {
         assert_eq!(a.labels, vec![0]);
         assert!((a.boxes[0][0] - 0.0).abs() <= 1.0, "a x1={}", a.boxes[0][0]);
         assert!((a.boxes[0][1] - 8.0).abs() <= 1.0, "a y1={}", a.boxes[0][1]);
-        assert!((a.boxes[0][2] - 32.0).abs() <= 1.0, "a x2={}", a.boxes[0][2]);
-        assert!((a.boxes[0][3] - 24.0).abs() <= 1.0, "a y2={}", a.boxes[0][3]);
+        assert!(
+            (a.boxes[0][2] - 32.0).abs() <= 1.0,
+            "a x2={}",
+            a.boxes[0][2]
+        );
+        assert!(
+            (a.boxes[0][3] - 24.0).abs() <= 1.0,
+            "a y2={}",
+            a.boxes[0][3]
+        );
 
         // b：32x32 等比无 pad，cxcywh (0.25,0.5,0.5,0.5) → xyxy (0,8)-(16,24)
         let b = &named[1].1;
@@ -2129,7 +2300,7 @@ mod tests {
         let train = dir.join("train");
         std::fs::create_dir_all(train.join("n02102040")).unwrap(); // 排序在后 → 类 1
         std::fs::create_dir_all(train.join("n01440764")).unwrap(); // 排序在前 → 类 0
-        // 16x8 全红图（非方形，验证拉伸 resize 到方形；用 PNG 避免 JPEG 有损量化）
+                                                                   // 16x8 全红图（非方形，验证拉伸 resize 到方形；用 PNG 避免 JPEG 有损量化）
         image::RgbImage::from_pixel(16, 8, image::Rgb([255, 0, 0]))
             .save(train.join("n01440764").join("a.png"))
             .unwrap();
@@ -2138,9 +2309,8 @@ mod tests {
             .save(train.join("n02102040").join("b.png"))
             .unwrap();
 
-        let (samples, labels, map) =
-            load_imagefolder(&dir, "train", 32, true, Device::Cpu, false)
-                .expect("ImageFolder 应可加载");
+        let (samples, labels, map) = load_imagefolder(&dir, "train", 32, true, Device::Cpu, false)
+            .expect("ImageFolder 应可加载");
         assert_eq!(samples.len(), 2);
         assert_eq!(labels, vec![0, 1]);
         assert_eq!(map.len(), 2);
@@ -2228,7 +2398,7 @@ mod tests {
         // 边界外沿不覆盖（像素中心在边界上/外）
         assert_eq!(m[2 * 16 + 10], 0, "(10,2) 中心 x=10.5 在界外");
         assert_eq!(m[8 * 16 + 2], 0, "(2,8) 中心 y=8.5 在界外");
-        assert_eq!(m[1 * 16 + 2], 0);
+        assert_eq!(m[16 + 2], 0);
         assert_eq!(m[2 * 16 + 1], 0);
     }
 
@@ -2243,7 +2413,7 @@ mod tests {
         assert_eq!(cnt, 6);
         assert_eq!(m[0], 1);
         assert_eq!(m[2], 1); // (2,0)
-        assert_eq!(m[1 * 8 + 1], 1); // (1,1)
+        assert_eq!(m[8 + 1], 1); // (1,1)
         assert_eq!(m[2 * 8], 1); // (0,2)
         assert_eq!(m[3 * 8], 0); // (0,3) 中心 3.5+0.5=4 边界上 → 不覆盖
     }
@@ -2256,7 +2426,12 @@ mod tests {
             .iter()
             .all(|&v| v == 0));
         // 完全在画布外
-        let out = [[100.0, 100.0], [120.0, 100.0], [120.0, 120.0], [100.0, 120.0]];
+        let out = [
+            [100.0, 100.0],
+            [120.0, 100.0],
+            [120.0, 120.0],
+            [100.0, 120.0],
+        ];
         assert!(rasterize_polygon(&out, 4, 4).iter().all(|&v| v == 0));
         // 部分越界：覆盖部分被裁进画布
         let half = [[-4.0, -4.0], [4.0, -4.0], [4.0, 4.0], [-4.0, 4.0]];
@@ -2302,7 +2477,7 @@ mod tests {
         assert_eq!(m0[3 * 8 + 3], 1, "中心点应覆盖");
         assert_eq!(m0[0], 0, "画布角落（灰边）不应覆盖");
         // 第二条（多点多边形）也应产出非空掩码
-        assert!(s.masks[1].iter().any(|&v| v == 1));
+        assert!(s.masks[1].contains(&1));
 
         // stack_seg_samples 形状 [B,3,S,S]
         let x = stack_seg_samples(&samples).unwrap();
@@ -2359,8 +2534,16 @@ mod tests {
         assert!((a.boxes[0][3] - 8.0).abs() < 1e-4, "h={}", a.boxes[0][3]);
         // 关键点映射 + 可见性保留
         assert_eq!(a.kpts[0].len(), 2);
-        assert!((a.kpts[0][0][0] - 8.0).abs() < 1e-4, "kx={}", a.kpts[0][0][0]);
-        assert!((a.kpts[0][0][1] - 12.0).abs() < 1e-4, "ky={}", a.kpts[0][0][1]);
+        assert!(
+            (a.kpts[0][0][0] - 8.0).abs() < 1e-4,
+            "kx={}",
+            a.kpts[0][0][0]
+        );
+        assert!(
+            (a.kpts[0][0][1] - 12.0).abs() < 1e-4,
+            "ky={}",
+            a.kpts[0][0][1]
+        );
         assert_eq!(a.kpts[0][0][2], 2.0);
         assert!((a.kpts[0][1][0] - 16.0).abs() < 1e-4);
         assert!((a.kpts[0][1][1] - 16.0).abs() < 1e-4);
@@ -2395,9 +2578,9 @@ mod tests {
         std::fs::write(
             lbl_dir.join("a.txt"),
             concat!(
-                "0 0.5 0.5 0.5 0.5 0.1 0.1\n",      // 尾部 2 值，凑不出 3K → 跳过
-                "\n",                                 // 空行 → 跳过
-                "0 0.5 0.5 0.5 0.5 0.2 0.2 2.0\n",   // 合法 K=1 → 保留
+                "0 0.5 0.5 0.5 0.5 0.1 0.1\n",     // 尾部 2 值，凑不出 3K → 跳过
+                "\n",                              // 空行 → 跳过
+                "0 0.5 0.5 0.5 0.5 0.2 0.2 2.0\n", // 合法 K=1 → 保留
             ),
         )
         .unwrap();
@@ -2440,9 +2623,13 @@ mod tests {
         let plain = load_cocopose_dir(&dir, "train", 32, Device::Cpu, false).unwrap();
         let raw = load_cocopose_dir_raw(&dir, "train").unwrap();
         assert_eq!(raw.len(), 1);
-        let enc = encode_keypoint_sample(&raw[0], 32, Device::Cpu, &AugmentPlan::none(), false)
-            .unwrap();
-        assert_eq!(tensor_max_diff(&plain[0].x, &enc.x), 0.0, "none() 张量应逐位一致");
+        let enc =
+            encode_keypoint_sample(&raw[0], 32, Device::Cpu, &AugmentPlan::none(), false).unwrap();
+        assert_eq!(
+            tensor_max_diff(&plain[0].x, &enc.x),
+            0.0,
+            "none() 张量应逐位一致"
+        );
         assert_eq!(plain[0].boxes, enc.boxes, "none() 框应逐位一致");
         assert_eq!(plain[0].kpts, enc.kpts, "none() 关键点应逐位一致");
         assert_eq!(plain[0].labels, enc.labels);
@@ -2463,7 +2650,15 @@ mod tests {
         let mut img = image::RgbImage::new(32, 32);
         for y in 0..32 {
             for x in 0..32 {
-                img.put_pixel(x, y, if x < 16 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) });
+                img.put_pixel(
+                    x,
+                    y,
+                    if x < 16 {
+                        image::Rgb([255, 0, 0])
+                    } else {
+                        image::Rgb([0, 0, 255])
+                    },
+                );
             }
         }
         img.save(img_dir.join("a.png")).unwrap();
@@ -2490,7 +2685,10 @@ mod tests {
             t.double_value(&[c as i64, y as i64, x as i64])
         };
         assert!(px(&e.x, 0, 0, 0) < 1e-6, "翻转后左上应为蓝的 R=0");
-        assert!((px(&e.x, 2, 0, 0) - 1.0).abs() < 1e-6, "翻转后左上应为蓝的 B=1");
+        assert!(
+            (px(&e.x, 2, 0, 0) - 1.0).abs() < 1e-6,
+            "翻转后左上应为蓝的 B=1"
+        );
         assert!((px(&e.x, 0, 0, 31) - 1.0).abs() < 1e-6, "翻转后右上应为红");
 
         // 框中心镜像：cx' = 32 − cx（w/h/pad 无 pad 不变）
@@ -2498,8 +2696,8 @@ mod tests {
         assert!((e.boxes[0][2] - p.boxes[0][2]).abs() < 1e-4);
 
         // 关键点：new[i] = mirror(old[SWAP[i]])；y 与 v 随点换位
-        for i in 0..17 {
-            let src = &p.kpts[0][COCO17_FLIP_SWAP[i]];
+        for (i, &sw) in COCO17_FLIP_SWAP.iter().enumerate() {
+            let src = &p.kpts[0][sw];
             assert!(
                 (e.kpts[0][i][0] - (32.0 - src[0])).abs() < 1e-4,
                 "kpt{i}: {} != 32−{}",
@@ -2528,10 +2726,16 @@ mod tests {
         assert_eq!(raw[0].boxes, vec![[40.0, 4.0, 56.0, 12.0]], "原图像素 xyxy");
 
         // none：与 plain 加载器逐位一致
-        let plain = load_yolo_dir_with_mode(&dir, "train", 32, Device::Cpu, ResizeMode::Letterbox, false)
-            .unwrap();
+        let plain =
+            load_yolo_dir_with_mode(&dir, "train", 32, Device::Cpu, ResizeMode::Letterbox, false)
+                .unwrap();
         let enc = encode_detect_sample(
-            &raw[0], 32, Device::Cpu, ResizeMode::Letterbox, &AugmentPlan::none(), false,
+            &raw[0],
+            32,
+            Device::Cpu,
+            ResizeMode::Letterbox,
+            &AugmentPlan::none(),
+            false,
         )
         .unwrap();
         assert_eq!(tensor_max_diff(&plain[0].x, &enc.x), 0.0);
@@ -2544,13 +2748,22 @@ mod tests {
             32,
             Device::Cpu,
             ResizeMode::Letterbox,
-            &AugmentPlan { flip: true, ..AugmentPlan::none() },
+            &AugmentPlan {
+                flip: true,
+                ..AugmentPlan::none()
+            },
             false,
         )
         .unwrap();
         let b = fl.boxes[0];
-        assert!((b[0] - 4.0).abs() < 1e-4 && (b[1] - 10.0).abs() < 1e-4, "b={b:?}");
-        assert!((b[2] - 12.0).abs() < 1e-4 && (b[3] - 14.0).abs() < 1e-4, "b={b:?}");
+        assert!(
+            (b[0] - 4.0).abs() < 1e-4 && (b[1] - 10.0).abs() < 1e-4,
+            "b={b:?}"
+        );
+        assert!(
+            (b[2] - 12.0).abs() < 1e-4 && (b[3] - 14.0).abs() < 1e-4,
+            "b={b:?}"
+        );
 
         // scale 0.5：增强后图 32×16，letterbox scale=1、pad_top=8
         // → 框 (40,4,56,12)×0.5=(20,2,28,6) → 画布 (20,10)-(28,14)
@@ -2559,13 +2772,22 @@ mod tests {
             32,
             Device::Cpu,
             ResizeMode::Letterbox,
-            &AugmentPlan { scale: 0.5, ..AugmentPlan::none() },
+            &AugmentPlan {
+                scale: 0.5,
+                ..AugmentPlan::none()
+            },
             false,
         )
         .unwrap();
         let b = sc.boxes[0];
-        assert!((b[0] - 20.0).abs() < 1e-4 && (b[1] - 10.0).abs() < 1e-4, "b={b:?}");
-        assert!((b[2] - 28.0).abs() < 1e-4 && (b[3] - 14.0).abs() < 1e-4, "b={b:?}");
+        assert!(
+            (b[0] - 20.0).abs() < 1e-4 && (b[1] - 10.0).abs() < 1e-4,
+            "b={b:?}"
+        );
+        assert!(
+            (b[2] - 28.0).abs() < 1e-4 && (b[3] - 14.0).abs() < 1e-4,
+            "b={b:?}"
+        );
         assert_eq!(sc.x.size(), vec![3, 32, 32], "输出画布尺寸不变");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2582,15 +2804,12 @@ mod tests {
         image::RgbImage::from_pixel(32, 32, image::Rgb([255, 0, 0]))
             .save(img_dir.join("a.png"))
             .unwrap();
-        std::fs::write(
-            lbl_dir.join("a.txt"),
-            "7 0.1 0.1 0.5 0.1 0.5 0.5 0.1 0.5\n",
-        )
-        .unwrap();
+        std::fs::write(lbl_dir.join("a.txt"), "7 0.1 0.1 0.5 0.1 0.5 0.5 0.1 0.5\n").unwrap();
 
         let plain = load_cocoseg_dir(&dir, "train", 32, Device::Cpu, false).unwrap();
         let raw = load_cocoseg_dir_raw(&dir, "train").unwrap();
-        let none = encode_seg_sample(&raw[0], 32, Device::Cpu, &AugmentPlan::none(), false).unwrap();
+        let none =
+            encode_seg_sample(&raw[0], 32, Device::Cpu, &AugmentPlan::none(), false).unwrap();
         assert_eq!(plain[0].labels, none.labels);
         assert_eq!(plain[0].masks, none.masks, "none() 掩码应逐位一致");
         assert_eq!(tensor_max_diff(&plain[0].x, &none.x), 0.0);
@@ -2601,7 +2820,10 @@ mod tests {
             &raw[0],
             32,
             Device::Cpu,
-            &AugmentPlan { flip: true, ..AugmentPlan::none() },
+            &AugmentPlan {
+                flip: true,
+                ..AugmentPlan::none()
+            },
             false,
         )
         .unwrap();
@@ -2630,15 +2852,10 @@ mod tests {
         // 64×64 图；30° 斜框：归一化角点（cx=0.5, cy=0.5, w=0.5, h=0.25, θ=30°）
         let (th, cw, ch) = (30f32.to_radians(), 0.25f32, 0.125f32);
         let (c, s) = (th.cos(), th.sin());
-        let corners: Vec<[f32; 2]> = [
-            (-cw, -ch),
-            (cw, -ch),
-            (cw, ch),
-            (-cw, ch),
-        ]
-        .iter()
-        .map(|&(dx, dy)| [0.5 + dx * c - dy * s, 0.5 + dx * s + dy * c])
-        .collect();
+        let corners: Vec<[f32; 2]> = [(-cw, -ch), (cw, -ch), (cw, ch), (-cw, ch)]
+            .iter()
+            .map(|&(dx, dy)| [0.5 + dx * c - dy * s, 0.5 + dx * s + dy * c])
+            .collect();
         let line = format!(
             "5 {}\n",
             corners
@@ -2654,12 +2871,16 @@ mod tests {
 
         let plain = load_dota_dir(&dir, "train", 32, Device::Cpu, false).unwrap();
         let raw = load_dota_dir_raw(&dir, "train").unwrap();
-        let none = encode_obb_sample(&raw[0], 32, Device::Cpu, &AugmentPlan::none(), false).unwrap();
+        let none =
+            encode_obb_sample(&raw[0], 32, Device::Cpu, &AugmentPlan::none(), false).unwrap();
         assert_eq!(plain[0].boxes.len(), 1);
         assert_eq!(none.labels, plain[0].labels);
         for (a, b) in plain[0].boxes.iter().zip(&none.boxes) {
             for (va, vb) in a.iter().zip(b) {
-                assert!((va - vb).abs() < 1e-4, "none() 应与 plain 一致: {va} vs {vb}");
+                assert!(
+                    (va - vb).abs() < 1e-4,
+                    "none() 应与 plain 一致: {va} vs {vb}"
+                );
             }
         }
         assert_eq!(tensor_max_diff(&plain[0].x, &none.x), 0.0);
@@ -2669,15 +2890,29 @@ mod tests {
             &raw[0],
             32,
             Device::Cpu,
-            &AugmentPlan { flip: true, ..AugmentPlan::none() },
+            &AugmentPlan {
+                flip: true,
+                ..AugmentPlan::none()
+            },
             false,
         )
         .unwrap();
         let (p, e) = (&plain[0].boxes[0], &fl.boxes[0]);
-        assert!((e[0] - (32.0 - p[0])).abs() < 1e-4, "cx 镜像: {} vs 32−{}", e[0], p[0]);
+        assert!(
+            (e[0] - (32.0 - p[0])).abs() < 1e-4,
+            "cx 镜像: {} vs 32−{}",
+            e[0],
+            p[0]
+        );
         assert!((e[1] - p[1]).abs() < 1e-4);
-        assert!((e[2] - p[2]).abs() < 1e-4 && (e[3] - p[3]).abs() < 1e-4, "wh 不变");
-        let (pn, en) = (AngleDomain::Le90.normalize(p[4]), AngleDomain::Le90.normalize(e[4]));
+        assert!(
+            (e[2] - p[2]).abs() < 1e-4 && (e[3] - p[3]).abs() < 1e-4,
+            "wh 不变"
+        );
+        let (pn, en) = (
+            AngleDomain::Le90.normalize(p[4]),
+            AngleDomain::Le90.normalize(e[4]),
+        );
         assert!(
             (en + pn).abs() < 1e-3 || ((en - pn).abs() < 1e-3 && (p[2] - p[3]).abs() < 1e-3),
             "镜像应 θ→−θ（le90 归一化后）：{pn} vs {en}"
@@ -2691,7 +2926,13 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// 2×2 纯色 raw 检测样本。
-    fn solid_raw(w: u32, h: u32, rgb: [u8; 3], boxes: Vec<[f32; 4]>, labels: Vec<u32>) -> RawDetectSample {
+    fn solid_raw(
+        w: u32,
+        h: u32,
+        rgb: [u8; 3],
+        boxes: Vec<[f32; 4]>,
+        labels: Vec<u32>,
+    ) -> RawDetectSample {
         RawDetectSample {
             w,
             h,
@@ -2756,7 +2997,11 @@ mod tests {
         // TR 象限：[2,2,4,4] × 0.5 + (2,0) = [3,1,4,2]；BL：+ (0,2) → [1,3,2,4]；BR：+ (2,2) → [3,3,4,4]
         assert_eq!(
             m.boxes,
-            vec![[3.0, 1.0, 4.0, 2.0], [1.0, 3.0, 2.0, 4.0], [3.0, 3.0, 4.0, 4.0]]
+            vec![
+                [3.0, 1.0, 4.0, 2.0],
+                [1.0, 3.0, 2.0, 4.0],
+                [3.0, 3.0, 4.0, 4.0]
+            ]
         );
         assert_eq!(m.labels, vec![3, 3, 3]);
     }
@@ -2886,8 +3131,7 @@ mod seg_cache_tests {
         };
         let reference = encode_seg_sample(&raw, img_size, Device::Cpu, &plan, false).unwrap();
         let cached = build_seg_cache_sample(&raw, img_size).unwrap();
-        let fast =
-            encode_seg_sample_cached(&cached, img_size, Device::Cpu, &plan, false).unwrap();
+        let fast = encode_seg_sample_cached(&cached, img_size, Device::Cpu, &plan, false).unwrap();
         let (dmax, _) = tensor_diff(&reference.x, &fast.x);
         assert_eq!(dmax, 0.0, "flip 路径必须逐位一致，实际最大差 {dmax}");
         assert_masks_eq(&reference, &fast);
@@ -2906,8 +3150,7 @@ mod seg_cache_tests {
         };
         let reference = encode_seg_sample(&raw, img_size, Device::Cpu, &plan, false).unwrap();
         let cached = build_seg_cache_sample(&raw, img_size).unwrap();
-        let fast =
-            encode_seg_sample_cached(&cached, img_size, Device::Cpu, &plan, false).unwrap();
+        let fast = encode_seg_sample_cached(&cached, img_size, Device::Cpu, &plan, false).unwrap();
         let (dmax, dmean) = tensor_diff(&reference.x, &fast.x);
         assert!(dmax <= 2.0 / 255.0, "增益路径最大差 {dmax} 超容差 2/255");
         assert!(dmean < 0.2 / 255.0, "增益路径平均差 {dmean} 偏大");
@@ -2927,8 +3170,7 @@ mod seg_cache_tests {
         };
         let reference = encode_seg_sample(&raw, img_size, Device::Cpu, &plan, false).unwrap();
         let cached = build_seg_cache_sample(&raw, img_size).unwrap();
-        let fast =
-            encode_seg_sample_cached(&cached, img_size, Device::Cpu, &plan, false).unwrap();
+        let fast = encode_seg_sample_cached(&cached, img_size, Device::Cpu, &plan, false).unwrap();
         let (dmax, dmean) = tensor_diff(&reference.x, &fast.x);
         assert!(dmax <= 4.0 / 255.0, "缩放路径最大差 {dmax} 超容差 4/255");
         assert!(dmean < 1.0 / 255.0, "缩放路径平均差 {dmean} 偏大");
@@ -2959,8 +3201,8 @@ mod seg_cache_tests {
         let raw = synthetic_raw(160, 128);
         let img_size = 128;
         let cached = build_seg_cache_sample(&raw, img_size).unwrap();
-        let stack = build_seg_canvas_stack(std::slice::from_ref(&cached), img_size, device)
-            .unwrap();
+        let stack =
+            build_seg_canvas_stack(std::slice::from_ref(&cached), img_size, device).unwrap();
         // 回归锁：内容贴片是非方形（cw≠ch），画布堆必须是 [N,3,S,S] 且
         // reshape/窄拷贝路径不能静默走样（曾因方形假设引发运行期 panic）
         assert_eq!(
@@ -2969,16 +3211,41 @@ mod seg_cache_tests {
             "画布堆形状错误"
         );
         for (name, plan, tol_max, tol_mean) in [
-            ("flip", AugmentPlan { flip: true, scale: 1.0, rgb_gains: [1.0; 3] }, 2.0f32, 0.2f32),
-            ("gain", AugmentPlan { flip: false, scale: 1.0, rgb_gains: [1.06, 0.95, 1.0] }, 2.0, 0.2),
-            ("scale", AugmentPlan { flip: false, scale: 1.1, rgb_gains: [1.0; 3] }, 8.0, 2.0),
+            (
+                "flip",
+                AugmentPlan {
+                    flip: true,
+                    scale: 1.0,
+                    rgb_gains: [1.0; 3],
+                },
+                2.0f32,
+                0.2f32,
+            ),
+            (
+                "gain",
+                AugmentPlan {
+                    flip: false,
+                    scale: 1.0,
+                    rgb_gains: [1.06, 0.95, 1.0],
+                },
+                2.0,
+                0.2,
+            ),
+            (
+                "scale",
+                AugmentPlan {
+                    flip: false,
+                    scale: 1.1,
+                    rgb_gains: [1.0; 3],
+                },
+                8.0,
+                2.0,
+            ),
         ] {
-            let cpu = encode_seg_sample_cached(
-                &cached, img_size, Device::Cpu, &plan, false,
-            )
-            .unwrap()
-            .x
-            .to_device(device);
+            let cpu = encode_seg_sample_cached(&cached, img_size, Device::Cpu, &plan, false)
+                .unwrap()
+                .x
+                .to_device(device);
             let gpu = encode_seg_sample_gpu(&stack, 0, &cached, img_size, &plan, false)
                 .unwrap()
                 .x;
@@ -3010,12 +3277,22 @@ fn seg_cache_bench() {
                 }
                 s
             };
-            r.polys = vec![vec![[0.1 * w as f32, 0.1 * h as f32], [0.6 * w as f32, 0.6 * h as f32]]];
+            r.polys = vec![vec![
+                [0.1 * w as f32, 0.1 * h as f32],
+                [0.6 * w as f32, 0.6 * h as f32],
+            ]];
             r.labels = vec![0];
             r
         })
         .collect();
-    let plans = vec![AugmentPlan { flip: true, scale: 1.05, rgb_gains: [1.02, 0.98, 1.0] }; n];
+    let plans = vec![
+        AugmentPlan {
+            flip: true,
+            scale: 1.05,
+            rgb_gains: [1.02, 0.98, 1.0]
+        };
+        n
+    ];
 
     let t0 = Instant::now();
     let _old: Vec<_> = raws
@@ -3035,7 +3312,210 @@ fn seg_cache_bench() {
     let new_ms = t2.elapsed().as_millis() as f64 / n as f64;
 
     println!("旧路径（全分辨率单线程）: {old_ms:.1} ms/样本");
-    println!("新路径（缓存+rayon 并行）: {new_ms:.1} ms/样本（缓存构建一次性 {build_ms:.1} ms/样本）");
+    println!(
+        "新路径（缓存+rayon 并行）: {new_ms:.1} ms/样本（缓存构建一次性 {build_ms:.1} ms/样本）"
+    );
     println!("稳态加速比: {:.0}x", old_ms / new_ms);
     assert!(old_ms > new_ms * 4.0, "新路径应显著快于旧路径");
+}
+
+/// 检测内容贴片缓存（数据管线 v2）单测：none-plan 与 raw 路径逐位一致 + 贴片
+/// 几何正确 + 贴片 mosaic 语义（检测训练增强的缓存路径行为契约）。
+#[cfg(test)]
+mod detect_cache_tests {
+    use super::*;
+
+    fn tensor_diff(a: &Tensor, b: &Tensor) -> (f32, f32) {
+        let d = (a - b).abs();
+        (
+            d.max().double_value(&[]) as f32,
+            d.mean(Kind::Float).double_value(&[]) as f32,
+        )
+    }
+
+    fn synthetic_detect_raw(w: u32, h: u32) -> RawDetectSample {
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let fx = x as f32 / w as f32;
+                let fy = y as f32 / h as f32;
+                rgb.push((30.0 + 200.0 * fx) as u8);
+                rgb.push((50.0 + 180.0 * fy) as u8);
+                rgb.push((90.0 + 140.0 * (fx * 0.5 + fy * 0.5)) as u8);
+            }
+        }
+        RawDetectSample {
+            w,
+            h,
+            rgb,
+            boxes: vec![
+                [
+                    0.1 * w as f32,
+                    0.2 * h as f32,
+                    0.4 * w as f32,
+                    0.6 * h as f32,
+                ],
+                [
+                    0.55 * w as f32,
+                    0.1 * h as f32,
+                    0.9 * w as f32,
+                    0.5 * h as f32,
+                ],
+            ],
+            labels: vec![1, 0],
+        }
+    }
+
+    fn boxes_of(s: &SampleTensor) -> Vec<[f32; 4]> {
+        s.boxes.clone()
+    }
+
+    #[test]
+    fn detect_cache_none_plan_is_bit_exact_landscape() {
+        let raw = synthetic_detect_raw(640, 426);
+        let img_size = 320;
+        let tile = detect_content_tile(&raw, img_size).unwrap();
+        assert_eq!(tile.w, img_size, "横图长边贴到 img_size");
+        assert_eq!(tile.h, ((426.0 / 640.0) * img_size as f32).round() as u32);
+        let reference = encode_detect_sample(
+            &raw,
+            img_size,
+            Device::Cpu,
+            ResizeMode::Letterbox,
+            &AugmentPlan::none(),
+            false,
+        )
+        .unwrap();
+        let fast = encode_detect_sample(
+            &tile,
+            img_size,
+            Device::Cpu,
+            ResizeMode::Letterbox,
+            &AugmentPlan::none(),
+            false,
+        )
+        .unwrap();
+        let (dmax, _) = tensor_diff(&reference.x, &fast.x);
+        assert_eq!(dmax, 0.0, "none plan 必须逐位一致，实际最大差 {dmax}");
+        assert_eq!(boxes_of(&reference), boxes_of(&fast), "框映射必须逐位一致");
+        assert_eq!(reference.labels, fast.labels);
+    }
+
+    #[test]
+    fn detect_cache_none_plan_is_bit_exact_portrait() {
+        let raw = synthetic_detect_raw(426, 640);
+        let img_size = 320;
+        let tile = detect_content_tile(&raw, img_size).unwrap();
+        assert_eq!(tile.h, img_size, "竖图长边贴到 img_size");
+        let reference = encode_detect_sample(
+            &raw,
+            img_size,
+            Device::Cpu,
+            ResizeMode::Letterbox,
+            &AugmentPlan::none(),
+            false,
+        )
+        .unwrap();
+        let fast = encode_detect_sample(
+            &tile,
+            img_size,
+            Device::Cpu,
+            ResizeMode::Letterbox,
+            &AugmentPlan::none(),
+            false,
+        )
+        .unwrap();
+        let (dmax, _) = tensor_diff(&reference.x, &fast.x);
+        assert_eq!(dmax, 0.0, "竖图 none plan 必须逐位一致，实际最大差 {dmax}");
+        assert_eq!(boxes_of(&reference), boxes_of(&fast));
+    }
+
+    #[test]
+    fn detect_cache_stretch_mode_is_bit_exact() {
+        let raw = synthetic_detect_raw(500, 333);
+        let img_size = 320;
+        let tile = detect_content_tile(&raw, img_size).unwrap();
+        // 拉伸模式：raw 直接 resize S×S；贴片先内容化再拉伸——像素不同属预期，
+        // 但 none-plan 的框都必须精确落在同一目标几何（无补边满幅）
+        let a = encode_detect_sample(
+            &raw,
+            img_size,
+            Device::Cpu,
+            ResizeMode::Stretch,
+            &AugmentPlan::none(),
+            false,
+        )
+        .unwrap();
+        let b = encode_detect_sample(
+            &tile,
+            img_size,
+            Device::Cpu,
+            ResizeMode::Stretch,
+            &AugmentPlan::none(),
+            false,
+        )
+        .unwrap();
+        for (ba, bb) in a.boxes.iter().zip(&b.boxes) {
+            for k in 0..4 {
+                assert!(
+                    (ba[k] - bb[k]).abs() < 1.5,
+                    "拉伸框几何偏差 ≤1.5px，实际 {}",
+                    (ba[k] - bb[k]).abs()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn detect_tile_cache_batch_preserves_order_and_dims() {
+        let img_size = 160;
+        let raws = vec![
+            synthetic_detect_raw(320, 200),
+            synthetic_detect_raw(200, 320),
+            synthetic_detect_raw(160, 160),
+        ];
+        let tiles = build_detect_tile_cache(raws, img_size).unwrap();
+        assert_eq!(tiles.len(), 3);
+        assert_eq!((tiles[0].w, tiles[0].h), (img_size, 100));
+        assert_eq!((tiles[1].w, tiles[1].h), (100, img_size));
+        assert_eq!((tiles[2].w, tiles[2].h), (img_size, img_size));
+        // 保序：逐样本框相对位置不变（第 1 框 x1 < 第 2 框 x1）
+        for t in &tiles {
+            assert!(t.boxes[0][0] < t.boxes[1][0]);
+            assert_eq!(t.labels, vec![1, 0]);
+        }
+    }
+
+    #[test]
+    fn detect_mosaic_on_tiles_matches_canvas_contract() {
+        // 贴片过 mosaic4_raw：画布 = 2×锚点尺寸，框落在画布内（缓存路径复用
+        // 同一 mosaic 机制，语义与 raw 版一致）
+        let img_size = 160;
+        let tiles: Vec<RawDetectSample> = (0..4)
+            .map(|k| {
+                let mut r = synthetic_detect_raw(320 + k, 200 + 2 * k);
+                for v in r.rgb.iter_mut().step_by(97) {
+                    *v = v.wrapping_add(k as u8 * 11);
+                }
+                detect_content_tile(&r, img_size).unwrap()
+            })
+            .collect();
+        let m = mosaic4_raw([&tiles[0], &tiles[1], &tiles[2], &tiles[3]]).unwrap();
+        assert_eq!((m.w, m.h), (2 * tiles[0].w, 2 * tiles[0].h));
+        assert_eq!(m.boxes.len(), 8, "四图框并集");
+        for b in &m.boxes {
+            assert!(b[0] >= 0.0 && b[1] >= 0.0 && b[2] <= m.w as f32 && b[3] <= m.h as f32);
+        }
+        // mosaic 产物再编码 none-plan：与 raw 路径同一入口，几何契约不变
+        let s = encode_detect_sample(
+            &m,
+            img_size,
+            Device::Cpu,
+            ResizeMode::Letterbox,
+            &AugmentPlan::none(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(s.x.size(), [3, img_size as i64, img_size as i64]);
+    }
 }

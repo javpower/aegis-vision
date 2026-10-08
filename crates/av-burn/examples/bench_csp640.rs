@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use av_burn::data::load_cocoseg_dir;
 use av_burn::seg::{SegNet, SegNetCfg};
-use av_burn::train::{TrainCfg, cosine_lr, make_optimizer};
+use av_burn::train::{cosine_lr, make_optimizer, TrainCfg};
 use av_burn::wgpu_check::WgpuTrainB;
 use burn_core::tensor::{Tensor, TensorData};
 use burn_wgpu::WgpuDevice;
@@ -90,10 +90,7 @@ fn main() -> av_core::AvResult<()> {
             for &i in chunk {
                 buf.extend_from_slice(&data[i].pixels);
             }
-            let x = Tensor::<WgpuTrainB, 4>::from_data(
-                TensorData::new(buf, [n, 3, s, s]),
-                &device,
-            );
+            let x = Tensor::<WgpuTrainB, 4>::from_data(TensorData::new(buf, [n, 3, s, s]), &device);
             let masks: Vec<Vec<Vec<u8>>> = chunk.iter().map(|&i| data[i].masks.clone()).collect();
             let labels: Vec<Vec<u32>> = chunk.iter().map(|&i| data[i].labels.clone()).collect();
             let lr = cosine_lr(&tcfg, (epoch - 1) * steps_per_epoch + steps);
@@ -112,7 +109,7 @@ fn main() -> av_core::AvResult<()> {
             loss_sum / steps.max(1) as f32
         );
     }
-    epoch_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    epoch_times.sort_by(|a, b| a.total_cmp(b));
     let steady = epoch_times[epoch_times.len() / 2];
     println!(
         "[bench] 完成：中位 epoch={steady:.1}s 首 epoch（含 wgpu JIT）={:.1}s —— tch 对照臂 ~7.5s/epoch",

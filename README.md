@@ -54,9 +54,13 @@ AegisVision 选择另一条路——**用 Rust 从零实现 YOLO 级训练体系
 
 - 实例分割数据管线重写后 **288 秒 → 3 秒/epoch（96 倍）**：内容贴片缓存 +
   rayon 并行编码 + 双缓冲预取 + 显存驻留与 GPU 张量增强（`[data].cache`）
+- 检测 / OBB / 关键点增强路径同款 rayon 化（RNG 预抽序逐位一致）后，
+  coco128@320 增强训练端到端 **222 秒 → 48 秒（4.7 倍，24 核 CPU）**
 - 同卡同数据同 batch 吞吐对照：**3.0 秒/epoch vs Ultralytics YOLO11n-seg 4.0 秒/epoch**
 - 训练吞吐基准（同协议 csp-elan@640）：tch 7.5 秒/epoch，burn-wgpu 27 秒/epoch
   （跨厂商 GPU 轨道，[M2 报告](runs/M2-BURN-BENCHMARK.md)）
+- `[train].deterministic = true` 播种 torch 全局 RNG，权重初始化可复现
+  （两次运行 epoch1 loss 逐位一致）
 
 ## 核心特性
 

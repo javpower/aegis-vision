@@ -8,7 +8,7 @@
 //! 贪心流程与 av_core::nms 同款：分数降序 → 逐一与保留集合比重叠度 → 超阈值丢弃。
 //! 与 av_core::nms 一致采用类别无关抑制（跨类比较），保持整库后处理语义统一。
 
-use av_core::geometry::RotBox;
+use av_core::geometry::{Aabb, RotBox};
 use av_core::types::Detection;
 
 /// 旋转 NMS 的重叠度量。
@@ -43,32 +43,45 @@ fn det_rotbox(d: &Detection) -> RotBox {
     }
 }
 
+/// 旋转框的轴对齐包络框（顶点包络，与 [`envelope_half_extents`] 一致）。
+fn envelope_aabb(r: &RotBox) -> Aabb {
+    let (hw, hh) = envelope_half_extents(r.w, r.h, r.theta);
+    Aabb::new(r.cx - hw, r.cy - hh, r.cx + hw, r.cy + hh)
+}
+
 /// 角度感知贪心 NMS：分数降序保留，抑制与已保留框旋转重叠超阈值的候选。
 ///
 /// - `iou_thr`：抑制阈值（Polygon 度量即普通 IoU 阈值；ProbIou 为近似档）；
 /// - 类别无关（与 [`av_core::types::nms`] 语义一致）。
+///
+/// 保留集合的 RotBox / 包络框一次预计算（旧实现每对比较重建 RotBox）；Polygon
+/// 度量先做包络框相交测试——包络不相交则多边形 IoU 必为 0，密集候选下把昂贵的
+/// 多边形裁剪只在包络重叠的对上执行。
 pub fn rotate_nms(mut dets: Vec<Detection>, iou_thr: f32, metric: RotNmsMetric) -> Vec<Detection> {
     dets.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let mut kept: Vec<Detection> = Vec::new();
+    let mut kept: Vec<(Detection, RotBox, Aabb)> = Vec::new();
     for d in dets {
         let rb = det_rotbox(&d);
-        let suppressed = kept.iter().any(|k| {
-            let rk = det_rotbox(k);
+        let env = envelope_aabb(&rb);
+        let suppressed = kept.iter().any(|(_, rk, renv)| {
+            if matches!(metric, RotNmsMetric::Polygon) && renv.intersection(&env).area() <= 0.0 {
+                return false; // 包络不相交 → 多边形交面积 = 0 → 不抑制
+            }
             let ov = match metric {
                 RotNmsMetric::Polygon => rk.iou(&rb),
-                RotNmsMetric::ProbIou => probiou_scalar(rk, rb),
+                RotNmsMetric::ProbIou => probiou_scalar(*rk, rb),
             };
             ov > iou_thr
         });
         if !suppressed {
-            kept.push(d);
+            kept.push((d, rb, env));
         }
     }
-    kept
+    kept.into_iter().map(|(d, _, _)| d).collect()
 }
 
 /// 标量版 ProbIoU：两旋转框高斯拟合的 Bhattacharyya 系数 ∈ (0, 1]（相同框 → 1）。
@@ -78,7 +91,11 @@ pub fn probiou_scalar(a: RotBox, b: RotBox) -> f32 {
         let (sin, cos) = r.theta.sin_cos();
         let m = r.w * r.w / 12.0;
         let n = r.h * r.h / 12.0;
-        [m * cos * cos + n * sin * sin, (m - n) * sin * cos, m * sin * sin + n * cos * cos]
+        [
+            m * cos * cos + n * sin * sin,
+            (m - n) * sin * cos,
+            m * sin * sin + n * cos * cos,
+        ]
     }
     let [axx, axy, ayy] = cov(&a);
     let [bxx, bxy, byy] = cov(&b);
@@ -138,11 +155,21 @@ mod tests {
         let s = std::f32::consts::FRAC_1_SQRT_2;
         let a = det(50.0, 50.0, 40.0, 8.0, std::f32::consts::FRAC_PI_4, 0.9);
         // b = a 沿法向 (−sin45°, cos45°) 平移 8px
-        let b = det(50.0 - 8.0 * s, 50.0 + 8.0 * s, 40.0, 8.0, std::f32::consts::FRAC_PI_4, 0.7);
+        let b = det(
+            50.0 - 8.0 * s,
+            50.0 + 8.0 * s,
+            40.0,
+            8.0,
+            std::f32::consts::FRAC_PI_4,
+            0.7,
+        );
         // 前置：旋转 IoU ≈ 0（法向间距 = 短边宽 → 交叠面积归零）
         let (ra, rb) = (det_rotbox(&a), det_rotbox(&b));
         let rot_iou = ra.iou(&rb);
-        assert!(rot_iou < 0.01, "前置：平行错位条带旋转 IoU 应≈0，got {rot_iou}");
+        assert!(
+            rot_iou < 0.01,
+            "前置：平行错位条带旋转 IoU 应≈0，got {rot_iou}"
+        );
         // 对照：同样的两个目标若按外接 Aabb 走角度盲 NMS（envelope IoU ≈ 0.53 > 0.5）
         // 会被错杀——这正是旋转 NMS 要修的回归
         let (hwa, hha) = envelope_half_extents(40.0, 8.0, std::f32::consts::FRAC_PI_4);
@@ -206,12 +233,30 @@ mod tests {
         //   Σa = diag(1600,64)/12，Σb = diag(64,1600)/12，det 均为 711.111
         //   Σ* = diag(69.3333,69.3333)，det* = 4807.11，q = 0
         //   BC = √(711.111/4807.11) ≈ 0.384616 < 0.5 → 交叉框不互抑
-        let a = RotBox { cx: 0.0, cy: 0.0, w: 40.0, h: 8.0, theta: 0.0 };
-        let b = RotBox { cx: 0.0, cy: 0.0, w: 8.0, h: 40.0, theta: 0.0 };
+        let a = RotBox {
+            cx: 0.0,
+            cy: 0.0,
+            w: 40.0,
+            h: 8.0,
+            theta: 0.0,
+        };
+        let b = RotBox {
+            cx: 0.0,
+            cy: 0.0,
+            w: 8.0,
+            h: 40.0,
+            theta: 0.0,
+        };
         let bc_cross = probiou_scalar(a, b);
         assert!((bc_cross - 0.384616).abs() < 1e-3, "BC={bc_cross}");
         // 1px 平移的近重复：q = dx²·(h²/12)⁻¹·… = 12/1600 → BC ≈ 0.9991 > 0.99
-        let dup = RotBox { cx: 1.0, cy: 0.0, w: 40.0, h: 8.0, theta: 0.0 };
+        let dup = RotBox {
+            cx: 1.0,
+            cy: 0.0,
+            w: 40.0,
+            h: 8.0,
+            theta: 0.0,
+        };
         let bc_dup = probiou_scalar(a, dup);
         assert!(bc_dup > 0.99, "BC dup={bc_dup}");
         assert!(probiou_scalar(a, a) > 0.9999);
@@ -220,17 +265,37 @@ mod tests {
         // （q = 8²·12/8² = 12 → BC = exp(−1.5) ≈ 0.223 < 0.5）
         let s = std::f32::consts::FRAC_1_SQRT_2;
         let ka = det(50.0, 50.0, 40.0, 8.0, std::f32::consts::FRAC_PI_4, 0.9);
-        let kdup = det(50.0 + s, 50.0 + s, 40.0, 8.0, std::f32::consts::FRAC_PI_4, 0.8);
-        let kb = det(50.0 - 8.0 * s, 50.0 + 8.0 * s, 40.0, 8.0, std::f32::consts::FRAC_PI_4, 0.7);
+        let kdup = det(
+            50.0 + s,
+            50.0 + s,
+            40.0,
+            8.0,
+            std::f32::consts::FRAC_PI_4,
+            0.8,
+        );
+        let kb = det(
+            50.0 - 8.0 * s,
+            50.0 + 8.0 * s,
+            40.0,
+            8.0,
+            std::f32::consts::FRAC_PI_4,
+            0.7,
+        );
         let kept = rotate_nms(vec![ka, kdup, kb], 0.5, RotNmsMetric::ProbIou);
         assert_eq!(kept.len(), 2, "ProbIou 度量：重复框抑制、错位条带保留");
     }
 
     #[test]
     fn envelope_matches_rotbox_corners() {
-        // 外接半宽高 = 顶点包络（旋转 30° 的 10×6 框逐顶点验证）
-        let (w, h, th) = (10.0f32, 6.0f32, 0.5236f32);
-        let rb = RotBox { cx: 0.0, cy: 0.0, w, h, theta: th };
+        // 外接半宽高 = 顶点包络（旋转 30°（π/6）的 10×6 框逐顶点验证）
+        let (w, h, th) = (10.0f32, 6.0f32, std::f32::consts::FRAC_PI_6);
+        let rb = RotBox {
+            cx: 0.0,
+            cy: 0.0,
+            w,
+            h,
+            theta: th,
+        };
         let mut xmax = 0f32;
         let mut ymax = 0f32;
         for c in rb.corners() {

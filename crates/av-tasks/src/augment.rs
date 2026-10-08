@@ -21,7 +21,8 @@ use crate::rng::XorShift;
 /// （0 鼻不动；1↔2 左右眼、3↔4 左右耳、5↔6 肩、7↔8 肘、9↔10 腕、11↔12 髋、
 /// 13↔14 膝、15↔16 踝）。**仅当关键点模板恰为 17 点**时使用——其它点数模板
 /// 无内置语义，翻转让坐标镜像但索引不交换（否则会静默错位）。
-pub const COCO17_FLIP_SWAP: [usize; 17] = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15];
+pub const COCO17_FLIP_SWAP: [usize; 17] =
+    [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15];
 
 /// 单样本增强方案：由 [`draw_plan`] 按配置一次性抽好（抛硬币翻转、缩放系数、
 /// 每通道增益），同一份 plan 同时作用于像素与坐标——坐标同步的前提是
@@ -66,8 +67,7 @@ pub fn has_strength(cfg: &AugmentCfg) -> bool {
 /// （让模型在干净分布上收尾），即 `epoch <= total − N` 时返回 true；
 /// N = 0 恒开；N ≥ total 从第 1 个 epoch 就关（saturating 下溢安全）。
 pub fn strong_aug_active(cfg: &AugmentCfg, epoch: u32, total_epochs: u32) -> bool {
-    cfg.close_last_epochs == 0
-        || epoch <= total_epochs.saturating_sub(cfg.close_last_epochs)
+    cfg.close_last_epochs == 0 || epoch <= total_epochs.saturating_sub(cfg.close_last_epochs)
 }
 
 /// 按配置抽一份样本级 plan。随机数消耗顺序固定：flip 抛硬币 → 缩放系数 →
@@ -106,12 +106,23 @@ pub fn hflip_rgb(w: usize, h: usize, rgb: &mut [u8]) {
 
 /// RGB8 缓冲通道乘性增益（HSV 简化版，原地）：`v = clamp(round(v · gain), 0, 255)`。
 /// gain 全 1 时逐位恒等（v·1.0 精确、round 回同值）。
+///
+/// 每调用先建 3×256 查找表（768 次乘加），逐像素只查表不再做 f32 运算——
+/// 表项与逐字节计算同公式逐位一致，增强热路径上每像素省 3 次浮点乘加。
 pub fn mul_rgb(rgb: &mut [u8], gains: [f32; 3]) {
-    for px in rgb.chunks_exact_mut(3) {
-        for c in 0..3 {
-            let v = (px[c] as f32 * gains[c]).round().clamp(0.0, 255.0);
-            px[c] = v as u8;
+    if gains == [1.0, 1.0, 1.0] {
+        return; // 恒等增益直接返回（文档承诺的逐位恒等）
+    }
+    let mut lut = [[0u8; 256]; 3];
+    for (c, gc) in gains.iter().enumerate() {
+        for (v, slot) in lut[c].iter_mut().enumerate() {
+            *slot = (v as f32 * gc).round().clamp(0.0, 255.0) as u8;
         }
+    }
+    for px in rgb.chunks_exact_mut(3) {
+        px[0] = lut[0][px[0] as usize];
+        px[1] = lut[1][px[1] as usize];
+        px[2] = lut[2][px[2] as usize];
     }
 }
 
@@ -422,7 +433,13 @@ mod tests {
     fn flip_keypoints_swaps_coco17_pairs() {
         // 3 个代表点验证：0 鼻不动、1(左眼)↔2(右眼)、16(左踝)↔15(右踝)
         let mut g: Vec<[f32; 3]> = (0..17)
-            .map(|i| [10.0 + i as f32, 20.0 + i as f32, if i == 3 { 0.0 } else { 2.0 }])
+            .map(|i| {
+                [
+                    10.0 + i as f32,
+                    20.0 + i as f32,
+                    if i == 3 { 0.0 } else { 2.0 },
+                ]
+            })
             .collect();
         g[1] = [10.0, 21.0, 2.0]; // 左眼 (10,21) v=2
         g[2] = [30.0, 22.0, 2.0]; // 右眼 (30,22) v=2
@@ -663,7 +680,12 @@ mod tests {
     #[test]
     fn mosaic_compose_hand_computed() {
         // 象限 2×2 → 画布 4×4；每象限纯色便于核对像素归属
-        let px = |r, g, b| vec![[r, g, b]; 4].into_iter().flatten().collect::<Vec<u8>>();
+        let px = |r, g, b| {
+            vec![[r, g, b]; 4]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<u8>>()
+        };
         let red = px(255, 0, 0);
         let green = px(0, 255, 0);
         let blue = px(0, 0, 255);
@@ -712,10 +734,10 @@ mod tests {
         assert_eq!(
             boxes,
             vec![
-                [0.0, 0.0, 2.0, 2.0],  // TL 恒等
-                [2.0, 0.0, 3.0, 1.0],  // TR 平移 (2,0)
-                [1.0, 3.0, 2.0, 4.0],  // BL [1,1,2,2] + (0,2)
-                [2.0, 3.0, 3.0, 4.0],  // BR [0,1,1,2] + (2,2)
+                [0.0, 0.0, 2.0, 2.0], // TL 恒等
+                [2.0, 0.0, 3.0, 1.0], // TR 平移 (2,0)
+                [1.0, 3.0, 2.0, 4.0], // BL [1,1,2,2] + (0,2)
+                [2.0, 3.0, 3.0, 4.0], // BR [0,1,1,2] + (2,2)
             ]
         );
         assert_eq!(labels, vec![7, 8, 9, 10]);

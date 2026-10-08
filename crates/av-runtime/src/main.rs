@@ -7,8 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
 use av_core::config::{DataPipeline, RunConfig, TaskCfg};
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "av", version, about = "AegisVision：Rust 原生多任务检测框架")]
@@ -82,6 +82,10 @@ enum Command {
         /// 切片重叠比例 0~0.8（--slice 时生效）
         #[arg(long, default_value_t = 0.2)]
         slice_overlap: f32,
+        /// 可视化输出目录：把检测框（按类着色 + 类别/分数标签）画在原图上，
+        /// 存为 <DIR>/<输入文件名>.jpg
+        #[arg(long = "save-viz", value_name = "DIR")]
+        save_viz: Option<PathBuf>,
     },
     /// 基准 / 场景评测（v0.1 已接通：合成验证集冒烟指标；真实基准协议 M8 落地）
     Eval {
@@ -161,6 +165,7 @@ fn main() -> Result<()> {
             slice,
             slice_window,
             slice_overlap,
+            save_viz,
         } => cmd_infer(
             &weights,
             config.as_deref(),
@@ -170,6 +175,7 @@ fn main() -> Result<()> {
             slice,
             slice_window,
             slice_overlap,
+            save_viz.as_deref(),
         ),
         Command::Pack { src, out } => {
             let (count, bytes) =
@@ -211,12 +217,7 @@ fn milestone_of(cmd: &Command) -> &'static str {
     }
 }
 
-fn cmd_train(
-    config_path: &PathBuf,
-    resume: bool,
-    overrides: &[String],
-    dry_run: bool,
-) -> Result<()> {
+fn cmd_train(config_path: &Path, resume: bool, overrides: &[String], dry_run: bool) -> Result<()> {
     let mut cfg = load_config(config_path)?;
     apply_overrides(&mut cfg, overrides)?;
     // 训练前的数据侧预检（CLI 层，库不改）：把「目录不存在 / 类数不匹配」拦在
@@ -241,10 +242,7 @@ fn run_train(cfg: &av_core::config::RunConfig, resume: bool) -> Result<()> {
     println!("训练完成 ✔");
     println!("  task        = {}", report.task);
     println!("  final_loss  = {:.4}", report.final_loss);
-    println!(
-        "  {} = {:.3}",
-        report.metric, report.metric_value
-    );
+    println!("  {} = {:.3}", report.metric, report.metric_value);
     if let Some((name, v)) = &report.secondary {
         println!("  {name} = {v:.3}");
     }
@@ -258,51 +256,233 @@ fn run_train(_cfg: &av_core::config::RunConfig, _resume: bool) -> Result<()> {
 }
 
 #[cfg(feature = "torch")]
+#[allow(clippy::too_many_arguments)]
 fn cmd_infer(
-    weights: &PathBuf,
+    weights: &Path,
     config: Option<&std::path::Path>,
-    input: &PathBuf,
+    input: &Path,
     conf: f32,
     iou: f32,
     slice: bool,
     slice_window: u32,
     slice_overlap: f32,
+    save_viz: Option<&Path>,
 ) -> Result<()> {
     let _ = (conf, iou); // v0.1 引擎使用内置默认值；参数生效按 M2 批推理接口
     let cfg = resolve_config_for_weights(weights, config)?;
     let result = if slice {
-        av_runtime::engine::infer_sliced(
-            &cfg,
-            weights,
-            input,
-            slice_window,
-            slice_overlap,
-        )
-        .map_err(anyhow::Error::from)?
+        av_runtime::engine::infer_sliced(&cfg, weights, input, slice_window, slice_overlap)
+            .map_err(anyhow::Error::from)?
     } else {
         av_runtime::engine::infer(&cfg, weights, input).map_err(anyhow::Error::from)?
     };
+    if let Some(dir) = save_viz {
+        let out = save_viz_image(input, &result, dir)?;
+        println!("可视化已写入 {}", out.display());
+    }
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 
+/// 检测框按类着色调色板（8 色循环）。
+#[cfg(feature = "torch")]
+const VIZ_PALETTE: [[u8; 3]; 8] = [
+    [80, 250, 123],
+    [255, 121, 198],
+    [189, 147, 249],
+    [241, 250, 140],
+    [139, 233, 253],
+    [255, 184, 108],
+    [255, 85, 85],
+    [114, 213, 163],
+];
+
+#[cfg(feature = "torch")]
+/// 3×5 微型字模（MSB=左列；覆盖推理标签所需的 A-Z/0-9/空格/点/冒号）。
+const VIZ_FONT: [(&str, [u8; 5]); 38] = [
+    ("0", [0b111, 0b101, 0b101, 0b101, 0b111]),
+    ("1", [0b010, 0b110, 0b010, 0b010, 0b111]),
+    ("2", [0b111, 0b001, 0b111, 0b100, 0b111]),
+    ("3", [0b111, 0b001, 0b111, 0b001, 0b111]),
+    ("4", [0b101, 0b101, 0b111, 0b001, 0b001]),
+    ("5", [0b111, 0b100, 0b111, 0b001, 0b111]),
+    ("6", [0b111, 0b100, 0b111, 0b101, 0b111]),
+    ("7", [0b111, 0b001, 0b010, 0b010, 0b010]),
+    ("8", [0b111, 0b101, 0b111, 0b101, 0b111]),
+    ("9", [0b111, 0b101, 0b111, 0b001, 0b111]),
+    ("A", [0b111, 0b101, 0b111, 0b101, 0b101]),
+    ("B", [0b110, 0b101, 0b110, 0b101, 0b110]),
+    ("C", [0b111, 0b100, 0b100, 0b100, 0b111]),
+    ("D", [0b110, 0b101, 0b101, 0b101, 0b110]),
+    ("E", [0b111, 0b100, 0b111, 0b100, 0b111]),
+    ("F", [0b111, 0b100, 0b111, 0b100, 0b100]),
+    ("G", [0b111, 0b100, 0b101, 0b101, 0b111]),
+    ("H", [0b101, 0b101, 0b111, 0b101, 0b101]),
+    ("I", [0b111, 0b010, 0b010, 0b010, 0b111]),
+    ("J", [0b011, 0b001, 0b001, 0b101, 0b111]),
+    ("K", [0b101, 0b110, 0b100, 0b110, 0b101]),
+    ("L", [0b100, 0b100, 0b100, 0b100, 0b111]),
+    ("M", [0b101, 0b111, 0b111, 0b101, 0b101]),
+    ("N", [0b101, 0b111, 0b111, 0b111, 0b101]),
+    ("O", [0b111, 0b101, 0b101, 0b101, 0b111]),
+    ("P", [0b111, 0b101, 0b111, 0b100, 0b100]),
+    ("R", [0b111, 0b101, 0b111, 0b110, 0b101]),
+    ("S", [0b111, 0b100, 0b111, 0b001, 0b111]),
+    ("T", [0b111, 0b010, 0b010, 0b010, 0b010]),
+    ("U", [0b101, 0b101, 0b101, 0b101, 0b111]),
+    ("V", [0b101, 0b101, 0b101, 0b101, 0b010]),
+    ("W", [0b101, 0b101, 0b111, 0b111, 0b101]),
+    ("X", [0b101, 0b101, 0b010, 0b101, 0b101]),
+    ("Y", [0b101, 0b101, 0b010, 0b010, 0b010]),
+    ("Z", [0b111, 0b001, 0b010, 0b100, 0b111]),
+    (" ", [0b000, 0b000, 0b000, 0b000, 0b000]),
+    (".", [0b000, 0b000, 0b000, 0b000, 0b010]),
+    (":", [0b010, 0b010, 0b000, 0b010, 0b010]),
+];
+
+#[cfg(feature = "torch")]
+fn viz_glyph(ch: char) -> &'static [u8; 5] {
+    let upper = ch.to_uppercase().next().unwrap_or(ch);
+    let s = upper.to_string();
+    VIZ_FONT
+        .iter()
+        .find(|(name, _)| *name == s)
+        .map(|(_, g)| g)
+        .unwrap_or(&[0b111, 0b101, 0b101, 0b101, 0b111])
+}
+
+#[cfg(feature = "torch")]
+fn viz_put_pixel(img: &mut image::RgbImage, x: i64, y: i64, c: [u8; 3]) {
+    if x >= 0 && y >= 0 && (x as u32) < img.width() && (y as u32) < img.height() {
+        img.put_pixel(x as u32, y as u32, image::Rgb(c));
+    }
+}
+
+#[cfg(feature = "torch")]
+fn viz_hline(img: &mut image::RgbImage, x1: i64, x2: i64, y: i64, c: [u8; 3], t: i64) {
+    for dy in 0..t {
+        for x in x1.min(x2)..=x2.max(x1) {
+            viz_put_pixel(img, x, y + dy, c);
+        }
+    }
+}
+
+#[cfg(feature = "torch")]
+fn viz_vline(img: &mut image::RgbImage, x: i64, y1: i64, y2: i64, c: [u8; 3], t: i64) {
+    for dx in 0..t {
+        for y in y1.min(y2)..=y2.max(y1) {
+            viz_put_pixel(img, x + dx, y, c);
+        }
+    }
+}
+
+#[cfg(feature = "torch")]
+fn viz_text(img: &mut image::RgbImage, x: i64, y: i64, text: &str, scale: i64, c: [u8; 3]) {
+    for (i, ch) in text.chars().enumerate() {
+        let glyph = viz_glyph(ch);
+        let gx = x + i as i64 * 4 * scale;
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..3 {
+                if bits & (0b100 >> col) != 0 {
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            viz_put_pixel(
+                                img,
+                                gx + col * scale + dx,
+                                y + row as i64 * scale + dy,
+                                c,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 把检测/分类结果画到原图并存盘（`--save-viz`）。检测：框（按类着色，2px）
+/// + 黑底标签 `C<id> <score>`；分类：左上角列出前 3 个预测。
+#[cfg(feature = "torch")]
+fn save_viz_image(input: &Path, result: &serde_json::Value, dir: &Path) -> Result<PathBuf> {
+    let img = image::open(input)
+        .map_err(|e| anyhow::anyhow!("读图失败 {}: {e}", input.display()))?
+        .to_rgb8();
+    let mut img = img;
+    match result.get("task").and_then(|v| v.as_str()) {
+        Some("detect") | Some("obb") => {
+            if let Some(dets) = result.get("detections").and_then(|v| v.as_array()) {
+                for d in dets {
+                    let (Some(bbox), Some(class_id)) =
+                        (d.get("bbox"), d.get("class_id").and_then(|v| v.as_u64()))
+                    else {
+                        continue;
+                    };
+                    let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
+                        bbox.get("x1").and_then(|v| v.as_f64()),
+                        bbox.get("y1").and_then(|v| v.as_f64()),
+                        bbox.get("x2").and_then(|v| v.as_f64()),
+                        bbox.get("y2").and_then(|v| v.as_f64()),
+                    ) else {
+                        continue;
+                    };
+                    let color = VIZ_PALETTE[(class_id as usize) % VIZ_PALETTE.len()];
+                    let (x1, y1, x2, y2) = (x1 as i64, y1 as i64, x2 as i64, y2 as i64);
+                    viz_hline(&mut img, x1, x2 + 2, y1, color, 2);
+                    viz_hline(&mut img, x1, x2 + 2, y2, color, 2);
+                    viz_vline(&mut img, x1, y1, y2 + 2, color, 2);
+                    viz_vline(&mut img, x2, y1, y2 + 2, color, 2);
+                    let score = d.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let tag = format!("C{class_id} {score:.2}");
+                    let (tw, th) = (tag.len() as i64 * 8 + 2, 12);
+                    for dy in 0..th {
+                        for dx in 0..tw {
+                            viz_put_pixel(&mut img, x1 + dx, y1 - th + dy, [0, 0, 0]);
+                        }
+                    }
+                    viz_text(&mut img, x1 + 1, y1 - th + 2, &tag, 2, color);
+                }
+            }
+        }
+        Some("classify") => {
+            if let Some(preds) = result.get("predictions").and_then(|v| v.as_array()) {
+                for (i, p) in preds.iter().take(3).enumerate() {
+                    let class_id = p.get("class_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let prob = p.get("prob").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let tag = format!("C{class_id} {prob:.2}");
+                    viz_text(&mut img, 4, 4 + i as i64 * 12, &tag, 2, VIZ_PALETTE[i % 8]);
+                }
+            }
+        }
+        _ => {}
+    }
+    std::fs::create_dir_all(dir)?;
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("viz")
+        .to_string();
+    let out = dir.join(format!("{stem}.jpg"));
+    img.save_with_format(&out, image::ImageFormat::Jpeg)?;
+    Ok(out)
+}
+
 #[cfg(not(feature = "torch"))]
-#[allow(clippy::too_many_arguments)]
 fn cmd_infer(
-    _weights: &PathBuf,
+    _weights: &Path,
     _config: Option<&std::path::Path>,
-    _input: &PathBuf,
+    _input: &Path,
     _conf: f32,
     _iou: f32,
     _slice: bool,
     _slice_window: u32,
     _slice_overlap: f32,
+    _save_viz: Option<&Path>,
 ) -> Result<()> {
     bail!("本二进制未启用 torch feature（--features torch），无法推理")
 }
 
 #[cfg(feature = "torch")]
-fn cmd_eval(weights: &PathBuf, report: Option<&std::path::Path>) -> Result<()> {
+fn cmd_eval(weights: &Path, report: Option<&std::path::Path>) -> Result<()> {
     let cfg = resolve_config_for_weights(weights, None)?;
     let result = av_runtime::engine::eval(&cfg, weights).map_err(anyhow::Error::from)?;
     let text = serde_json::to_string_pretty(&result)?;
@@ -315,18 +495,14 @@ fn cmd_eval(weights: &PathBuf, report: Option<&std::path::Path>) -> Result<()> {
 }
 
 #[cfg(all(feature = "torch", feature = "panel"))]
-fn cmd_export(
-    weights: &PathBuf,
-    format: &str,
-    out: Option<&std::path::Path>,
-) -> Result<()> {
+fn cmd_export(weights: &Path, format: &str, out: Option<&std::path::Path>) -> Result<()> {
     let out_path = match out {
         Some(p) => p.to_path_buf(),
         None => {
             let stem = weights
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .context("权重路径无文件名")?;
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .context("权重路径无文件名")?;
             weights
                 .parent()
                 .context("权重路径无父目录")?
@@ -338,42 +514,37 @@ fn cmd_export(
     let mut vs = tch::nn::VarStore::new(tch::Device::Cpu);
     let _model = av_tasks::models::build_model(&vs.root(), &cfg).map_err(anyhow::Error::from)?;
     av_runtime::engine::load_checkpoint_dir(&mut vs, weights).map_err(anyhow::Error::from)?;
-    av_runtime::engine::export_checkpoint(&vs, &out_path, format)
-        .map_err(anyhow::Error::from)?;
+    av_runtime::engine::export_checkpoint(&vs, &out_path, format).map_err(anyhow::Error::from)?;
     println!("导出完成 ✔ {} ({})", out_path.display(), format);
     Ok(())
 }
 
 #[cfg(not(all(feature = "torch", feature = "panel")))]
-fn cmd_export(
-    _weights: &PathBuf,
-    _format: &str,
-    _out: Option<&std::path::Path>,
-) -> Result<()> {
+fn cmd_export(_weights: &Path, _format: &str, _out: Option<&std::path::Path>) -> Result<()> {
     bail!("本二进制未启用 torch feature，无法导出")
 }
 
 #[cfg(all(feature = "panel", feature = "torch"))]
-fn cmd_panel(port: u16, runs_dir: &PathBuf) -> Result<()> {
+fn cmd_panel(port: u16, runs_dir: &Path) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().context("创建 tokio 运行时失败")?;
     rt.block_on(async move {
-        av_runtime::panel::serve(runs_dir.clone(), port)
+        av_runtime::panel::serve(runs_dir.to_path_buf(), port)
             .await
             .map_err(anyhow::Error::from)
     })
 }
 
 #[cfg(not(all(feature = "panel", feature = "torch")))]
-fn cmd_panel(_port: u16, _runs_dir: &PathBuf) -> Result<()> {
+fn cmd_panel(_port: u16, _runs_dir: &Path) -> Result<()> {
     bail!("面板需要构建时启用 panel + torch feature（默认已启用）")
 }
 
 #[cfg(not(feature = "torch"))]
-fn cmd_eval(_weights: &PathBuf, _report: Option<&std::path::Path>) -> Result<()> {
+fn cmd_eval(_weights: &Path, _report: Option<&std::path::Path>) -> Result<()> {
     bail!("本二进制未启用 torch feature（--features torch），无法评测")
 }
 
-fn load_config(config_path: &PathBuf) -> Result<av_core::config::RunConfig> {
+fn load_config(config_path: &Path) -> Result<av_core::config::RunConfig> {
     if !config_path.exists() {
         bail!(
             "配置文件不存在: {}\n  原因：路径拼写错误，或当前工作目录不是工作区根目录\n  下一步：运行 av init --task detect --data <数据目录> 自动生成最小配置；或直接用开箱即训的 configs/quick_detect.toml（合成数据）",
@@ -384,10 +555,7 @@ fn load_config(config_path: &PathBuf) -> Result<av_core::config::RunConfig> {
         .with_context(|| format!("读取配置 {}", config_path.display()))
 }
 
-fn apply_overrides(
-    cfg: &mut av_core::config::RunConfig,
-    overrides: &[String],
-) -> Result<()> {
+fn apply_overrides(cfg: &mut av_core::config::RunConfig, overrides: &[String]) -> Result<()> {
     for ov in overrides {
         let (k, v) = ov.split_once('=').with_context(|| {
             format!(
@@ -429,7 +597,8 @@ fn print_run_plan(cfg: &av_core::config::RunConfig) {
     println!(
         "  数据源     = {}",
         match cfg.data.pipeline {
-            av_core::config::DataPipeline::Synthetic => "synthetic（内置合成，开箱即训）".to_string(),
+            av_core::config::DataPipeline::Synthetic =>
+                "synthetic（内置合成，开箱即训）".to_string(),
             av_core::config::DataPipeline::AvPack => "avpack".to_string(),
             av_core::config::DataPipeline::Dir => "dir".to_string(),
         }
@@ -438,7 +607,7 @@ fn print_run_plan(cfg: &av_core::config::RunConfig) {
 
 #[cfg(feature = "torch")]
 fn resolve_config_for_weights(
-    weights: &PathBuf,
+    weights: &Path,
     explicit: Option<&std::path::Path>,
 ) -> Result<av_core::config::RunConfig> {
     let path = match explicit {
@@ -503,7 +672,11 @@ fn scan_max_class_id(labels_dir: &Path) -> Option<u32> {
             continue;
         };
         for line in text.lines() {
-            if let Some(cls) = line.split_whitespace().next().and_then(|t| t.parse::<u32>().ok()) {
+            if let Some(cls) = line
+                .split_whitespace()
+                .next()
+                .and_then(|t| t.parse::<u32>().ok())
+            {
                 max = Some(max.map_or(cls, |m: u32| m.max(cls)));
             }
         }
@@ -787,8 +960,7 @@ fn cmd_init(
 
     let out_display = out_path.display().to_string();
     let toml = build_init_toml(task, data, layout, num_classes, &out_display);
-    fs::write(&out_path, &toml)
-        .with_context(|| format!("写出配置 {}", out_path.display()))?;
+    fs::write(&out_path, &toml).with_context(|| format!("写出配置 {}", out_path.display()))?;
 
     println!("已生成最小配置 {}", out_path.display());
     match data {
@@ -803,7 +975,11 @@ fn cmd_init(
             },
             num_classes
         ),
-        None => println!("  任务 = {}，数据 = 内置合成源，类别数 = {}", task.as_str(), num_classes),
+        None => println!(
+            "  任务 = {}，数据 = 内置合成源，类别数 = {}",
+            task.as_str(),
+            num_classes
+        ),
     }
     println!(
         "下一步：av train -c {} --dry-run   # 先校验；去掉 --dry-run 开始训练",
@@ -839,7 +1015,10 @@ fn preflight_data_check(cfg: &RunConfig) -> Result<()> {
     let train_split = cfg.data.sources.train.split.as_deref().unwrap_or("train");
     match cfg.model.tasks.first() {
         Some(TaskCfg::Classify(c)) => {
-            let Some(root) = c.data_dir.clone().or_else(|| cfg.data.sources.train.dir.clone())
+            let Some(root) = c
+                .data_dir
+                .clone()
+                .or_else(|| cfg.data.sources.train.dir.clone())
             else {
                 return Ok(()); // validate 层已拦截缺 dir 的配置
             };
@@ -897,11 +1076,7 @@ mod init_tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "av-init-test-{}-{}",
-            std::process::id(),
-            tag
-        ));
+        let d = std::env::temp_dir().join(format!("av-init-test-{}-{}", std::process::id(), tag));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -984,7 +1159,10 @@ mod init_tests {
             80,
             "x.toml",
         );
-        assert!(RunConfig::from_toml_str(&t).is_ok(), "反斜杠路径破坏 TOML:\n{t}");
+        assert!(
+            RunConfig::from_toml_str(&t).is_ok(),
+            "反斜杠路径破坏 TOML:\n{t}"
+        );
     }
 
     #[test]
@@ -1006,8 +1184,11 @@ mod init_tests {
         let d = temp_dir("yolo");
         touch(&d.join("images/train/a.jpg"));
         touch(&d.join("labels/train/a.txt"));
-        fs::write(d.join("labels/train/a.txt"), b"3 0.5 0.5 0.1 0.1\n7 0.1 0.1 0.1 0.1\n")
-            .unwrap();
+        fs::write(
+            d.join("labels/train/a.txt"),
+            b"3 0.5 0.5 0.1 0.1\n7 0.1 0.1 0.1 0.1\n",
+        )
+        .unwrap();
         assert_eq!(detect_data_layout(&d), DataLayout::YoloDir);
         assert_eq!(auto_class_count(InitTask::Detect, &d), Some(8));
 
@@ -1034,7 +1215,10 @@ mod init_tests {
         )
         .unwrap();
         let err = preflight_data_check(&cfg).unwrap_err().to_string();
-        assert!(err.contains("数据目录不存在") && err.contains("下一步"), "{err}");
+        assert!(
+            err.contains("数据目录不存在") && err.contains("下一步"),
+            "{err}"
+        );
 
         // 类数不匹配：标注最大 id 7（需 8 类）> num_classes 2 → 拦截
         let d = temp_dir("mismatch");
@@ -1047,7 +1231,10 @@ mod init_tests {
         );
         let cfg = RunConfig::from_toml_str(&toml).unwrap();
         let err = preflight_data_check(&cfg).unwrap_err().to_string();
-        assert!(err.contains("类数不匹配") && err.contains("num_classes 改为 >= 8"), "{err}");
+        assert!(
+            err.contains("类数不匹配") && err.contains("num_classes 改为 >= 8"),
+            "{err}"
+        );
 
         // 类数一致 → 放行
         let toml = toml.replace("num_classes=2", "num_classes=8");

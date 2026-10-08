@@ -83,8 +83,7 @@ impl RunConfig {
         if self.train.optimizer.lr <= 0.0 {
             return Err(AvError::config("train.optimizer.lr 必须 > 0"));
         }
-        if !(0.0 < self.train.scheduler.lr_min_factor
-            && self.train.scheduler.lr_min_factor <= 1.0)
+        if !(0.0 < self.train.scheduler.lr_min_factor && self.train.scheduler.lr_min_factor <= 1.0)
         {
             return Err(AvError::config(
                 "train.scheduler.lr_min_factor 需在 (0, 1] 区间",
@@ -126,7 +125,14 @@ impl RunConfig {
                 DataPipeline::Synthetic => {}
             }
         }
-        for st in self.data.sources.train.tasks.iter().chain(&self.data.sources.val.tasks) {
+        for st in self
+            .data
+            .sources
+            .train
+            .tasks
+            .iter()
+            .chain(&self.data.sources.val.tasks)
+        {
             if let Some([lo, hi]) = st.augment.scale_jitter {
                 if lo <= 0.0 || lo > hi {
                     return Err(AvError::config(
@@ -167,8 +173,7 @@ impl RunConfig {
 
     /// 最终生效配置的 TOML 快照（训练启动时写入 runs/<run_id>/config.snapshot.toml）。
     pub fn snapshot_toml(&self) -> AvResult<String> {
-        toml::to_string_pretty(self)
-            .map_err(|e| AvError::config(format!("配置序列化失败: {e}")))
+        toml::to_string_pretty(self).map_err(|e| AvError::config(format!("配置序列化失败: {e}")))
     }
 }
 
@@ -315,7 +320,11 @@ impl TaskCfg {
                 check_weight(c.loss_weight)
             }
             TaskCfg::Keypoint(c) => {
-                check_one_of("keypoint.decode", &c.decode, &["heatmap", "simdr", "direct"])?;
+                check_one_of(
+                    "keypoint.decode",
+                    &c.decode,
+                    &["heatmap", "simdr", "direct"],
+                )?;
                 if c.num_keypoints == 0 {
                     return Err(AvError::config("keypoint.num_keypoints 必须 >= 1"));
                 }
@@ -337,7 +346,7 @@ impl TaskCfg {
 }
 
 fn check_img_size(s: u32) -> AvResult<()> {
-    if s < 32 || s % 32 != 0 {
+    if s < 32 || !s.is_multiple_of(32) {
         return Err(AvError::config("img_size 必须 >= 32 且为 32 的倍数"));
     }
     Ok(())
@@ -548,20 +557,11 @@ pub enum DataPipeline {
     Synthetic,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DataSources {
     pub train: DataSourceCfg,
     pub val: DataSourceCfg,
-}
-
-impl Default for DataSources {
-    fn default() -> Self {
-        Self {
-            train: DataSourceCfg::default(),
-            val: DataSourceCfg::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

@@ -1,0 +1,87 @@
+# configs/glass_logo.toml —— 玻璃 logo 小目标检测（工业相机 5472×3648 大图）
+#
+# 数据：D:\Dev\Projects\AI\任务\glass-logo-yolo26\datasets\glass_logo
+#（YOLO 格式 3 类：DJMC/JMC/ford，train 1296 / val 144，每图约 1 实例，
+#  目标占图幅 1-4%）。data/glass_logo_2560 为长边 2560 的工作副本——
+#  detect 训练管线全集原始像素驻留内存（原图约 77GB 不可行；2560 = 训练
+#  分辨率 1280 的 2 倍，给 mosaic/scale_jitter 留缩放余量，坐标归一化不受影响）。
+# 用法：av train -c configs/glass_logo.toml
+run_id = "glass-logo-v4"
+seed = 3
+device = "cuda:0"                  # 无 CUDA 自动回退 CPU
+output_dir = "runs"
+
+[model.backbone]
+family = "csp-elan"                # YOLOv8 同构骨干（nano 形状 0.25/0.33 匹配 yolov8n 权重）
+depth = 0.33
+width = 0.25
+pretrained = "none"
+imagenet_norm = false
+
+[model.neck]
+type = "identity"
+channels = []
+
+[[model.tasks]]
+kind = "detect"
+head = "yolo"
+loss_weight = 1.0
+assigner = "tal"
+obb_mode = false
+num_classes = 3
+img_size = 1280                    # 目标在 640 下仅 7-14px，1280 下 14-28px 才可学
+loss_cls_weight = 1.0
+loss_ciou_weight = 5.0
+loss_dfl_weight = 1.5
+head_levels = [8, 16]
+
+[data]
+pipeline = "dir"
+workers = 1
+prefetch = 1
+
+[data.sources.train]
+dir = "D:/Dev/Projects/AI/任务/glass-logo-yolo26/datasets/glass_logo"
+split = "train"
+
+[[data.sources.train.tasks]]
+kind = "detect"
+format = "yolo"
+
+[data.sources.train.tasks.augment]
+mosaic = 1.0
+mixup = 0.0
+flip = 0.5
+hsv = [0.1, 0.1, 0.1]
+scale_jitter = [0.9, 1.1]
+close_last_epochs = 15             # 尾段关增强，收敛到干净分布
+
+[data.sources.val]
+dir = "D:/Dev/Projects/AI/任务/glass-logo-yolo26/datasets/glass_logo"
+split = "val"
+
+[train]
+epochs = 100
+batch_size = 8
+optimizer = { type = "adamw", lr = 1e-3, weight_decay = 1e-4 }
+warmup_epochs = 5
+scheduler = { type = "cosine", lr_min_factor = 0.01 }
+amp = true
+deterministic = false
+ema_decay = 0.999
+grad_clip = 10.0
+
+[eval]
+interval_epochs = 5
+protocols = ["coco-map"]
+
+[pretrain]
+enable = true
+weight_path = "data/pretrain/yolov8n_backbone_full.safetensors"   # 官方 yolov8n 完整骨干（162 张量）
+layer_map = "configs/cspelan_yolov8n_map.toml"               # 单条前缀映射 model.* → backbone.*
+load_only_backbone = true
+freeze_backbone = false
+
+[panel]
+enabled = false
+port = 8080

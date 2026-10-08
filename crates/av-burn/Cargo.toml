@@ -32,3 +32,8 @@ burn-ndarray = "0.21.0"
 burn-autodiff = "0.21.0"
 # wgpu = GPU 编译验证（经 av-burn 的 wgpu feature 打开）。
 burn-wgpu = { version = "0.21.0", optional = true }
+
+# bench_csp640 只在 wgpu feature 下可编译（用到 burn_wgpu / wgpu_check 模块）
+[[example]]
+name = "bench_csp640"
+required-features = ["wgpu"]

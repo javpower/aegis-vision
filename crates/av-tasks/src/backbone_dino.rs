@@ -33,7 +33,7 @@ use tch::{IndexOp, Kind, Tensor};
 
 use av_core::config::BackboneCfg;
 use av_core::error::{AvError, AvResult};
-use av_core::traits::{BaseBackbone, BackboneSpec, FeatureMap, FeaturePyramid, LevelSpec};
+use av_core::traits::{BackboneSpec, BaseBackbone, FeatureMap, FeaturePyramid, LevelSpec};
 
 pub const FAMILY_NAME: &str = "dinov2";
 
@@ -181,7 +181,6 @@ pub struct DinoV2Backbone {
     conv_s8: nn::Conv2D,
     conv_s16: nn::Conv2D,
     conv_s32: nn::Conv2D,
-    img_size: i64,
     grid_side: i64,
 }
 
@@ -215,10 +214,27 @@ impl DinoV2Backbone {
                 .map(|i| Block::new(p / "blocks" / i, EMBED_DIM, NUM_HEADS))
                 .collect(),
             norm: nn::layer_norm(p / "norm", vec![EMBED_DIM], ln_config()),
-            conv_s8: nn::conv2d(p / "pyramid" / "stride8", EMBED_DIM, PYRAMID_CHANNELS, 3, cc),
-            conv_s16: nn::conv2d(p / "pyramid" / "stride16", EMBED_DIM, PYRAMID_CHANNELS, 3, cc),
-            conv_s32: nn::conv2d(p / "pyramid" / "stride32", EMBED_DIM, PYRAMID_CHANNELS, 3, cc),
-            img_size: img,
+            conv_s8: nn::conv2d(
+                p / "pyramid" / "stride8",
+                EMBED_DIM,
+                PYRAMID_CHANNELS,
+                3,
+                cc,
+            ),
+            conv_s16: nn::conv2d(
+                p / "pyramid" / "stride16",
+                EMBED_DIM,
+                PYRAMID_CHANNELS,
+                3,
+                cc,
+            ),
+            conv_s32: nn::conv2d(
+                p / "pyramid" / "stride32",
+                EMBED_DIM,
+                PYRAMID_CHANNELS,
+                3,
+                cc,
+            ),
             grid_side,
         })
     }
@@ -265,12 +281,7 @@ impl DinoV2Backbone {
         let patch_pos = patch_pos
             .reshape([1, sqrt_n as i64, sqrt_n as i64, dim])
             .permute([0, 3, 1, 2])
-            .upsample_bicubic2d(
-                [w0 as i64, h0 as i64],
-                false,
-                w0 / sqrt_n,
-                h0 / sqrt_n,
-            )
+            .upsample_bicubic2d([w0 as i64, h0 as i64], false, w0 / sqrt_n, h0 / sqrt_n)
             .permute([0, 2, 3, 1])
             .reshape([1, -1, dim]);
         Tensor::cat(&[&class_pos, &patch_pos], 1)
@@ -289,10 +300,12 @@ impl DinoV2Backbone {
     /// reshape 在 permute 后的非连续视图上会隐式拷贝（torch reshape 语义）。
     fn patch_grid(&self, tokens: &Tensor) -> Tensor {
         let b = tokens.size()[0];
-        tokens
-            .i((.., 1..))
-            .permute([0, 2, 1])
-            .reshape([b, EMBED_DIM, self.grid_side, self.grid_side])
+        tokens.i((.., 1..)).permute([0, 2, 1]).reshape([
+            b,
+            EMBED_DIM,
+            self.grid_side,
+            self.grid_side,
+        ])
     }
 
     // -----------------------------------------------------------------------
@@ -339,7 +352,9 @@ impl DinoV2Backbone {
         for (src_name, src) in sources {
             match map_source_name(&src_name) {
                 Mapped::Skipped(reason) => {
-                    stats.skipped_unrecognized.push(format!("{src_name}（{reason}）"));
+                    stats
+                        .skipped_unrecognized
+                        .push(format!("{src_name}（{reason}）"));
                 }
                 Mapped::Qkv { layer, part, bias } => {
                     let store = if bias { &mut qkv_b } else { &mut qkv_w };
@@ -508,7 +523,10 @@ fn map_source_name(src: &str) -> Mapped {
     if n == "cls_token" || n == "embeddings.cls_token" {
         return Mapped::Direct("cls_token".into());
     }
-    if matches!(n, "pos_embed" | "position_embedding" | "embeddings.position_embeddings") {
+    if matches!(
+        n,
+        "pos_embed" | "position_embedding" | "embeddings.position_embeddings"
+    ) {
         return Mapped::Direct("pos_embed".into());
     }
     if n == "mask_token" || n == "embeddings.mask_token" {
@@ -547,8 +565,20 @@ fn map_source_name(src: &str) -> Mapped {
         for (part, name) in [(0u8, "query"), (1u8, "key"), (2u8, "value")] {
             if let Some(t) = sub.strip_prefix(&format!("attention.attention.{name}.")) {
                 match t {
-                    "weight" => return Mapped::Qkv { layer, part, bias: false },
-                    "bias" => return Mapped::Qkv { layer, part, bias: true },
+                    "weight" => {
+                        return Mapped::Qkv {
+                            layer,
+                            part,
+                            bias: false,
+                        }
+                    }
+                    "bias" => {
+                        return Mapped::Qkv {
+                            layer,
+                            part,
+                            bias: true,
+                        }
+                    }
                     _ => return Mapped::Skipped("无法识别的 QKV 子张量"),
                 }
             }
@@ -741,7 +771,7 @@ mod tests {
         let vs = nn::VarStore::new(tch::Device::Cpu);
         let cfg = BackboneCfg::default();
         let mut backbone = DinoV2Backbone::new(&vs.root(), &cfg, 224).unwrap(); // 16×16 网格
-        // 构造默认 pos_embed 零初始化（零插值仍是零，测不出变化），先随机化
+                                                                                // 构造默认 pos_embed 零初始化（零插值仍是零，测不出变化），先随机化
         let rand = Tensor::randn(
             backbone.pos_embed.size(),
             (tch::Kind::Float, tch::Device::Cpu),
@@ -856,8 +886,14 @@ mod tests {
             map_source_name("embeddings.mask_token"),
             Mapped::Skipped(_)
         ));
-        assert!(matches!(map_source_name("register_tokens"), Mapped::Skipped(_)));
-        assert!(matches!(map_source_name("head.fc.weight"), Mapped::Skipped(_)));
+        assert!(matches!(
+            map_source_name("register_tokens"),
+            Mapped::Skipped(_)
+        ));
+        assert!(matches!(
+            map_source_name("head.fc.weight"),
+            Mapped::Skipped(_)
+        ));
     }
 
     /// 用一个极小合成 safetensors 走一遍融合 QKV 与形状不符跳过路径
@@ -870,9 +906,8 @@ mod tests {
         let mut backbone = DinoV2Backbone::new(&vs.root(), &cfg, 224).unwrap();
 
         // 构造 layer 0 的源张量（q/k/v 拆分 + 一个形状不符项）
-        let mk = |v: f64, shape: &[i64]| {
-            Tensor::ones(shape, (tch::Kind::Float, tch::Device::Cpu)) * v
-        };
+        let mk =
+            |v: f64, shape: &[i64]| Tensor::ones(shape, (tch::Kind::Float, tch::Device::Cpu)) * v;
         let dir =
             std::env::temp_dir().join(format!("av-dino-test-{}.safetensors", std::process::id()));
         let entries: Vec<(&str, Tensor)> = vec![
@@ -880,11 +915,26 @@ mod tests {
                 "encoder.layer.0.attention.attention.query.weight",
                 mk(1.0, &[dim, dim]),
             ),
-            ("encoder.layer.0.attention.attention.key.weight", mk(2.0, &[dim, dim])),
-            ("encoder.layer.0.attention.attention.value.weight", mk(3.0, &[dim, dim])),
-            ("encoder.layer.0.attention.attention.query.bias", mk(4.0, &[dim])),
-            ("encoder.layer.0.attention.attention.key.bias", mk(5.0, &[dim])),
-            ("encoder.layer.0.attention.attention.value.bias", mk(6.0, &[dim])),
+            (
+                "encoder.layer.0.attention.attention.key.weight",
+                mk(2.0, &[dim, dim]),
+            ),
+            (
+                "encoder.layer.0.attention.attention.value.weight",
+                mk(3.0, &[dim, dim]),
+            ),
+            (
+                "encoder.layer.0.attention.attention.query.bias",
+                mk(4.0, &[dim]),
+            ),
+            (
+                "encoder.layer.0.attention.attention.key.bias",
+                mk(5.0, &[dim]),
+            ),
+            (
+                "encoder.layer.0.attention.attention.value.bias",
+                mk(6.0, &[dim]),
+            ),
             // 形状不符（正确为 [4*dim, dim]）→ 应被跳过并记录
             ("encoder.layer.1.mlp.fc1.weight", mk(7.0, &[dim, dim])),
         ];
@@ -906,7 +956,10 @@ mod tests {
         assert!((fused_b.double_value(&[dim]) - 5.0).abs() < 1e-6);
         assert_eq!(stats.loaded, 2); // qkv.weight + qkv.bias（fc1 形状不符跳过）
         assert_eq!(stats.expected, 3);
-        assert_eq!(stats.skipped_shape_mismatch, vec!["blocks.1.mlp.fc1.weight"]);
+        assert_eq!(
+            stats.skipped_shape_mismatch,
+            vec!["blocks.1.mlp.fc1.weight"]
+        );
         assert_eq!(stats.sources_total, entries.len() as usize);
         assert!(stats.load_ratio() < 0.9);
         let _ = std::fs::remove_file(&dir);
