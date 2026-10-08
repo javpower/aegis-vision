@@ -229,6 +229,9 @@ enum DetectBackbone {
     SimpleCnn(SimpleCnnBackbone),
     ResNet18(ResNetBackbone),
     CspElan(CspElanBackbone),
+    /// DINOv2：ViTDet 式 stride 8/16/32 金字塔（×256 conv 分支随机初始化随
+    /// 检测训练）；img_size 须为 448 的倍数（14×32），见 DinoV2Backbone::new。
+    DinoV2(DinoV2Backbone),
 }
 
 impl DetectBackbone {
@@ -236,6 +239,7 @@ impl DetectBackbone {
         match self {
             Self::SimpleCnn(b) => b.forward_features(x),
             Self::ResNet18(b) => b.forward_features(x),
+            Self::DinoV2(b) => b.forward_features(x),
             Self::CspElan(b) => b.forward_features(x),
         }
     }
@@ -244,16 +248,19 @@ impl DetectBackbone {
         match self {
             Self::SimpleCnn(b) => b.stride_channels(stride),
             Self::ResNet18(b) => b.stride_channels(stride),
+            Self::DinoV2(b) => b.stride_channels(stride),
             Self::CspElan(b) => b.stride_channels(stride),
         }
     }
 
     /// BN train/eval 装配开关：resnet18 / csp-elan → BatchNorm train 语义
-    /// （批统计 + running 更新）；simple-cnn 无 train 态 BN，no-op。
+    /// （批统计 + running 更新）；simple-cnn 无 train 态 BN、dino 为 LayerNorm
+    /// （无 BN），no-op。
     fn set_train(&self, train: bool) {
         match self {
             Self::SimpleCnn(_) => {}
             Self::ResNet18(b) => b.set_train(train),
+            Self::DinoV2(_) => {}
             Self::CspElan(b) => b.set_train(train),
         }
     }
@@ -262,13 +269,18 @@ impl DetectBackbone {
 /// 检测骨干装配：按 `backbone.family` 分发（"resnet18" → ResNetBackbone，
 /// 其余维持 simple-cnn 既有行为）。层名 = torchvision 名 + `backbone.` 前缀，
 /// 预训练导入走引擎通用 [pretrain] 通道（load_only_backbone 同语义命中）。
+/// dino 侧 img_size 须为 448 的倍数（14×32），由任务 cfg 提供。
 fn build_detect_backbone(
     p: &nn::Path,
     cfg: &av_core::config::BackboneCfg,
+    img_size: u32,
 ) -> AvResult<DetectBackbone> {
     match cfg.family.as_str() {
         RESNET_FAMILY => Ok(DetectBackbone::ResNet18(ResNetBackbone::new(p, cfg)?)),
         CSP_FAMILY => Ok(DetectBackbone::CspElan(CspElanBackbone::new(p, cfg)?)),
+        DINO_FAMILY => Ok(DetectBackbone::DinoV2(DinoV2Backbone::new(
+            p, cfg, img_size,
+        )?)),
         _ => Ok(DetectBackbone::SimpleCnn(SimpleCnnBackbone::new(p, cfg))),
     }
 }
@@ -387,13 +399,70 @@ pub struct SegModel {
 
 /// 关键点模型（PLAN §4.4，直接回归档）：骨干 + KeypointHead（stride 8）。
 pub struct KeypointModel {
-    backbone: SimpleCnnBackbone,
+    backbone: KeypointBackbone,
     head: KeypointHead,
     img_size: u32,
     /// 任务级损失总权重（KeypointCfg.loss_weight）
     loss_weight: f64,
     /// OKS 损失项权重（KeypointCfg.loss_oks_weight）
     loss_w_oks: f64,
+}
+
+/// 关键点骨干（消费 stride 8 特征）：此前硬编码 simple-cnn、无视
+/// `backbone.family`；现在四骨干可选（dino 的 stride 8 来自 ViTDet 式金字塔
+/// conv 分支，随机初始化随任务训练）。
+enum KeypointBackbone {
+    SimpleCnn(SimpleCnnBackbone),
+    ResNet18(ResNetBackbone),
+    CspElan(CspElanBackbone),
+    DinoV2(DinoV2Backbone),
+}
+
+impl KeypointBackbone {
+    fn forward_features(&self, x: &Tensor) -> AvResult<av_core::traits::FeaturePyramid> {
+        match self {
+            Self::SimpleCnn(b) => b.forward_features(x),
+            Self::ResNet18(b) => b.forward_features(x),
+            Self::DinoV2(b) => b.forward_features(x),
+            Self::CspElan(b) => b.forward_features(x),
+        }
+    }
+
+    fn stride_channels(&self, stride: u32) -> AvResult<i64> {
+        match self {
+            Self::SimpleCnn(b) => b.stride_channels(stride),
+            Self::ResNet18(b) => b.stride_channels(stride),
+            Self::DinoV2(b) => b.stride_channels(stride),
+            Self::CspElan(b) => b.stride_channels(stride),
+        }
+    }
+
+    /// simple-cnn / dino（LayerNorm）无 train 态 BN，no-op。
+    fn set_train(&self, train: bool) {
+        match self {
+            Self::SimpleCnn(_) => {}
+            Self::ResNet18(b) => b.set_train(train),
+            Self::DinoV2(_) => {}
+            Self::CspElan(b) => b.set_train(train),
+        }
+    }
+}
+
+/// 关键点骨干装配：按 `backbone.family` 分发（dino 侧 img_size 须为 448 的
+/// 倍数，见 DinoV2Backbone::new 校验）。
+fn build_keypoint_backbone(
+    p: &nn::Path,
+    cfg: &av_core::config::BackboneCfg,
+    img_size: u32,
+) -> AvResult<KeypointBackbone> {
+    match cfg.family.as_str() {
+        RESNET_FAMILY => Ok(KeypointBackbone::ResNet18(ResNetBackbone::new(p, cfg)?)),
+        CSP_FAMILY => Ok(KeypointBackbone::CspElan(CspElanBackbone::new(p, cfg)?)),
+        DINO_FAMILY => Ok(KeypointBackbone::DinoV2(DinoV2Backbone::new(
+            p, cfg, img_size,
+        )?)),
+        _ => Ok(KeypointBackbone::SimpleCnn(SimpleCnnBackbone::new(p, cfg))),
+    }
 }
 
 /// 单图关键点实例数上限（conf 过低时防解码爆炸，同 MAX_SEGS_PER_IMAGE）。
@@ -464,7 +533,7 @@ pub fn build_model(p: &nn::Path, cfg: &RunConfig) -> AvResult<TaskModel> {
             let head_levels = validate_head_levels(&d.head_levels)?;
             // 骨干按 family 分发（"resnet18" → ResNetBackbone；ImageNet 权重经
             // 引擎 [pretrain] + resnet18_map 通道导入，见 build_detect_backbone）
-            let backbone = build_detect_backbone(&(p / "backbone"), &backbone_cfg)?;
+            let backbone = build_detect_backbone(&(p / "backbone"), &backbone_cfg, d.img_size)?;
             // 每层通道数由骨干 stride → 通道映射给出（P2 = stride_channels(4)；
             // resnet18 = 64/128/256，simple-cnn 按宽度缩放）
             let channels: AvResult<Vec<i64>> = head_levels
@@ -531,7 +600,7 @@ pub fn build_model(p: &nn::Path, cfg: &RunConfig) -> AvResult<TaskModel> {
                     k.decode
                 )));
             }
-            let backbone = SimpleCnnBackbone::new(&(p / "backbone"), &backbone_cfg);
+            let backbone = build_keypoint_backbone(&(p / "backbone"), &backbone_cfg, k.img_size)?;
             let head = KeypointHead::new(
                 &(p / "head"),
                 backbone.stride_channels(8)?,
@@ -2402,8 +2471,7 @@ impl TaskModel {
             TaskModel::Classify(m) => m.backbone.set_train(train),
             TaskModel::Detect(m) => m.backbone.set_train(train),
             TaskModel::Seg(m) => m.backbone.set_train(train),
-            // 关键点走 SimpleCnnBackbone（无 train 态 BN），no-op
-            TaskModel::Keypoint(_) => {}
+            TaskModel::Keypoint(m) => m.backbone.set_train(train),
         }
     }
 }
@@ -3482,5 +3550,77 @@ backbone = { family = \"simple-cnn\", depth = 1.0, width = 1.0, pretrained = \"n
     /// 借用切片辅助（过拟合测试里 zip 两个平行 Vec）。
     fn gk_of(kpts: &[Vec<[f32; 3]>]) -> &[Vec<[f32; 3]>] {
         kpts
+    }
+}
+
+/// 骨干 × 任务接线契约：keypoint 不再硬编码 simple-cnn、detect 支持 dino-v2。
+/// 用真实 build_model 装配 + stride 通道断言（resnet18 stride8 = layer2 = 128、
+/// dino pyramid = 256）；dino detect/keypoint 需 img_size 为 448 的倍数。
+#[cfg(test)]
+mod backbone_dispatch_tests {
+    use super::*;
+
+    fn cfg_with_backbone(family: &str, task: TaskCfg) -> RunConfig {
+        RunConfig {
+            model: av_core::config::ModelConfig {
+                backbone: av_core::config::BackboneCfg {
+                    family: family.into(),
+                    ..av_core::config::BackboneCfg::default()
+                },
+                tasks: vec![task],
+                ..av_core::config::ModelConfig::default()
+            },
+            ..RunConfig::default()
+        }
+    }
+
+    fn kp_task(img_size: u32) -> TaskCfg {
+        TaskCfg::Keypoint(av_core::config::KeypointCfg {
+            img_size,
+            decode: "direct".into(),
+            ..av_core::config::KeypointCfg::default()
+        })
+    }
+
+    fn det_task(img_size: u32) -> TaskCfg {
+        TaskCfg::Detect(av_core::config::DetectCfg {
+            img_size,
+            num_classes: 3,
+            ..av_core::config::DetectCfg::default()
+        })
+    }
+
+    #[test]
+    fn keypoint_builds_on_resnet18_and_dino() {
+        let vs = tch::nn::VarStore::new(Device::Cpu);
+        let cfg = cfg_with_backbone("resnet18", kp_task(224));
+        let m = build_model(&vs.root(), &cfg).unwrap();
+        assert!(
+            matches!(m, TaskModel::Keypoint(_)),
+            "resnet18 应装配 keypoint"
+        );
+
+        let vs2 = tch::nn::VarStore::new(Device::Cpu);
+        let cfg = cfg_with_backbone("dinov2", kp_task(448));
+        let m = build_model(&vs2.root(), &cfg).unwrap();
+        assert!(
+            matches!(m, TaskModel::Keypoint(_)),
+            "dino-v2 应装配 keypoint"
+        );
+    }
+
+    #[test]
+    fn detect_builds_on_dino() {
+        let vs = tch::nn::VarStore::new(Device::Cpu);
+        let cfg = cfg_with_backbone("dinov2", det_task(448));
+        let m = build_model(&vs.root(), &cfg).unwrap();
+        assert!(matches!(m, TaskModel::Detect(_)), "dino-v2 应装配 detect");
+    }
+
+    #[test]
+    fn dino_detect_rejects_non_448_multiple_imgsz() {
+        let vs = tch::nn::VarStore::new(Device::Cpu);
+        let cfg = cfg_with_backbone("dinov2", det_task(640)); // 640 非 448 倍数
+        assert!(build_model(&vs.root(), &cfg).is_err(), "640 必须被校验拒绝");
     }
 }

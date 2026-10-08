@@ -324,7 +324,7 @@ def build(args):
                              [int(x) for x in args.levels.split(",")])
     if args.backbone == "resnet18":
         return ResNet18Classify(args.classes)
-    if args.backbone == "dino-v2":
+    if args.backbone == "dinov2":
         return DinoV2Classify(args.classes, args.imgsz // 14)
     if args.backbone == "simple-cnn":
         return SimpleCnnClassify(args.classes, max(int(round(16 * args.width)), 4))
@@ -387,7 +387,7 @@ def adapt_dinov2_official(sd):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backbone", default="csp-elan",
-                    choices=["csp-elan", "resnet18", "dino-v2", "simple-cnn"])
+                    choices=["csp-elan", "resnet18", "dinov2", "simple-cnn"])
     ap.add_argument("--ckpt", help="safetensors 权重（缺省 = 随机初始化，仅验证图结构）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--imgsz", type=int, default=640)

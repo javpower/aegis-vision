@@ -151,6 +151,20 @@ b8/24 线程在长训练后段有 commit 耗尽风险）。已知边界：detect
 `C<id> <score>` 标签画在原图上存为 `<DIR>/<文件名>.jpg`（无第三方绘图依赖，
 内置 3×5 微型字模）。
 
+**骨干 × 任务支持矩阵**（`backbone.family` 配置选择；keypoint 此前硬编码
+simple-cnn、detect 未接 dino，现已全量接线并有用例锁定）：
+
+| 骨干 | classify | detect/OBB | seg | keypoint | ONNX 导出 |
+|---|---|---|---|---|---|
+| csp-elan | ✅ | ✅（P3/P4/P5，width/depth 可缩放） | ✅ | ✅ | ✅ detect 图 |
+| resnet18 | ✅ | ✅（layer1/2/3 = stride 4/8/16） | ✅ | ✅ | ✅ classify 图 |
+| dinov2 | ✅ | ✅（ViTDet 式金字塔 conv 分支随任务训练；**img_size 须为 448 倍数**） | ✅ | ✅ | ✅ classify 图 |
+| simple-cnn | ✅ | ✅ | ✅ | ✅ | ✅ classify 图 |
+
+ONNX 导出：`python scripts/export_onnx.py --backbone <名称> --ckpt <safetensors>
+--imgsz <尺寸> --classes <N> --verify`（dinov2 的官方 HF checkpoint 自动套用
+命名适配 + QKV 融合；预处理已并入图内）。
+
 **AMP 混合精度（`[train].amp`，detect 路径）**：CUDA 上 fp16 autocast +
 动态梯度缩放（torch GradScaler 同款：放大 loss 反向、反缩放前检测 inf/NaN
 跳步回退、稳定后按 2000 步间隔放大）。tch 的 autocast 固定 fp16 且无原生
