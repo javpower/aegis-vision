@@ -4,6 +4,8 @@
 pub mod avpack;
 
 #[cfg(feature = "torch")]
+pub mod api;
+#[cfg(feature = "torch")]
 pub mod cuda_link;
 #[cfg(feature = "torch")]
 pub mod dataset;

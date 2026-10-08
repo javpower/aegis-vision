@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 description = "AegisVision 五任务内置实现：classify / detect / obb / seg / keypoint"
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 readme = "README.md"
 keywords = ["deep-learning", "yolo", "detection", "classification", "training"]

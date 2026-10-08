@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 description = "AegisVision 训练/推理引擎、CLI 与观测面板"
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 readme = "README.md"
 keywords = ["deep-learning", "yolo", "machine-learning", "detection", "cli"]

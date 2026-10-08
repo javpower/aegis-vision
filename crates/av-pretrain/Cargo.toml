@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 description = "AegisVision 预训练权重层：原生权重格式（哈希校验+元信息）与外部 PyTorch safetensors 导入适配"
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 documentation = "https://docs.rs/av-pretrain"
 # readme 不做 workspace 继承：workspace 级 readme 路径相对 workspace 根解析，

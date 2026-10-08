@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 description = "AegisVision 公共抽象层：六大核心 trait、配置 schema、几何工具、插件注册表"
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 # readme 不做 workspace 继承：workspace 级 readme 路径相对 workspace 根解析，
 # 会落到成员包根之外导致 cargo package 告警；各 crate 放自己的薄 README。

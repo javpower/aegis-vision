@@ -9,7 +9,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["AegisVision Contributors"]
 # 仓库公开后取消下一行注释，并在四个 crate 中以 repository.workspace = true 继承：
-# repository = "https://github.com/aegisvision/aegis-vision"
+repository = "https://github.com/javpower/aegis-vision"
 
 [workspace.dependencies]
 av-core = { path = "crates/av-core", default-features = false }
