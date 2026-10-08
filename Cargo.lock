@@ -19,7 +19,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aegisvision-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "serde",
@@ -31,14 +31,14 @@ dependencies = [
 
 [[package]]
 name = "aegisvision-plugins"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aegisvision-core",
 ]
 
 [[package]]
 name = "aegisvision-pretrain"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aegisvision-core",
  "blake3",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "aegisvision-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aegisvision-core",
  "aegisvision-plugins",
@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "aegisvision-tasks"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aegisvision-core",
  "rayon",
@@ -289,7 +289,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "av-burn"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aegisvision-core",
  "burn-autodiff",
