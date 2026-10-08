@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # 双许可（SPDX 表达式）：crates.io 页面据此展示许可证，无需 license-file
 license = "MIT OR Apache-2.0"
