@@ -2,10 +2,14 @@
 
 # AegisVision
 
-**Multi-task visual training and inference, natively in Rust**
+**Multi-task vision training & inference, natively in Rust**
 
-Object Detection · Instance Segmentation · Oriented Bounding Boxes · Keypoints · Classification —
-five tasks, one training system
+Detection · Oriented BBoxes · Instance Segmentation · Keypoints · Classification
+Single binary · Zero Python · Embeddable (crates.io) · ONNX export
+
+[![crates.io](https://img.shields.io/crates/v/aegisvision-runtime.svg)](https://crates.io/crates/aegisvision-runtime)
+[![docs.rs](https://img.shields.io/docsrs/aegisvision-runtime)](https://docs.rs/aegisvision-runtime)
+[![license](https://img.shields.io/crates/l/aegisvision-runtime.svg)](https://github.com/javpower/aegis-vision)
 
 [简体中文](README.md) | English
 
@@ -13,132 +17,127 @@ five tasks, one training system
 
 ---
 
-## Why AegisVision
+## ⚡ One-command training
 
-Deep learning engineering has long been anchored to the Python ecosystem: training scripts,
-export chains, and system boundaries held together by glue code. AegisVision takes a different
-path — **a YOLO-grade training system implemented from scratch in Rust**, consolidated into a
-single memory-safe, auditable binary with no interpreter dependency.
-
-| | AegisVision | Conventional Python stack |
-|---|---|---|
-| Runtime | Single binary, zero Python | Python + hundreds of packages |
-| Memory safety | Pure Rust (unsafe surface = tch FFI only) | C/C++ extensions |
-| Deployment | Copy and run | Environment rebuilds |
-| Auditability | Every loss/algorithm hand-written with hand-computed unit tests | Opaque high-level APIs |
-
-## Verified Results (reproducible; configs ship with the repository)
-
-**Five-task baselines on real data**
-
-| Task | Dataset | Result |
-|---|---|---|
-| Object detection | coco128 (real COCO subset, 300ep, CPU, from scratch) | mAP50 **0.846** / mAP50:95 0.521 |
-| Instance segmentation | coco8-seg (real COCO subset) | mask mIoU **0.978** / R@0.5 1.000 |
-| Classification | ImageNette (9,469 real images) | top1 **0.623** (44-second training) |
-| Keypoints | coco8-pose (real COCO subset) | PCK@0.5 **0.815** |
-| Oriented bounding boxes | dota8 (real aerial DOTA) | Full pipeline, GPU-converged |
-
-**Backbone and pre-training ablation** (automotive part instance segmentation, 526/93 images,
-2,219 instances, 120ep)
-
-| Backbone | Pre-training | val mIoU | R@0.5 | P@0.5 |
-|---|---|---|---|---|
-| ResNet18 | Full ImageNet import (11.2M params) | **0.855** | 0.985 | 0.980 |
-| **CSP-ELAN** (YOLOv8-native) | Full YOLOv8n backbone (3.2M params) | **0.846** | 0.979 | 0.974 |
-| ResNet18 | None | 0.829 | 0.974 | 0.974 |
-| simple-cnn | YOLOv8n stem | 0.799 | 0.950 | 0.883 |
-| simple-cnn | None | 0.786 | 0.930 | 0.893 |
-| DINOv2 ViT-S/14 | DINOv2 (448px / 672px) | 0.746 / 0.786 | — | — |
-
-Full per-class metrics and measurement definitions: [runs/COMPARISON.md](runs/COMPARISON.md).
-
-**Engineering performance**
-
-- Instance-segmentation data pipeline rewrite: **288 s → 3 s per epoch (96×)** —
-  content-patch caching + rayon-parallel encoding + double-buffered prefetch +
-  GPU-resident datasets with on-GPU augmentation (`[data].cache`)
-- Throughput A/B on the same GPU/dataset/batch: **3.0 s/epoch vs Ultralytics
-  YOLO11n-seg 4.0 s/epoch**
-- Training throughput benchmark (same protocol, csp-elan@640): tch 7.5 s/epoch,
-  burn-wgpu 27 s/epoch (cross-vendor GPU track, [M2 report](runs/M2-BURN-BENCHMARK.md))
-
-## Core Features
-
-- **Five tasks, one training system** — TAL + CIoU + DFL (detection), YOLACT prototype
-  masks + Dice (segmentation), KFIoU + rotated NMS (OBB), OKS (keypoints), classification;
-  every loss ships with hand-computed unit tests
-- **CSP-ELAN production backbone** — layer-for-layer compatible with the Ultralytics YOLOv8
-  backbone; the full official `yolov8n.pt` backbone (162 tensors) imports through a single
-  mapping rule. Also included: ResNet18 (ImageNet, verified 100/100 tensor import) and
-  DINOv2 ViT-S/14 (positional-embedding grid interpolation + QKV fusion import)
-- **Bidirectional pretrained-weight channel** — import: safetensors + regex layer mapping
-  (partial loading with full reporting); export: safetensors (verified readable from Python)
-- **GPU training** — verified on RTX 50 series (Blackwell/sm_120); requires only the graphics
-  driver, no CUDA Toolkit; built-in runtime fixes for two upstream Windows defects
-- **Data pipeline v2** — `[data].cache = auto/gpu/ram/off` tiered caching; `--resume`
-  checkpoint continuation; periodic `last.ckpt` snapshots; evaluation protocols covering
-  mIoU / recall / precision / per-class metrics
-- **Dual-backend track** — tch (performance, NVIDIA) + burn-wgpu (zero-install track,
-  NVIDIA/AMD/Intel; spike verified trainable, 17/17 tests)
-- **Production engineering** — `.avpack` single-file dataset container (blake3-verified),
-  SAHI-style tiled inference for large images, live SSE training panel, one-command
-  environment setup (Windows/Linux)
-- **Pluggable** — custom backbones/heads in three steps: implement a trait, register,
-  select in config
-
-## Quick Start
-
-Requirements: Rust stable + MSVC build tools (Windows). The CPU path requires no extra setup
-(CPU libtorch downloads automatically on first build); the GPU path is one command.
-
-```powershell
-# Windows: auto-detects GPU and configures (Linux: ./scripts/setup-env.sh)
-.\scripts\setup-env.ps1
-
-cargo build --release -p av-runtime          # produces target\release\av-runtime.exe
-
-# Generate a config from your data directory → train → infer
-set AV=target\release\av-runtime.exe
-
-%AV% init --task seg --data E:\data\my_dataset --out configs\my.toml
-%AV% train -c configs\my.toml
-%AV% infer -w runs\my\best.ckpt --input sample.png
-%AV% eval  -w runs\my\best.ckpt --report report.json
+```bash
+# Dataset = Ultralytics directory layout or data.yaml; classes auto-detected
+av-runtime train --data datasets/glass_logo/data.yaml --imgsz 1280 --epochs 100
 ```
 
-Dataset layouts follow the Ultralytics directory convention (`images/<split>` +
-`labels/<split>`); YOLO txt, COCO-seg polygons, COCO-pose, ImageFolder, and DOTA
-quadrilaterals read out of the box.
+Auto-assembled: csp-elan backbone (YOLOv8-isomorphic) + official pretrain import +
+mosaic/flip/HSV augmentation + **AMP + content-tile caching + double-buffered
+prefetch** + EMA + fitness-based best.ckpt. For OBB/segmentation/keypoints and
+custom backbones, use a TOML config (`av init` generates the template).
 
-## Workspace Layout
+## 📊 Benchmarked against Ultralytics YOLO26n
 
-| Crate | Responsibility | libtorch |
-|---|---|---|
-| `av-core` | Config / geometry / types / format utilities | No |
-| `av-pretrain` | Pretrained-weight import adapter (safetensors + layer mapping) | Optional |
-| `av-tasks` | Backbones / heads / losses / augmentation / assigners | Optional (`torch`) |
-| `av-plugins` | Backbone plugin registry | Optional |
-| `av-runtime` | Training/inference engine, CLI, panel, avpack | Yes |
-| `av-burn` | burn-wgpu backend verification spike | No (burn) |
+Same machine, same dataset, same 1280 input, 100 epochs — industrial glass-logo
+detection (3 classes, 1296/144 images, training directly on 5472×3648 originals):
 
-## Documentation
+| | mAP50 | mAP50:95 | R@0.5 | per epoch |
+|---|---|---|---|---|
+| **AegisVision (this repo)** | **0.9996** | 0.734 | **1.000** | 34 s |
+| Ultralytics YOLO26n | 0.995 | **0.751** | 1.000 | **31.3 s** |
 
-- [docs/USAGE.md](docs/USAGE.md) — full CLI reference, per-task data formats, GPU setup,
-  benchmark details, known-issues ledger
-- [runs/COMPARISON.md](runs/COMPARISON.md) — backbone and pre-training ablation study
-- [runs/M2-BURN-BENCHMARK.md](runs/M2-BURN-BENCHMARK.md) — dual-backend throughput benchmark
-- [scripts/setup-env.ps1](scripts/setup-env.ps1) / [setup-env.sh](scripts/setup-env.sh) —
-  one-command environment setup
+> No Python runtime, fully auditable weights and training; accuracy and speed are
+> in the same league.
 
-## Honest Boundaries
+More real-data baselines (coco128 / ImageNette / coco8-seg / coco8-pose / dota8 /
+backbone×pretrain ablation) in [runs/COMPARISON.md](runs/COMPARISON.md).
 
-Every capability claim maps to a reproducible measurement and unit tests; unfinished work is
-labeled just as precisely: mosaic/mixup currently applies to detection only; AMP and
-multi-GPU are milestone-scheduled; burn-wgpu training throughput is ~1/3.6 of tch
-(positioned as the deployment/cross-vendor track); DINOv2 resolution is constrained by its
-patch-14 grid. The full ledger lives in USAGE §8 (Known Issues).
+## 📦 Embed as a library (in-app online training)
+
+```toml
+[dependencies]
+aegisvision-runtime = "0.3"
+```
+
+```rust
+use av_core::config::RunConfig;
+use std::path::Path;
+
+let cfg: RunConfig = toml::from_str(&toml_text)?;
+
+let report = av_runtime::api::train(&cfg)?;
+let detections = av_runtime::api::infer(&cfg, Path::new("runs/run/best.ckpt"),
+                                        Path::new("sample.jpg"))?;
+av_runtime::api::export_safetensors(&cfg, Path::new("runs/run/best.ckpt"),
+                                    Path::new("best.safetensors"))?;
+```
+
+Five layered crates: `aegisvision-core` (config/geometry) → `pretrain` (weight
+import) → `tasks` (backbones/heads/losses) → `plugins` (registry) →
+`runtime` (engine/CLI/panel).
+
+## 🌐 Cross-platform inference (ONNX)
+
+```bash
+av-runtime export -w runs/run/best.ckpt --format safetensors
+python scripts/export_onnx.py --backbone csp-elan --ckpt best.safetensors \
+    --out best.onnx --imgsz 640 --classes 3 --verify
+```
+
+Consumed directly by ONNX Runtime on C#/Java/C++/JS/Android; preprocessing
+(/255, normalization) is baked into the graph. All four backbones supported,
+export verified against Rust inference to ≤ 1e-5.
+
+## 🧩 Five tasks × four backbones
+
+| Backbone | classify | detect / OBB | seg | keypoint |
+|---|---|---|---|---|
+| csp-elan (YOLOv8-isomorphic) | ✅ | ✅ | ✅ | ✅ |
+| resnet18 (full ImageNet import) | ✅ | ✅ | ✅ | ✅ |
+| dinov2 (ViT-S/14 official + QKV fusion) | ✅ | ✅ (imgsz in multiples of 448) | ✅ | ✅ |
+| simple-cnn (teaching/smoke) | ✅ | ✅ | ✅ | ✅ |
+
+Custom backbones: implement the trait → register → select in config
+(three steps via `av-plugins`).
+
+## ✨ Engineering
+
+- **All five losses hand-written with hand-computed unit tests**: TAL + CIoU +
+  DFL / KFIoU + rotated NMS / YOLACT prototypes + Dice / OKS / cross-entropy
+- **Data pipeline v2**: content-tile cache + streaming build (train directly on
+  60MP originals, no downsampling) + double-buffered prefetch + SIMD resize —
+  measured 195 → 34 s/epoch on identical data/resolution
+- **Modern training loop**: AMP fp16 (dynamic grad scaling), EMA, cosine
+  schedule, grad accumulation/clipping, deterministic seeding
+- **.avpack single-file dataset container** (blake3 + mmap zero-copy), SAHI-style
+  sliced inference, SSE live panel, `--save-viz` visualization
+- **Bidirectional pretrain channel**: safetensors import (regex layer mapping +
+  partial-load report) / export (verified readable from Python)
+- GPU: RTX 50-series (Blackwell/sm_120) tested — only the driver required
+
+## ⚙️ Getting started
+
+Requirements: Rust stable + MSVC (Windows). CPU path needs no setup (CPU
+libtorch auto-downloads on first build); GPU configured by one script.
+
+```powershell
+.\scripts\setup-env.ps1                 # Windows (Linux: ./scripts/setup-env.sh)
+cargo build --release -p av-runtime     # produces target\release\av-runtime.exe
+
+av-runtime train --data <dataset or data.yaml> --imgsz 640
+av-runtime infer -w runs/<id>/best.ckpt --input sample.jpg --save-viz viz
+av-runtime eval   -w runs/<id>/best.ckpt --report report.json
+```
+
+## 📚 Docs
+
+- [docs/USAGE.md](docs/USAGE.md) — full CLI, five-task data formats, GPU setup,
+  benchmark tables, backbone×task matrix, known-issues archive
+- [runs/COMPARISON.md](runs/COMPARISON.md) — backbone×pretrain ablation study
+- [runs/M2-BURN-BENCHMARK.md](runs/M2-BURN-BENCHMARK.md) — burn-wgpu dual-track
+
+## 🎯 Honest boundaries
+
+Every claim maps to reproducible measurements and unit tests; unfinished items
+are stated as such: mosaic/mixup currently detect-only; AMP/EMA wired on the
+detect path; multi-GPU scheduled; ONNX export uses a Python side-car (deployment
+side needs zero Python, export side needs torch); `--resume` currently seg-only;
+the burn-wgpu backend is a cross-vendor validation track (~1/3.6 of tch
+throughput). Full archive in USAGE §8.
 
 ## License
 
-Dual-licensed under MIT OR Apache-2.0.
+Dual-licensed MIT OR Apache-2.0.

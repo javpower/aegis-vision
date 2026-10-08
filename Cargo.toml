@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # 双许可（SPDX 表达式）：crates.io 页面据此展示许可证，无需 license-file
 license = "MIT OR Apache-2.0"
@@ -12,11 +12,11 @@ authors = ["AegisVision Contributors"]
 repository = "https://github.com/javpower/aegis-vision"
 
 [workspace.dependencies]
-aegisvision-core = { path = "crates/av-core", version = "0.2.0", default-features = false }
-aegisvision-tasks = { path = "crates/av-tasks", version = "0.2.0", default-features = false }
-aegisvision-plugins = { path = "crates/av-plugins", version = "0.2.0" }
-aegisvision-runtime = { path = "crates/av-runtime", version = "0.2.0" }
-aegisvision-pretrain = { path = "crates/av-pretrain", version = "0.2.0", default-features = false }
+aegisvision-core = { path = "crates/av-core", version = "0.3.0", default-features = false }
+aegisvision-tasks = { path = "crates/av-tasks", version = "0.3.0", default-features = false }
+aegisvision-plugins = { path = "crates/av-plugins", version = "0.3.0" }
+aegisvision-runtime = { path = "crates/av-runtime", version = "0.3.0" }
+aegisvision-pretrain = { path = "crates/av-pretrain", version = "0.3.0", default-features = false }
 
 # ---- 深度学习底座（PLAN §2.2：每个 tch 版本硬绑定一个 libtorch 版本，用 "=" 锁死）----
 # 锁 0.24.0（libtorch 2.11.0，MSVC C++17 可编译；2026-09-12 实验二逐版本筛选出的
