@@ -1,5 +1,5 @@
 [package]
-name = "av-pretrain"
+name = "aegisvision-pretrain"
 version.workspace = true
 edition.workspace = true
 description = "AegisVision 预训练权重层：原生权重格式（哈希校验+元信息）与外部 PyTorch safetensors 导入适配"
@@ -20,10 +20,13 @@ default = ["torch"]
 torch = ["dep:tch", "tch/download-libtorch"]
 
 [dependencies]
-av-core = { workspace = true }
+aegisvision-core = { workspace = true }
 tch = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 blake3 = { workspace = true }
 regex = { workspace = true }
+
+[lib]
+name = "av_pretrain"

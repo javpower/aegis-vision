@@ -1,5 +1,5 @@
 [package]
-name = "av-plugins"
+name = "aegisvision-plugins"
 version.workspace = true
 edition.workspace = true
 description = "AegisVision 插件机制与内置扩展（跨模态 / 规则引擎 / 选型器 / 蒸馏 / 少样本）"
@@ -11,4 +11,7 @@ keywords = ["deep-learning", "yolo", "plugins", "extensibility", "distillation"]
 categories = ["science"]
 
 [dependencies]
-av-core = { workspace = true }
+aegisvision-core = { workspace = true }
+
+[lib]
+name = "av_plugins"

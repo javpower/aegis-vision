@@ -16,7 +16,7 @@ wgpu = ["dep:burn-wgpu"]   # 0.21 的 Wgpu 类型默认已含 burn-fusion 融合
 [dependencies]
 # 只依赖 av-core（default-features = false 避免 tch/libtorch）+ image + burn；
 # 禁止依赖 av-runtime / av-tasks（绑 tch）——letterbox / 栅格化逻辑按语义自实现。
-av-core = { workspace = true, default-features = false }
+aegisvision-core = { workspace = true, default-features = false }
 image = { workspace = true }
 
 # ---- burn 0.21.0：按子 crate 直接依赖，不用 umbrella `burn` ----

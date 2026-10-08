@@ -18,6 +18,73 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aegisvision-core"
+version = "0.2.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "tch",
+ "thiserror 1.0.69",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "aegisvision-plugins"
+version = "0.2.0"
+dependencies = [
+ "aegisvision-core",
+]
+
+[[package]]
+name = "aegisvision-pretrain"
+version = "0.2.0"
+dependencies = [
+ "aegisvision-core",
+ "blake3",
+ "regex",
+ "serde",
+ "serde_json",
+ "tch",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "aegisvision-runtime"
+version = "0.2.0"
+dependencies = [
+ "aegisvision-core",
+ "aegisvision-plugins",
+ "aegisvision-pretrain",
+ "aegisvision-tasks",
+ "anyhow",
+ "axum",
+ "blake3",
+ "clap",
+ "fast_image_resize",
+ "futures-core",
+ "image",
+ "memmap2",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tch",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "aegisvision-tasks"
+version = "0.2.0"
+dependencies = [
+ "aegisvision-core",
+ "rayon",
+ "tch",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -222,9 +289,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "av-burn"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "av-core",
+ "aegisvision-core",
  "burn-autodiff",
  "burn-core",
  "burn-ndarray",
@@ -232,64 +299,6 @@ dependencies = [
  "burn-optim",
  "burn-wgpu",
  "image",
-]
-
-[[package]]
-name = "av-core"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "serde",
- "serde_json",
- "tch",
- "thiserror 1.0.69",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "av-plugins"
-version = "0.1.0"
-dependencies = [
- "av-core",
-]
-
-[[package]]
-name = "av-pretrain"
-version = "0.1.0"
-dependencies = [
- "av-core",
- "blake3",
- "regex",
- "serde",
- "serde_json",
- "tch",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "av-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "av-core",
- "av-plugins",
- "av-pretrain",
- "av-tasks",
- "axum",
- "blake3",
- "clap",
- "fast_image_resize",
- "futures-core",
- "image",
- "memmap2",
- "rayon",
- "serde",
- "serde_json",
- "tch",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -310,15 +319,6 @@ dependencies = [
  "thiserror 2.0.20",
  "v_frame",
  "y4m",
-]
-
-[[package]]
-name = "av-tasks"
-version = "0.1.0"
-dependencies = [
- "av-core",
- "rayon",
- "tch",
 ]
 
 [[package]]

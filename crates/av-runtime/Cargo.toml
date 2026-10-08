@@ -1,5 +1,5 @@
 [package]
-name = "av-runtime"
+name = "aegisvision-runtime"
 version.workspace = true
 edition.workspace = true
 description = "AegisVision 训练/推理引擎、CLI 与观测面板"
@@ -12,14 +12,14 @@ categories = ["science", "multimedia::images", "command-line-utilities"]
 
 [features]
 default = ["torch", "panel"]
-torch = ["av-core/torch", "av-tasks/torch", "av-pretrain/torch", "dep:tch"]
+torch = ["aegisvision-core/torch", "aegisvision-tasks/torch", "aegisvision-pretrain/torch", "dep:tch"]
 panel = ["dep:axum", "dep:tokio"]
 
 [dependencies]
-av-core = { workspace = true }
-av-tasks = { workspace = true }
-av-plugins = { workspace = true }
-av-pretrain = { workspace = true }
+aegisvision-core = { workspace = true }
+aegisvision-tasks = { workspace = true }
+aegisvision-plugins = { workspace = true }
+aegisvision-pretrain = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
@@ -44,3 +44,6 @@ fast_image_resize = "6.1.0"
 [dev-dependencies]
 # 面板 SSE 集成测试用裸 TCP 收发，需要 AsyncRead/WriteExt（io-util 仅测试期启用）
 tokio = { workspace = true, features = ["io-util"] }
+
+[lib]
+name = "av_runtime"

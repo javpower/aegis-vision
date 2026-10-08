@@ -1,5 +1,5 @@
 [package]
-name = "av-tasks"
+name = "aegisvision-tasks"
 version.workspace = true
 edition.workspace = true
 description = "AegisVision 五任务内置实现：classify / detect / obb / seg / keypoint"
@@ -12,9 +12,12 @@ categories = ["science", "algorithms"]
 
 [features]
 default = ["torch"]
-torch = ["av-core/torch", "dep:tch"]
+torch = ["aegisvision-core/torch", "dep:tch"]
 
 [dependencies]
-av-core = { workspace = true }
+aegisvision-core = { workspace = true }
 rayon = { workspace = true }
 tch = { workspace = true, optional = true }
+
+[lib]
+name = "av_tasks"
