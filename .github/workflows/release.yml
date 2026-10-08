@@ -1,0 +1,91 @@
+# 预编译二进制发布：推送 v* 标签时触发。
+#
+# CPU 矩阵（linux/windows/macos）：torch-sys 构建期自动下载 CPU libtorch，
+# 产物零依赖即可跑 CPU 推理/训练。
+# Windows GPU 追加构建：下载 cu128 libtorch（2.8GB），构建时 LIBTORCH 指向之；
+# 运行时 GPU 环境由用户按 docs/USAGE.md §6 的 setup-env.ps1 准备（仅需驱动）。
+#
+# 触发：git tag v0.3.1 && git push --tags
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  cpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build (CPU libtorch auto-download)
+        run: cargo build --release -p av-runtime --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          DIR="aegisvision-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$DIR"
+          cp "target/${{ matrix.target }}/release/av-runtime" "$DIR/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$DIR/"
+          tar czf "$DIR.tar.gz" "$DIR"
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $dir = "aegisvision-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/av-runtime.exe" $dir
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            *.zip
+          generate_release_notes: true
+
+  gpu-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download CUDA libtorch (cu128, 与 setup-env.ps1 同源同版本)
+        shell: pwsh
+        run: |
+          curl -L -o libtorch.zip "https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.11.0%2Bcu128.zip"
+          Expand-Archive libtorch.zip -DestinationPath .
+          # 解压根目录名 = libtorch（LIBTORCH 指向解压后的 libtorch 根）
+          "LIBTORCH=$PWD\libtorch" | Out-File -Append $env:GITHUB_ENV
+      - name: Build (CUDA)
+        run: cargo build --release -p av-runtime
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "aegisvision-${{ github.ref_name }}-x86_64-windows-cuda"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "target/release/av-runtime.exe" $dir
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $dir
+          @'
+          GPU 运行环境：下载 cu128 libtorch 并将 lib 目录加入 PATH
+          （scripts/setup-env.ps1 -Device cuda 自动完成），无需 CUDA Toolkit。
+          '@ | Out-File -Encoding utf8 "$dir\GPU-README.txt"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "*.zip"

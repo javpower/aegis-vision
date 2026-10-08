@@ -13,6 +13,11 @@
 | libtorch 2.11 | 首次构建自动下载 CPU 版（~200MB） | 自动下载 cu128 版（~2.8GB，含 RTX 50 系 sm_120 内核） |
 | 显卡 | 无要求 | NVIDIA（只装驱动，无需 CUDA Toolkit）；AMD 见下 |
 
+**免编译路径（推荐给纯使用者）**：GitHub Releases 提供预编译 `av-runtime`
+（Windows/Linux/macOS CPU 版 + Windows CUDA 版，推 `v*` 标签自动构建，
+见 `.github/workflows/release.yml`）——下载解压即用，CUDA 版运行环境仍需
+`setup-env.ps1` 下载 libtorch（见 §6）。以下内容面向需要编译（开发者/嵌入方）。
+
 ```powershell
 # Windows 一键配置（自动探测 GPU：有 N 卡装 cu128，无卡走 CPU；AMD 如实回退并说明）
 .\scripts\setup-env.ps1                  # 加 -SmokeTest 顺带跑合成数据冒烟验证
