@@ -1,37 +1,52 @@
 [package]
-name = "av-burn"
+name = "aegisvision-burn"
 version.workspace = true
 edition.workspace = true
-description = "AegisVision burn 框架技术验证 spike：CSP-ELAN 骨干 + YOLACT 式分割头（wgpu 后端）"
+description = "AegisVision 纯 Rust 分割后端（burn 框架）：CSP-ELAN 骨干 + YOLACT 式分割头，训练/推理/checkpoint/CLI 零 libtorch 依赖"
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
-publish = false
+readme = "README.md"
+keywords = ["deep-learning", "yolo", "segmentation", "burn", "wgpu"]
+categories = ["science", "multimedia::images", "command-line-utilities"]
 
 [features]
-# wgpu 只做编译验证（显存被实验占用，禁止 GPU 训练）；默认仅 ndarray 后端，
-# 测试一律在 ndarray 上跑（验收标准 1），wgpu 随本 feature 编译期验证（验收标准 2）。
+# wgpu = GPU 后端（默认已含 burn-fusion 融合 + autotune）；默认仅 ndarray，
+# 测试一律在 ndarray 上跑（纯 CPU 可复现），wgpu 随本 feature 编译期验证。
 default = []
-wgpu = ["dep:burn-wgpu"]   # 0.21 的 Wgpu 类型默认已含 burn-fusion 融合 + autotune
+wgpu = ["dep:burn-wgpu"]
 
 [dependencies]
-# 只依赖 av-core（default-features = false 避免 tch/libtorch）+ image + burn；
+# 只依赖 av-core（default-features = false 避免 tch/libtorch）+ 纯 Rust 三方；
 # 禁止依赖 av-runtime / av-tasks（绑 tch）——letterbox / 栅格化逻辑按语义自实现。
 aegisvision-core = { workspace = true, default-features = false }
 image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
 
 # ---- burn 0.21.0：按子 crate 直接依赖，不用 umbrella `burn` ----
 # 原因（实测）：umbrella `burn` 的依赖锁图必含可选的 burn-tch（torch-sys ^0.22），
 # 与工作区 av-runtime 的 tch 0.24（torch-sys 0.24）在 `links = "tch"` 上冲突，
 # 导致整个工作区解析失败（隔离探针 crate 复现）。子 crate 组合不含 burn-tch，
-# 与 tch 0.24 在同一工作区解析/编译均通过。版本号与 `cargo add burn` 最新稳定一致。
+# 与 tch 0.24 在同一工作区解析/编译均通过。API 无损：umbrella 只是 re-export。
 burn-core = { version = "0.21.0", default-features = false, features = ["std"] }
 burn-nn = "0.21.0"
 burn-optim = "0.21.0"
-# ndarray = 冒烟测试/单测后端；autodiff = 训练必需（ndarray 不自带反传）。
+# ndarray = 冒烟测试/单测/CPU 推理后端；autodiff = 训练必需（ndarray 不自带反传）。
 burn-ndarray = "0.21.0"
 burn-autodiff = "0.21.0"
-# wgpu = GPU 编译验证（经 av-burn 的 wgpu feature 打开）。
+# wgpu = GPU 后端（经本 crate 的 wgpu feature 打开）。
 burn-wgpu = { version = "0.21.0", optional = true }
+
+# avb CLI（独立二进制；与 aegisvision-runtime 的 av CLI 体验对齐）
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+# lib 名沿用 av_burn（crate 改名后 use 路径零改动，与
+# aegisvision-core → av_core 等同款约定）。
+[lib]
+name = "av_burn"
 
 # bench_csp640 只在 wgpu feature 下可编译（用到 burn_wgpu / wgpu_check 模块）
 [[example]]

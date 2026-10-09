@@ -1,4 +1,57 @@
-# av-burn PROGRESS（最终状态）
+# av-burn PROGRESS
+
+> burn 框架后端（crate 名 `aegisvision-burn`，lib 名 `av_burn`）。
+
+## 2026-10-09 产品化升级（spike → 发布 crate）
+
+spike 验收后追加的集成与发布工作，目标：**不管用户走 tch 主后端还是 burn
+后端，使用体验统一且开箱即用**。
+
+### 交付内容
+
+1. **推理路径补全**（`src/infer.rs`）：`SegNet::predict`（conf 截取 → 分数
+   降序截断 → 系数批量上设备一次合成全部候选掩码 logits → 0.5 阈值二值化 →
+   空掩码丢弃 → 同类掩码 IoU NMS），语义对齐 tch 版 `SegModel::predict`
+   （含 MAX_SEGS_PER_IMAGE=100、stable 排序平局保持 cell 行序）；输出
+   `SegInstance{label,score,mask}` 与 tch 版同名同型；`upmask_to_original`
+   letterbox 逆映射（掩码 → 原图坐标）；`predict_image` 单图便捷入口。
+2. **checkpoint 闭环**（`src/checkpoint.rs`）：`model.bp`（burn
+   BinFileRecorder/FullPrecision）+ `config.snapshot.toml`（与 av-runtime
+   权重旁快照约定一致）；train → save → predict 零参数闭环（预测侧超参从
+   快照自动重建）。roundtrip 测试断言前向逐位一致（先取参照输出再保存——
+   前向会推进 BN 统计）。
+3. **avb CLI**（`src/bin/avb.rs`，二进制目标，`cargo install aegisvision-burn`
+   即得）：`avb train --data <目录|data.yaml>`（复用 `av_core::config::
+   parse_data_yaml`，与主 CLI `av` 同款数据格式与超参默认值）+ `avb predict`
+   （--save-viz 叠色可视化 / --save-masks PNG 导出 / --json 结构化输出 /
+   --device cpu|gpu）。后端编译期选择：默认 ndarray，`--features wgpu` 时
+   `--device gpu` 可用。
+4. **发布就绪**：crate 改名 `aegisvision-burn`（lib 名保持 `av_burn`，use
+   路径零改动，与 aegisvision-core → av_core 同款约定）；去 publish=false；
+   元数据 + README 齐备；`cargo package` 验证通过。发布到 crates.io。
+5. **CI 修复**（ci.yml）：check-torch 的 `-p av-core/-p av-tasks` 是改名前
+   残留（job 必挂）→ 更正为 aegisvision-*；触发分支补 master；数据相关测试
+   改为数据集缺失时跳过（data/ 不入库，CI 无数据集也能全绿）；新增 check-burn
+   job（ndarray + wgpu 编译验证）。
+
+### 测试与验证记录（2026-10-09）
+
+- lib 测试 24 项全过（原 17 + 新增 infer 5 + checkpoint 2），含 coco8-seg
+  过拟合冒烟；wgpu feature 全量编译通过（dev profile ~4m49s）。
+- 首轮测试抓出 3 个测试自身缺陷并修复：mask_iou 手算期望值错误（1/7→1/4）、
+  upmask 手算用例违反「掩码画布 = dst/4」不变式、roundtrip 参照输出取自
+  保存之后（BN 统计已被前向推进）。
+
+### 边界（仍未做，与 spike 一致）
+
+- 无 ultralytics 权重命名对齐（burn checkpoint 为原生格式，av-pretrain 导入
+  适配器仍不在范围）；wgpu 正式训练仍待 GPU 空闲后专项验证（编译期验证已过）；
+  ndarray 后端无 BLAS，性能基线不变（wgpu ≈ tch 的 1/3，见下方 bench 记录）。
+
+---
+
+# 历史记录：spike 阶段（2026-09-13/14）
+
 
 > burn 框架技术验证 spike。硬期限：2026-09-14 09:00。
 > **状态：三条验收标准全部达成（见下），交付时间 2026-09-13 深夜。**

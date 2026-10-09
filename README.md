@@ -68,6 +68,22 @@ av_runtime::api::export_safetensors(&cfg, Path::new("runs/run/best.ckpt"),
 五个 crate 按层发布：`aegisvision-core`（配置/几何）→ `pretrain`（权重导入）→
 `tasks`（骨干/头/损失）→ `plugins`（插件注册）→ `runtime`（引擎/CLI/面板）。
 
+## 🦀 纯 Rust 后端（aegisvision-burn，无 libtorch）
+
+不想装 libtorch/C++ 工具链？burn 框架后端提供同款分割链路（CSP-ELAN +
+YOLACT 式原型×系数），数据格式、conf/iou 语义、`SegInstance` 输出与主后端
+完全一致，训练/推理一条命令：
+
+```bash
+cargo install aegisvision-burn --features wgpu   # GPU 版（CPU 版去掉 --features）
+avb train   --data <目录|data.yaml> --epochs 100 --device gpu
+avb predict --weights runs-avb/<name> --input img.jpg --save-viz out/ --json res.json
+```
+
+后端选型建议：生产训练/推理用主后端 `av`（tch/libtorch，最快）；受限环境
+（无 libtorch、纯 Rust 构建）用 `avb`（wgpu/ndarray，wgpu 实测约为 tch 的
+1/3 吞吐）。详见 [crates.io/crates/aegisvision-burn](https://crates.io/crates/aegisvision-burn)。
+
 ## 🌐 跨平台推理（ONNX）
 
 ```bash

@@ -305,6 +305,30 @@ cudnn/内核启动三级检查内建。
 
 ---
 
+## 6A. 纯 Rust 后端（avb / aegisvision-burn，无 libtorch）
+
+没有 libtorch / C++ 工具链的环境，可用 burn 框架后端训练/推理**实例分割**，
+数据格式与主 CLI 一致（YOLO-seg 目录或 data.yaml）：
+
+```bash
+cargo install aegisvision-burn                 # CPU 版（ndarray 后端）
+cargo install aegisvision-burn --features wgpu # GPU 版（wgpu 后端）
+
+avb train --data <目录|data.yaml> --epochs 100 [--device gpu] \
+          [--imgsz 640 --width 0.25 --depth 0.33 --protos 32]
+# 产物：runs-avb/<数据集名>/model.bp + config.snapshot.toml
+
+avb predict --weights runs-avb/<名> --input img.jpg [--conf 0.25 --iou 0.7] \
+            [--save-viz out/] [--save-masks out/] [--json res.json]
+```
+
+库 API（`use av_burn::...`）提供 SegNet / train / checkpoint / infer 四模块，
+详见 crate 文档。边界：该后端目前只有 seg 链路；无 ultralytics 权重导入；
+ndarray 后端无 BLAS（冒烟/小模型用），wgpu 吞吐约为 tch 的 1/3——生产训练
+仍建议主后端 `av`（§6）。
+
+---
+
 ## 7. 发布清单（crates.io 就绪状态）
 
 - [x] 四 crate + av-pretrain 元数据（description/license/keywords/categories/readme）

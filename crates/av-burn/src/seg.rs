@@ -135,6 +135,16 @@ impl<B: Backend> SegNet<B> {
         self.head.forward(p4)
     }
 
+    /// 类别数 C。
+    pub fn num_classes(&self) -> usize {
+        self.num_classes
+    }
+
+    /// 原型数 K。
+    pub fn num_protos(&self) -> usize {
+        self.num_protos
+    }
+
     /// 分割损失（语义对齐 tch SegModel::loss）。
     ///
     /// `masks[i][g]`：第 i 图第 g 实例的 0/1 掩码（img/4 画布扁平）；
@@ -345,7 +355,14 @@ mod tests {
     #[test]
     fn coco8_seg_overfit_smoke() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/coco8-seg");
-        let samples = load_cocoseg_dir(&root, "train", 128).expect("coco8-seg 应存在");
+        // 数据集不入库（.gitignore /data/）：缺失时跳过（CI 无数据集也能全绿）
+        let Ok(samples) = load_cocoseg_dir(&root, "train", 128) else {
+            println!(
+                "跳过 coco8-seg 冒烟：数据集不存在（{}）；获取方式见 docs/USAGE.md",
+                root.display()
+            );
+            return;
+        };
         // 取实例最多的图（单图过拟合，BN batch=1 的方差由小画布缓解）。
         let sample = samples
             .iter()

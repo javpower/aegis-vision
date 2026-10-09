@@ -16,6 +16,8 @@ pub mod backbone;
 /// DINOv2 ViT 骨干族（ViT-S/14 起步）：官方预训练权重导入 + pos_embed 网格插值。
 #[cfg(feature = "torch")]
 pub mod backbone_cspelan;
+/// DINOv2 骨干（RF-DETR 同款；绑 tch，纯逻辑构建下同样不可用）。
+#[cfg(feature = "torch")]
 pub mod backbone_dino;
 /// torchvision ResNet18 骨干族：层名逐字对齐 torchvision，ImageNet 权重可全量导入。
 #[cfg(feature = "torch")]

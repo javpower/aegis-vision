@@ -18,6 +18,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aegisvision-burn"
+version = "0.3.0"
+dependencies = [
+ "aegisvision-core",
+ "anyhow",
+ "burn-autodiff",
+ "burn-core",
+ "burn-ndarray",
+ "burn-nn",
+ "burn-optim",
+ "burn-wgpu",
+ "clap",
+ "image",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "aegisvision-core"
 version = "0.3.0"
 dependencies = [
@@ -286,20 +305,6 @@ name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
-
-[[package]]
-name = "av-burn"
-version = "0.3.0"
-dependencies = [
- "aegisvision-core",
- "burn-autodiff",
- "burn-core",
- "burn-ndarray",
- "burn-nn",
- "burn-optim",
- "burn-wgpu",
- "image",
-]
 
 [[package]]
 name = "av-scenechange"
