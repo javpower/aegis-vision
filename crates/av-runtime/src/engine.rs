@@ -2943,13 +2943,20 @@ fn train_detect_yolo(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<
         // 数值；首块同步编码仅一次，此后每块先收上一块的货再预热下一块。
         let chunk_starts: Vec<usize> = (0..order.len()).step_by(bs).collect();
         let mut in_flight: Option<std::thread::JoinHandle<AvResult<Vec<SampleTensor>>>> = None;
+        // AV_LOSS_TIMING 下的编码等待统计（累计值，epoch 末打印一次）
+        let mut encode_wait_total = std::time::Duration::ZERO;
+        let mut stack_h2d_total = std::time::Duration::ZERO;
         for (ci, &start) in chunk_starts.iter().enumerate() {
             let end = (start + bs).min(order.len());
+            let t_wait0 = std::time::Instant::now();
             let (x, boxes, labels) = match in_flight.take() {
                 Some(h) => {
                     let batch_samples: Vec<SampleTensor> =
                         h.join().map_err(|_| AvError::train("数据编码线程崩溃"))??;
+                    let t_stack0 = std::time::Instant::now();
                     let x = dataset::stack_samples(&batch_samples)?.to_device(device);
+                    stack_h2d_total += t_stack0.elapsed();
+                    encode_wait_total += t_wait0.elapsed();
                     (
                         x,
                         batch_samples.iter().map(|s| s.boxes.clone()).collect(),
@@ -3054,6 +3061,12 @@ fn train_detect_yolo(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<
             );
         }
         final_loss = epoch_loss.mean(steps);
+        if loss_timing {
+            println!(
+                "[timing] epoch={epoch} encode 等待合计={encode_wait_total:?} stack+H2D 合计={stack_h2d_total:?}（{} 步）",
+                steps
+            );
+        }
         let TaskModel::Detect(m) = &model else {
             unreachable!("检测任务模型类型")
         };
