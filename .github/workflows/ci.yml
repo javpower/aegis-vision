@@ -18,12 +18,25 @@ jobs:
       # 数据集（data/coco8-seg）不入库，av-burn 数据相关测试在缺数据时自动跳过
       - run: cargo test --workspace --no-default-features
 
+  # 供应链：Cargo.lock 对 RustSec 漏洞库审计（有漏洞即失败）
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   # torch 侧：默认 feature 已含 download-libtorch，CI 零配置锚定 CPU libtorch（PLAN §2.2）
   check-torch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # torch 门控代码的 clippy 硬门禁（与 test-pure 同标准）
+      - run: cargo clippy -p aegisvision-core -p aegisvision-tasks -p aegisvision-pretrain -p aegisvision-runtime --features torch --all-targets -- -D warnings
       - run: cargo check -p aegisvision-core
       - run: cargo check -p aegisvision-tasks
       - run: cargo check -p aegisvision-burn --bin avb
@@ -34,6 +47,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy -p aegisvision-burn --all-targets -- -D warnings
       - run: cargo check -p aegisvision-burn --features wgpu
 
   # Windows CUDA 冒烟：仅编译（PLAN §9）

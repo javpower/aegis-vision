@@ -8,7 +8,7 @@ edition = "2021"
 # 双许可（SPDX 表达式）：crates.io 页面据此展示许可证，无需 license-file
 license = "MIT OR Apache-2.0"
 authors = ["AegisVision Contributors"]
-# 仓库公开后取消下一行注释，并在四个 crate 中以 repository.workspace = true 继承：
+# repository 已生效：六个 crate 以 repository.workspace = true 继承
 repository = "https://github.com/javpower/aegis-vision"
 
 [workspace.dependencies]

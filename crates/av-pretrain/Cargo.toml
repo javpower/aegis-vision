@@ -6,7 +6,7 @@ description = "AegisVision 预训练权重层：原生权重格式（哈希校�
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-documentation = "https://docs.rs/av-pretrain"
+# documentation 字段不写：docs.rs 会按包名自动生成链接，写错名反而是坏链
 # readme 不做 workspace 继承：workspace 级 readme 路径相对 workspace 根解析，
 # 会落到成员包根之外导致 cargo package 告警；各 crate 放自己的薄 README。
 readme = "README.md"

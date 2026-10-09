@@ -20,14 +20,16 @@ Single binary · Zero Python · Embeddable (crates.io) · ONNX export
 ## ⚡ One-command training
 
 ```bash
-# Dataset = Ultralytics directory layout or data.yaml; classes auto-detected
-av-runtime train --data datasets/glass_logo/data.yaml --imgsz 1280 --epochs 100
+# Runs out of the box: synthetic smoke training (no dataset needed)
+av-runtime train -c configs/quick_detect.toml
+# Real data = Ultralytics directory layout or data.yaml; classes auto-detected
+av-runtime train --data <dataset dir|data.yaml> --imgsz 1280 --epochs 100
 ```
 
 Auto-assembled: csp-elan backbone (YOLOv8-isomorphic) + official pretrain import +
 mosaic/flip/HSV augmentation + **AMP + content-tile caching + double-buffered
 prefetch** + EMA + fitness-based best.ckpt. For OBB/segmentation/keypoints and
-custom backbones, use a TOML config (`av init` generates the template).
+custom backbones, use a TOML config (`av-runtime init` generates the template).
 
 ## 📊 Benchmarked against Ultralytics YOLO26n
 
@@ -43,7 +45,7 @@ detection (3 classes, 1296/144 images, training directly on 5472×3648 originals
 > in the same league.
 
 More real-data baselines (coco128 / ImageNette / coco8-seg / coco8-pose / dota8 /
-backbone×pretrain ablation) in [runs/COMPARISON.md](runs/COMPARISON.md).
+backbone×pretrain ablation) in [docs/USAGE.md §5](docs/USAGE.md).
 
 ## 📦 Embed as a library (in-app online training)
 
@@ -68,6 +70,24 @@ av_runtime::api::export_safetensors(&cfg, Path::new("runs/run/best.ckpt"),
 Five layered crates: `aegisvision-core` (config/geometry) → `pretrain` (weight
 import) → `tasks` (backbones/heads/losses) → `plugins` (registry) →
 `runtime` (engine/CLI/panel).
+
+## 🦀 Pure-Rust backend (aegisvision-burn, no libtorch)
+
+No libtorch/C++ toolchain? The burn-framework backend offers the same
+segmentation stack (CSP-ELAN + YOLACT-style prototypes×coefficients) with data
+formats, conf/iou semantics and `SegInstance` outputs identical to the main
+backend — train/predict in one command:
+
+```bash
+cargo install aegisvision-burn --features wgpu   # GPU build (drop --features for CPU)
+avb train   --data <dir|data.yaml> --epochs 100 --device gpu
+avb predict --weights runs-avb/<name> --input img.jpg --save-viz out/ --json res.json
+```
+
+Backend choice: production training/inference on the main `av-runtime` backend
+(tch/libtorch, fastest); constrained environments (no libtorch, pure-Rust
+builds) on `avb` (wgpu/ndarray, wgpu measured at ~1/3 of tch throughput). See
+[crates.io/crates/aegisvision-burn](https://crates.io/crates/aegisvision-burn).
 
 ## 🌐 Cross-platform inference (ONNX)
 
@@ -114,8 +134,8 @@ Requirements: Rust stable + MSVC (Windows). CPU path needs no setup (CPU
 libtorch auto-downloads on first build); GPU configured by one script.
 
 ```powershell
-.\scripts\setup-env.ps1                 # Windows (Linux: ./scripts/setup-env.sh)
-cargo build --release -p av-runtime     # produces target\release\av-runtime.exe
+.\scripts\setup-env.ps1                       # Windows (Linux: ./scripts/setup-env.sh)
+cargo build --release -p aegisvision-runtime  # produces target\release\av-runtime.exe
 
 av-runtime train --data <dataset or data.yaml> --imgsz 640
 av-runtime infer -w runs/<id>/best.ckpt --input sample.jpg --save-viz viz
@@ -125,9 +145,8 @@ av-runtime eval   -w runs/<id>/best.ckpt --report report.json
 ## 📚 Docs
 
 - [docs/USAGE.md](docs/USAGE.md) — full CLI, five-task data formats, GPU setup,
-  benchmark tables, backbone×task matrix, known-issues archive
-- [runs/COMPARISON.md](runs/COMPARISON.md) — backbone×pretrain ablation study
-- [runs/M2-BURN-BENCHMARK.md](runs/M2-BURN-BENCHMARK.md) — burn-wgpu dual-track
+  benchmark tables (coco128/ImageNette/coco8-seg/coco8-pose/dota8 + augmentation
+  ablations), backbone×task matrix, known-issues archive
 
 ## 🎯 Honest boundaries
 

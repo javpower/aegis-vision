@@ -53,3 +53,9 @@ name = "av_runtime"
 [[bin]]
 name = "av-runtime"
 path = "src/main.rs"
+
+# CUDA 冒烟示例直接 use tch，无 torch feature 时不可编译
+# （否则 cargo test/clippy --no-default-features 连 examples 一起构建即挂）
+[[example]]
+name = "cuda_smoke"
+required-features = ["torch"]

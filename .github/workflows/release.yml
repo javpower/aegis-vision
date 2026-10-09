@@ -139,3 +139,29 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: "*.zip"
+
+  # crates.io 发布：按依赖序 publish 六个 crate。
+  # 前置：repo Settings → Secrets and variables → Actions 配置 CARGO_REGISTRY_TOKEN；
+  # 未配置时本任务会鉴权失败（不阻塞二进制产物发布），可按 docs/USAGE.md §7 手动 publish。
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [cpu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # 每步独立重试：crates.io 偶发 503/超时不至于让整条流水线重来
+      - name: Publish (依赖序，逐个重试)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          for p in aegisvision-core aegisvision-pretrain aegisvision-tasks \
+                   aegisvision-plugins aegisvision-burn aegisvision-runtime; do
+            for attempt in 1 2 3; do
+              echo "== cargo publish -p $p（第 $attempt 次）"
+              if cargo publish -p "$p" --locked; then break; fi
+              if [ "$attempt" = 3 ]; then echo "::error::publish $p 三次失败"; exit 1; fi
+              sleep 20
+            done
+          done

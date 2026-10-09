@@ -23,7 +23,7 @@
 .\scripts\setup-env.ps1                  # 加 -SmokeTest 顺带跑合成数据冒烟验证
 # Linux: ./scripts/setup-env.sh          # 同款策略；ROCm 待上游 tch/libtorch 支持
 # 之后编译/训练：
-cargo build --release -p av-runtime
+cargo build --release -p aegisvision-runtime
 ```
 
 libtorch 下载源为 PyTorch 官方（download.pytorch.org，已验证 2.11.0 cu128/cpu 的
@@ -37,15 +37,15 @@ win/linux 文件名），安装到 `<仓库>\.libtorch\`（已 gitignore），�
 
 | 命令 | 用途 | 状态 |
 |---|---|---|
-| `av init --task <t> --data <dir> --out <f>` | 生成最小配置；自动探测数据格式（YOLO/ImageFolder/DOTA）+ 统计类数 | ✅ |
-| `av train -c <toml> [--dry-run] [--override k=v]` | 训练；`--resume` 续训 | ✅ |
-| `av infer -w <ckpt> [--config <toml>] --input <图>` | 推理（JSON 输出，坐标已还原原图） | ✅ |
-| `av infer --slice --slice-window N` | 高分辨率大图切片推理（SAHI 式） | ✅ |
-| `av eval -w <ckpt> [--report f]` | 评测（检测 mIoU/mAP50/mAP50:95；分类 top1；OBB 旋转 mIoU；关键点 PCK/OKS） | ✅ |
-| `av pack --src <dir> --out <f>` | 打包 .avpack 单文件容器（blake3 逐文件校验） | ✅ |
-| `av export -w <ckpt> --format safetensors` | 权重导出（跨生态互认，Python safetensors 实测可读） | ✅ |
-| `av panel --port 8080` | 观测面板（runs 浏览 + 指标视图，5 秒刷新） | ✅ |
-| `av distill` / `av nas` | 蒸馏 / 骨干选型 | ⏳ M9 |
+| `av-runtime init --task <t> --data <dir> --out <f>` | 生成最小配置；自动探测数据格式（YOLO/ImageFolder/DOTA）+ 统计类数 | ✅ |
+| `av-runtime train -c <toml> [--dry-run] [--override k=v]` | 训练；`--resume` 续训 | ✅ |
+| `av-runtime infer -w <ckpt> [--config <toml>] --input <图>` | 推理（JSON 输出，坐标已还原原图；`--conf/--iou` 覆盖阈值） | ✅ |
+| `av-runtime infer --slice --slice-window N` | 高分辨率大图切片推理（SAHI 式） | ✅ |
+| `av-runtime eval -w <ckpt> [--report f]` | 评测（检测 mIoU/mAP50/mAP50:95；分类 top1；OBB 旋转 mIoU；关键点 PCK/OKS） | ✅ |
+| `av-runtime pack --src <dir> --out <f>` | 打包 .avpack 单文件容器（blake3 逐文件校验） | ✅ |
+| `av-runtime export -w <ckpt> --format safetensors` | 权重导出（跨生态互认，Python safetensors 实测可读） | ✅ |
+| `av-runtime panel --port 8080` | 观测面板（runs 浏览 + 指标视图，5 秒刷新） | ✅ |
+| `av-runtime distill` / `av-runtime nas` | 蒸馏 / 骨干选型 | ⏳ M9 |
 
 通用约定：错误信息三段式（发生了什么/为什么/下一步）；训练产物统一落
 `runs/<run_id>/{best.ckpt/, config.snapshot.toml, report.json}`。
@@ -58,9 +58,9 @@ win/linux 文件名），安装到 `<仓库>\.libtorch\`（已 gitignore），�
 
 ```toml
 [dependencies]
-av-core = "0.1"      # 几何/配置/格式工具：无 libtorch，二进制极小
-av-runtime = "0.1"   # 完整训练/推理引擎
-av-pretrain = "0.1"  # 预训练权重导入
+aegisvision-core = "0.3"      # 几何/配置/格式工具：无 libtorch，二进制极小
+aegisvision-runtime = "0.3"   # 完整训练/推理引擎
+aegisvision-pretrain = "0.3"  # 预训练权重导入
 ```
 
 **训练**：
@@ -231,7 +231,7 @@ ONNX/TensorRT 导出（M8，Python 侧车）、蒸馏/NAS（M9）。
 | 配置 | 旋转 mIoU | R@0.5 | 说明 |
 |---|---|---|---|
 | 320px 150ep（修复前） | 0.008 | 0.000 | 320 后目标 2-6px 物理不可见 + pos_w bug |
-| 640px 400ep GPU（修复后） | **0.403@ep50，训练中** | — | 修复 + 高分辨率叠加生效，10 倍以上改善 |
+| 640px 400ep GPU（修复后） | 峰值 **0.554**（ep120），末值 0.146 | 0.25（末值） | 修复 + 高分辨率叠加生效，10 倍以上改善；8 图小数据约 ep120 后过拟合回落（曲线存 `runs/obb-dota8/metrics.jsonl`，本地产物） |
 
 ### 5.6 数据增强 A/B（coco8-pose 关键点，200ep）
 
@@ -293,15 +293,15 @@ sm_120 内核；两个必须处理的坑已有内建方案：
 ```powershell
 # 构建（cu128 libtorch 2.85GB，解压至 E:\libs\libtorch-cu128-2.11）
 $env:LIBTORCH = "E:\libs\libtorch-cu128-2.11"
-CARGO_TARGET_DIR=target-gpu cargo build --release -p av-runtime
+CARGO_TARGET_DIR=target-gpu cargo build --release -p aegisvision-runtime
 # 运行（无"回退 CPU"告警 = 真在 GPU）
 $env:PATH = "E:\libs\libtorch-cu128-2.11\lib;$env:PATH"
 .\target-gpu\release\av-runtime.exe train -c configs/detect_coco8.toml
 ```
 
-实验矩阵与证据：初版 gpu 实验归档（cu121 内核对 sm_120 不可用的过程记录保留于
-项目历史）。`resolve_device` 在 CUDA 不可用时自动回退 CPU 并告警，`Cuda` 探测/
-cudnn/内核启动三级检查内建。
+实验矩阵与证据（版本筛选过程、sm_120 内核、torch_cuda.dll 专项）：
+[docs/gpu.md](gpu.md)。`resolve_device` 在 CUDA 不可用时自动回退 CPU 并告警，
+`Cuda` 探测/cudnn/内核启动三级检查内建。
 
 ---
 
@@ -325,21 +325,23 @@ avb predict --weights runs-avb/<名> --input img.jpg [--conf 0.25 --iou 0.7] \
 库 API（`use av_burn::...`）提供 SegNet / train / checkpoint / infer 四模块，
 详见 crate 文档。边界：该后端目前只有 seg 链路；无 ultralytics 权重导入；
 ndarray 后端无 BLAS（冒烟/小模型用），wgpu 吞吐约为 tch 的 1/3——生产训练
-仍建议主后端 `av`（§6）。
+仍建议主后端 `av-runtime`（§6）。
 
 ---
 
 ## 7. 发布清单（crates.io 就绪状态）
 
-- [x] 四 crate + av-pretrain 元数据（description/license/keywords/categories/readme）
+- [x] 六 crate 元数据（description/license/keywords/categories/readme/repository）
 - [x] LICENSE-MIT + LICENSE-APACHE 双许可
-- [x] 薄 README（crates.io 页面渲染）× 5
-- [x] examples/ 可编译示例
-- [x] `cargo package --list` 零警告
-- [ ] 仓库公开后补 repository URL（Cargo.toml 注释占位已留）
+- [x] 薄 README（crates.io 页面渲染）× 6
+- [x] examples/ 可编译示例（av-runtime × 4，av-burn × 1）
+- [x] repository URL 已生效（workspace 继承到全部 crate）
 - [ ] BENCHMARK §3 的 YOLOv8n 300ep 对比表定稿（基线已实测完成）
 - [ ] 版本号策略：deny_unknown_fields 配置字段增删 = 破坏性变更（SemVer）
-- [ ] 按依赖序 publish：av-core → av-pretrain → av-tasks → av-runtime
+- [ ] 按依赖序 publish（`cargo publish -p <名>`，失败可重试）：
+      aegisvision-core → aegisvision-pretrain → aegisvision-tasks →
+      aegisvision-plugins → aegisvision-burn → aegisvision-runtime
+      （或打 `v*` 标签走 release.yml 的 publish 任务，需配 `CARGO_REGISTRY_TOKEN` secret）
 
 ## 8. 已知问题档案（全部有据）
 

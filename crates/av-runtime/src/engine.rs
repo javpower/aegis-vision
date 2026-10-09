@@ -15,7 +15,7 @@ use tch::nn::OptimizerConfig;
 use tch::nn::VarStore;
 use tch::{Device, Kind, Tensor};
 
-use av_core::config::{DataPipeline, RunConfig, TaskCfg, TaskKind};
+use av_core::config::{DataPipeline, OptimizerKind, RunConfig, TaskCfg, TaskKind};
 use av_core::error::{AvError, AvResult};
 use av_core::geometry::Aabb;
 use av_pretrain::av_weight as av_weight_store;
@@ -264,22 +264,55 @@ fn optimizer_step(
 /// checkpoint：tch 0.17 的 VarStore::save/load 在 Windows + libtorch 2.4 组合下
 /// 存在序列化不兼容（_load_parameters 报 Expected GenericDict but got Object），
 /// 故自研目录式 checkpoint：每个变量一个 Tensor::save 文件，按名字对齐写回。
+///
+/// 写入走「临时目录 + 换名」原子替换：先写 `<dir>.tmp`，再 `<dir>` → `<dir>.old`
+/// → tmp 换名为 `<dir>`。目录 rename 在同卷上是原子的，中断在任何一步都不会
+/// 留下半写的 checkpoint；最坏情形（换名序列中间断电）`<dir>` 缺失但
+/// `<dir>.old` 完整，[`resume_checkpoint_dir`] 会回退读取。
 fn save_checkpoint(vs: &VarStore, dir: &Path) -> AvResult<()> {
-    fs::create_dir_all(dir)?;
-    for (name, t) in vs.variables() {
-        let f = dir.join(ckpt_file_name(&name));
-        t.save(&f)
-            .map_err(|e| AvError::train(format!("保存张量 {name} 失败: {e}")))?;
-    }
-    Ok(())
+    save_checkpoint_epoch_impl(vs, dir, None)
 }
 
 /// 同 [`save_checkpoint`]，额外写 meta.json 记录 epoch——`--resume` 续训的
 /// 恢复点（last.ckpt）依此知道该从哪个 epoch 继续。
 fn save_checkpoint_epoch(vs: &VarStore, dir: &Path, epoch: u32) -> AvResult<()> {
-    save_checkpoint(vs, dir)?;
-    fs::write(dir.join("meta.json"), format!("{{\"epoch\":{epoch}}}"))
-        .map_err(|e| AvError::train(format!("写 checkpoint 元数据失败: {e}")))
+    save_checkpoint_epoch_impl(vs, dir, Some(epoch))
+}
+
+fn save_checkpoint_epoch_impl(vs: &VarStore, dir: &Path, epoch: Option<u32>) -> AvResult<()> {
+    let tmp = PathBuf::from(format!("{}.tmp", dir.display()));
+    let old = PathBuf::from(format!("{}.old", dir.display()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp)?;
+    for (name, t) in vs.variables() {
+        let f = tmp.join(ckpt_file_name(&name));
+        t.save(&f)
+            .map_err(|e| AvError::train(format!("保存张量 {name} 失败: {e}")))?;
+    }
+    if let Some(epoch) = epoch {
+        fs::write(tmp.join("meta.json"), format!("{{\"epoch\":{epoch}}}"))
+            .map_err(|e| AvError::train(format!("写 checkpoint 元数据失败: {e}")))?;
+    }
+    let _ = fs::remove_dir_all(&old);
+    if dir.exists() {
+        fs::rename(dir, &old)?;
+    }
+    fs::rename(&tmp, dir)?;
+    let _ = fs::remove_dir_all(&old);
+    Ok(())
+}
+
+/// 读 checkpoint 目录：`<dir>` 缺失但 `<dir>.old` 完整时（上次原子换名序列
+/// 被中断）回退到 `.old`，返回实际使用的目录。
+fn resume_checkpoint_dir(dir: &Path) -> PathBuf {
+    if dir.is_dir() {
+        return dir.to_path_buf();
+    }
+    let old = PathBuf::from(format!("{}.old", dir.display()));
+    if old.is_dir() {
+        return old;
+    }
+    dir.to_path_buf()
 }
 
 /// 读 checkpoint 的 epoch 元数据；无 meta.json（旧格式/最终 best.ckpt）返回 None。
@@ -461,7 +494,7 @@ pub fn infer(cfg: &RunConfig, weights: &Path, input: &Path) -> AvResult<serde_js
         imagenet_norm(cfg),
     )?;
     let x = x.to_device(device).unsqueeze(0);
-    match model.predict(&x, 0.25, 0.5)? {
+    match model.predict(&x, cfg.infer.conf, cfg.infer.iou)? {
         PredictOutput::Classify { labels, confs } => {
             let preds: Vec<serde_json::Value> = labels
                 .iter()
@@ -592,7 +625,7 @@ pub fn infer_sliced(
     for batch in tiles.chunks(8) {
         let xs: Vec<Tensor> = batch.iter().map(|(_, _, x, _)| x.copy()).collect();
         let x = Tensor::stack(&xs, 0).to_device(device);
-        let per = model.predict(&x, 0.25, 0.5)?;
+        let per = model.predict(&x, cfg.infer.conf, cfg.infer.iou)?;
         let per_image = match per {
             PredictOutput::Detect { per_image } => per_image,
             PredictOutput::Classify { .. } => continue,
@@ -641,7 +674,7 @@ pub fn infer_sliced(
     // 碎片合并（跨窗同目标伪影抑制：中心距阈值取窗口短边 1/4）→ 全局 NMS
     let max_center_dist = 0.25 * tw.min(th) as f32;
     let all = merge_tile_fragments(all, 0.3, max_center_dist);
-    let all = av_core::types::nms(all, 0.5);
+    let all = av_core::types::nms(all, cfg.infer.iou);
     let tiles_cnt = (y_starts.len() * x_starts.len()) as u32;
     Ok(serde_json::json!({
         "task": "detect",
@@ -1018,13 +1051,14 @@ fn train_seg(cfg: &RunConfig, run_id: &str, run_dir: &Path, resume: bool) -> AvR
     // 绑定已恢复的张量）。EMA 统计不持久化，恢复后从当前权重重新累计。
     let mut start_epoch = 1u32;
     if resume {
-        let last = run_dir.join("last.ckpt");
+        let last = resume_checkpoint_dir(&run_dir.join("last.ckpt"));
         match read_checkpoint_epoch(&last) {
             Some(done) => {
                 load_checkpoint(&mut vs, &last)?;
                 start_epoch = done + 1;
                 println!(
-                    "[resume] 已从 last.ckpt 恢复（完成 {done} epoch），从 epoch {start_epoch} 续训；EMA 重新累计"
+                    "[resume] 已从 {} 恢复（完成 {done} epoch），从 epoch {start_epoch} 续训；EMA 重新累计",
+                    last.display()
                 );
             }
             None => println!("[resume] 未找到 last.ckpt（runs/{run_id}/），从头训练"),
@@ -1154,7 +1188,8 @@ fn train_seg(cfg: &RunConfig, run_id: &str, run_dir: &Path, resume: bool) -> AvR
             let TaskModel::Seg(m) = &model else {
                 unreachable!("分割任务模型类型")
             };
-            (val_miou, val_r50, val_p50, _, _) = eval_seg_samples(m, &val, device)?;
+            (val_miou, val_r50, val_p50, _, _) =
+                eval_seg_samples(m, &val, device, cfg.eval.conf, cfg.eval.iou)?;
             model.set_train(bn_train); // 恢复训练态
             println!(
                 "[seg] run={run_id} epoch={epoch}/{} loss={final_loss:.4} val掩码mIoU={val_miou:.3} val R@0.5={val_r50:.3} val P@0.5={val_p50:.3}",
@@ -1192,9 +1227,9 @@ fn train_seg(cfg: &RunConfig, run_id: &str, run_dir: &Path, resume: bool) -> AvR
             let idx: Vec<usize> = (0..train_n).collect();
             let plans = vec![AugmentPlan::none(); train_n];
             let clean = enc.encode(&idx, &plans)?;
-            eval_seg_samples(m, &clean, device)?
+            eval_seg_samples(m, &clean, device, cfg.eval.conf, cfg.eval.iou)?
         }
-        None => eval_seg_samples(m, &train, device)?,
+        None => eval_seg_samples(m, &train, device, cfg.eval.conf, cfg.eval.iou)?,
     };
 
     save_checkpoint(&vs, &run_dir.join(CKPT_DIR))?;
@@ -1224,7 +1259,13 @@ type SegEval = (f32, f32, f32, usize, Vec<(u32, f32, usize)>);
 /// （按分数降序贪心一对一匹配：预测配对最佳未占用同类 gt，IoU ≥ 0.5 计 TP；
 /// P@0.5 = TP / 预测总数，无预测时为 0）。
 /// 返回 (miou, r50, p50, gt 实例数, 分类别 (类 id, mIoU, gt 数)，类 id 升序)。
-fn eval_seg_samples(m: &SegModel, val: &[SegSample], device: Device) -> AvResult<SegEval> {
+fn eval_seg_samples(
+    m: &SegModel,
+    val: &[SegSample],
+    device: Device,
+    conf: f32,
+    iou: f32,
+) -> AvResult<SegEval> {
     if val.is_empty() {
         return Err(AvError::data("验证集为空"));
     }
@@ -1233,7 +1274,7 @@ fn eval_seg_samples(m: &SegModel, val: &[SegSample], device: Device) -> AvResult
     // 的原型平面显存约束（[B,K,mh,mw]，16 批 ≈ 0.5GB@640）
     for chunk in val.chunks(16) {
         let x = dataset::stack_seg_samples(chunk)?.to_device(device);
-        per_image.extend(m.predict(&x, 0.1, 0.5)?);
+        per_image.extend(m.predict(&x, conf, iou)?);
     }
     let mut sum_best = 0f32;
     let mut n_gt = 0usize;
@@ -1534,7 +1575,8 @@ fn train_keypoint(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<Tra
             let TaskModel::Keypoint(m) = &model else {
                 unreachable!("关键点任务模型类型")
             };
-            (val_pck, val_oks, _, _) = eval_kp_samples(m, &val, device)?;
+            (val_pck, val_oks, _, _) =
+                eval_kp_samples(m, &val, device, cfg.eval.conf, cfg.eval.iou)?;
             model.set_train(bn_train); // 恢复训练态
             println!(
                 "[keypoint] run={run_id} epoch={epoch}/{} loss={final_loss:.4} val PCK@0.5={val_pck:.3} val meanOKS={val_oks:.3}",
@@ -1571,9 +1613,9 @@ fn train_keypoint(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<Tra
                     )
                 })
                 .collect::<AvResult<Vec<_>>>()?;
-            eval_kp_samples(m, &clean, device)?
+            eval_kp_samples(m, &clean, device, cfg.eval.conf, cfg.eval.iou)?
         }
-        None => eval_kp_samples(m, &train, device)?,
+        None => eval_kp_samples(m, &train, device, cfg.eval.conf, cfg.eval.iou)?,
     };
 
     save_checkpoint(&vs, &run_dir.join(CKPT_DIR))?;
@@ -1608,6 +1650,8 @@ fn eval_kp_samples(
     m: &KeypointModel,
     samples: &[KeypointSample],
     device: Device,
+    conf: f32,
+    iou: f32,
 ) -> AvResult<(f32, f32, usize, usize)> {
     if samples.is_empty() {
         return Err(AvError::data("验证集为空"));
@@ -1617,7 +1661,7 @@ fn eval_kp_samples(
     // 16/批：与 seg 评测同一理由（见 eval_seg_samples）
     for chunk in samples.chunks(16) {
         let x = dataset::stack_kp_samples(chunk)?.to_device(device);
-        per_image.extend(m.predict(&x, 0.1, 0.5)?);
+        per_image.extend(m.predict(&x, conf, iou)?);
     }
     let (mut hits, mut visible, mut n_inst) = (0usize, 0usize, 0usize);
     let (mut ok_sum, mut ok_cnt) = (0f64, 0usize);
@@ -1825,7 +1869,7 @@ fn train_detect_obb(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<T
         let TaskModel::Detect(m) = &model else {
             unreachable!("OBB 模型类型")
         };
-        (miou, r50) = eval_obb_samples(m, &val, device)?;
+        (miou, r50) = eval_obb_samples(m, &val, device, cfg.eval.conf, cfg.eval.iou)?;
         model.set_train(bn_train);
         if epoch == 1 || epoch % 10 == 0 || epoch == cfg.train.epochs {
             println!(
@@ -1861,6 +1905,8 @@ fn eval_obb_samples(
     m: &av_tasks::models::DetectModel,
     val: &[dataset::ObbSample],
     device: Device,
+    conf: f32,
+    iou: f32,
 ) -> AvResult<(f32, f32)> {
     use av_core::geometry::RotBox;
     let n = val.len();
@@ -1873,7 +1919,7 @@ fn eval_obb_samples(
     for chunk in val.chunks(32) {
         let xs: Vec<&Tensor> = chunk.iter().map(|s| &s.x).collect();
         let x = Tensor::stack(&xs, 0).to_device(device);
-        per_image.extend(m.predict(&x, 0.1, 0.5)?);
+        per_image.extend(m.predict(&x, conf, iou)?);
     }
     let mut best = vec![0f32; n];
     let mut ok = vec![false; n];
@@ -1967,7 +2013,8 @@ pub fn eval(cfg: &RunConfig, weights: &Path) -> AvResult<serde_json::Value> {
                         Device::Cpu,
                         imagenet_norm(cfg),
                     )?;
-                    let evm = eval_detect_samples(m, &val, device, false)?;
+                    let evm =
+                        eval_detect_samples(m, &val, device, false, cfg.eval.conf, cfg.eval.iou)?;
                     Ok(serde_json::json!({
                         "task": "detect",
                         "mean_iou": evm.miou,
@@ -1977,8 +2024,14 @@ pub fn eval(cfg: &RunConfig, weights: &Path) -> AvResult<serde_json::Value> {
                     }))
                 }
                 _ => {
-                    let (miou, r50, _, _) =
-                        eval_detect(&model, d.num_classes as u32, d.img_size, device)?;
+                    let (miou, r50, _, _) = eval_detect(
+                        &model,
+                        d.num_classes as u32,
+                        d.img_size,
+                        device,
+                        cfg.eval.conf,
+                        cfg.eval.iou,
+                    )?;
                     Ok(serde_json::json!({ "task": "detect", "mean_iou": miou, "recall@0.5": r50 }))
                 }
             }
@@ -2008,7 +2061,8 @@ pub fn eval(cfg: &RunConfig, weights: &Path) -> AvResult<serde_json::Value> {
                 Device::Cpu,
                 imagenet_norm(cfg),
             )?;
-            let (miou, r50, p50, n_gt, per_class) = eval_seg_samples(m, &val, device)?;
+            let (miou, r50, p50, n_gt, per_class) =
+                eval_seg_samples(m, &val, device, cfg.eval.conf, cfg.eval.iou)?;
             let per_class_json: serde_json::Map<String, serde_json::Value> = per_class
                 .into_iter()
                 .map(|(cls, v, n)| {
@@ -2052,7 +2106,8 @@ pub fn eval(cfg: &RunConfig, weights: &Path) -> AvResult<serde_json::Value> {
                 Device::Cpu,
                 imagenet_norm(cfg),
             )?;
-            let (pck, mean_oks, n_vis, n_inst) = eval_kp_samples(m, &val, device)?;
+            let (pck, mean_oks, n_vis, n_inst) =
+                eval_kp_samples(m, &val, device, cfg.eval.conf, cfg.eval.iou)?;
             Ok(serde_json::json!({
                 "task": "keypoint",
                 "gt_instances": n_inst,
@@ -2164,15 +2219,26 @@ fn load_model(cfg: &RunConfig, weights: &Path) -> AvResult<(TaskModel, Device)> 
     let device = resolve_device(cfg);
     let mut vs = VarStore::new(device);
     let model = build_model(&vs.root(), cfg)?;
-    load_checkpoint(&mut vs, weights)?;
+    load_checkpoint(&mut vs, &resume_checkpoint_dir(weights))?;
     Ok((model, device))
 }
 
 fn make_opt(vs: &VarStore, cfg: &RunConfig) -> AvResult<tch::nn::Optimizer> {
-    let lr = cfg.train.optimizer.lr as f64;
-    tch::nn::Adam::default()
-        .build(vs, lr)
-        .map_err(|e| AvError::train(format!("优化器构建失败: {e}")))
+    let o = &cfg.train.optimizer;
+    let lr = o.lr as f64;
+    let wd = o.weight_decay as f64;
+    let built = match o.kind {
+        // tch 原生 AdamW：解耦权重衰减（与 burn 后端 AdamWConfig 同语义）
+        OptimizerKind::AdamW => tch::nn::AdamW::default().wd(wd).build(vs, lr),
+        OptimizerKind::Sgd => tch::nn::Sgd {
+            momentum: o.momentum as f64,
+            dampening: 0.0,
+            wd,
+            nesterov: false,
+        }
+        .build(vs, lr),
+    };
+    built.map_err(|e| AvError::train(format!("优化器构建失败: {e}")))
 }
 
 /// 输入归一化域判定（训练/评测/推理共用）：`backbone.imagenet_norm = true`
@@ -2618,7 +2684,14 @@ fn train_detect_synthetic(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvRe
         }
         final_loss = epoch_loss.mean(STEPS_PER_EPOCH);
         model.set_train(false); // 评测 = BN 推理语义
-        (miou, r50, det_stats, dbg) = eval_detect(&model, num_classes, img_size, device)?;
+        (miou, r50, det_stats, dbg) = eval_detect(
+            &model,
+            num_classes,
+            img_size,
+            device,
+            cfg.eval.conf,
+            cfg.eval.iou,
+        )?;
         model.set_train(bn_train); // 恢复训练态
         if epoch % 10 == 0 || epoch == cfg.train.epochs {
             println!(
@@ -3079,7 +3152,7 @@ fn train_detect_yolo(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<
             model.set_train(false); // 评测 = BN 推理语义（running 统计量）
                                     // EMA 影子权重参与评测，评测后还原（训练继续用原始变量）
             let ema_saved = ema.apply_to(&vs);
-            let evm = eval_detect_samples(m, &val, device, amp)?;
+            let evm = eval_detect_samples(m, &val, device, amp, cfg.eval.conf, cfg.eval.iou)?;
             ema.restore(&vs, &ema_saved);
             model.set_train(bn_train); // 恢复训练态
             (miou, r50) = (evm.miou, evm.r50);
@@ -3139,6 +3212,8 @@ fn eval_detect_samples(
     val: &[SampleTensor],
     device: Device,
     amp: bool,
+    conf: f32,
+    iou: f32,
 ) -> AvResult<DetectEvalMetrics> {
     let n = val.len();
     if n == 0 {
@@ -3151,9 +3226,9 @@ fn eval_detect_samples(
         let x = dataset::stack_samples(chunk)?.to_device(device);
         let pred = if amp {
             // AMP：推理也走 fp16 autocast（与训练一致的速度收益与数值域）
-            tch::autocast(true, || m.predict(&x, 0.1, 0.5))?
+            tch::autocast(true, || m.predict(&x, conf, iou))?
         } else {
-            m.predict(&x, 0.1, 0.5)?
+            m.predict(&x, conf, iou)?
         };
         per_image.extend(pred);
     }
@@ -3261,6 +3336,8 @@ fn eval_detect(
     num_classes: u32,
     img_size: u32,
     device: Device,
+    conf: f32,
+    iou: f32,
 ) -> AvResult<(f32, f32, f32, String)> {
     let mut rng = XorShift::new(0x5EED_0002);
     let n = 64usize;
@@ -3269,7 +3346,7 @@ fn eval_detect(
     let TaskModel::Detect(m) = model else {
         return Err(AvError::train("模型与任务不匹配"));
     };
-    let per_image = m.predict(&x, 0.25, 0.5)?;
+    let per_image = m.predict(&x, conf, iou)?;
     let total_dets: usize = per_image.iter().map(|d| d.len()).sum();
     let mut best_ious = vec![0f32; n];
     let mut class_ok = vec![false; n];
@@ -3445,7 +3522,8 @@ pub(crate) fn testing_eval_kp_samples(
     m: &KeypointModel,
     samples: &[KeypointSample],
 ) -> AvResult<(f32, f32, usize, usize)> {
-    eval_kp_samples(m, samples, Device::Cpu)
+    // 测试包装：沿用旧硬编码默认阈值（0.1/0.5），隔离于用户配置
+    eval_kp_samples(m, samples, Device::Cpu, 0.1, 0.5)
 }
 
 // ---------------------------------------------------------------------------

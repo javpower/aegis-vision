@@ -28,6 +28,7 @@ pub struct RunConfig {
     pub data: DataConfig,
     pub train: TrainConfig,
     pub eval: EvalConfig,
+    pub infer: InferConfig,
     pub panel: PanelConfig,
     pub pretrain: PretrainCfg,
 }
@@ -43,6 +44,7 @@ impl Default for RunConfig {
             data: DataConfig::default(),
             train: TrainConfig::default(),
             eval: EvalConfig::default(),
+            infer: InferConfig::default(),
             panel: PanelConfig::default(),
             pretrain: PretrainCfg::default(),
         }
@@ -83,6 +85,12 @@ impl RunConfig {
         if self.train.optimizer.lr <= 0.0 {
             return Err(AvError::config("train.optimizer.lr 必须 > 0"));
         }
+        if self.train.optimizer.weight_decay < 0.0 {
+            return Err(AvError::config("train.optimizer.weight_decay 必须 >= 0"));
+        }
+        if !(0.0..=1.0).contains(&self.train.optimizer.momentum) {
+            return Err(AvError::config("train.optimizer.momentum 需在 [0, 1] 区间"));
+        }
         if !(0.0 < self.train.scheduler.lr_min_factor && self.train.scheduler.lr_min_factor <= 1.0)
         {
             return Err(AvError::config(
@@ -94,6 +102,17 @@ impl RunConfig {
         }
         if self.train.warmup_epochs > self.train.epochs as f32 {
             return Err(AvError::config("train.warmup_epochs 不能超过 epochs"));
+        }
+        for (name, conf, iou) in [
+            ("eval", self.eval.conf, self.eval.iou),
+            ("infer", self.infer.conf, self.infer.iou),
+        ] {
+            if !(0.0..1.0).contains(&conf) {
+                return Err(AvError::config(format!("{name}.conf 需在 [0, 1) 区间")));
+            }
+            if !(0.0 < iou && iou <= 1.0) {
+                return Err(AvError::config(format!("{name}.iou 需在 (0, 1] 区间")));
+            }
         }
 
         if self.data.workers == 0 || self.data.prefetch == 0 {
@@ -666,6 +685,8 @@ pub struct OptimizerCfg {
     pub kind: OptimizerKind,
     pub lr: f32,
     pub weight_decay: f32,
+    /// 仅 SGD 生效（AdamW 无动量参数）；0.937 为 Ultralytics YOLO 配方默认值
+    pub momentum: f32,
 }
 
 impl Default for OptimizerCfg {
@@ -674,6 +695,7 @@ impl Default for OptimizerCfg {
             kind: OptimizerKind::AdamW,
             lr: 1e-3,
             weight_decay: 5e-4,
+            momentum: 0.937,
         }
     }
 }
@@ -713,6 +735,10 @@ pub enum SchedulerKind {
 pub struct EvalConfig {
     pub interval_epochs: u32,
     pub protocols: Vec<String>,
+    /// 验证/评测预测的 conf 阈值（训练中验证与 `av eval` 共用）
+    pub conf: f32,
+    /// 验证/评测的 NMS IoU 阈值
+    pub iou: f32,
 }
 
 impl Default for EvalConfig {
@@ -720,6 +746,25 @@ impl Default for EvalConfig {
         Self {
             interval_epochs: 10,
             protocols: vec!["coco-map".into()],
+            conf: 0.1,
+            iou: 0.5,
+        }
+    }
+}
+
+/// 推理后处理阈值（`av infer` / `engine::infer`；CLI `--conf/--iou` 覆盖此处）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct InferConfig {
+    pub conf: f32,
+    pub iou: f32,
+}
+
+impl Default for InferConfig {
+    fn default() -> Self {
+        Self {
+            conf: 0.25,
+            iou: 0.5,
         }
     }
 }
@@ -775,6 +820,51 @@ impl Default for PretrainCfg {
             layer_map: None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+/// 解析 Ultralytics 标准 `data.yaml`（path/train/val/names 四键）：
+/// 返回 (数据集根, 训练图目录, 验证图目录, 类别名)。names 支持
+/// `['A', 'B']` 与 `[A, B]` 两种写法。解析失败/缺键报数据错误——
+/// 显式失败优于静默错位。
+pub fn parse_data_yaml(
+    path: &std::path::Path,
+) -> AvResult<(std::path::PathBuf, String, String, Vec<String>)> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| AvError::data(format!("读 data.yaml 失败 {}: {e}", path.display())))?;
+    let mut kv: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (k, v) = line
+            .split_once(':')
+            .ok_or_else(|| AvError::data(format!("data.yaml 行缺少冒号: {line}")))?;
+        kv.insert(k.trim().to_string(), v.trim().to_string());
+    }
+    let need = |k: &str| -> AvResult<String> {
+        kv.get(k)
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| AvError::data(format!("data.yaml 缺少字段: {k}")))
+    };
+    let root = std::path::PathBuf::from(need("path")?);
+    let train = need("train")?;
+    let val = need("val")?;
+    let names_raw = need("names")?;
+    let names: Vec<String> = names_raw
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Err(AvError::data("data.yaml names 为空"));
+    }
+    // train/val split 的相对路径由各数据集加载器按 root 拼接（dir + split 语义）
+    Ok((root, train, val, names))
 }
 
 // ---------------------------------------------------------------------------
@@ -914,6 +1004,46 @@ mod tests {
     }
 
     #[test]
+    fn infer_and_threshold_defaults_when_absent() {
+        // 旧版 TOML（无 [infer]、optimizer.momentum、eval.conf/iou）必须照常解析
+        let cfg = RunConfig::from_toml_str(MINIMAL).unwrap();
+        assert_eq!(cfg.infer.conf, 0.25);
+        assert_eq!(cfg.infer.iou, 0.5);
+        assert_eq!(cfg.eval.conf, 0.1);
+        assert_eq!(cfg.eval.iou, 0.5);
+        assert_eq!(cfg.train.optimizer.momentum, 0.937);
+        assert_eq!(cfg.train.optimizer.kind, OptimizerKind::AdamW);
+        assert!((cfg.train.optimizer.weight_decay - 5e-4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn infer_section_overrides_thresholds() {
+        let t = format!("{MINIMAL}[infer]\nconf = 0.4\niou = 0.7\n");
+        let cfg = RunConfig::from_toml_str(&t).unwrap();
+        assert_eq!(cfg.infer.conf, 0.4);
+        assert_eq!(cfg.infer.iou, 0.7);
+    }
+
+    #[test]
+    fn threshold_validation_rejects_out_of_range() {
+        let t = format!("{MINIMAL}[infer]\nconf = 1.0\n");
+        assert!(RunConfig::from_toml_str(&t)
+            .unwrap_err()
+            .to_string()
+            .contains("infer.conf"));
+        let t = format!("{MINIMAL}[eval]\niou = 0.0\n");
+        assert!(RunConfig::from_toml_str(&t)
+            .unwrap_err()
+            .to_string()
+            .contains("eval.iou"));
+        let t = format!("{MINIMAL}[train.optimizer]\nmomentum = 1.5\n");
+        assert!(RunConfig::from_toml_str(&t)
+            .unwrap_err()
+            .to_string()
+            .contains("momentum"));
+    }
+
+    #[test]
     fn pretrain_enable_requires_weight_path() {
         let t = format!("{MINIMAL}[pretrain]\nenable = true\n");
         let err = RunConfig::from_toml_str(&t).unwrap_err();
@@ -943,56 +1073,4 @@ mod tests {
         assert!(cfg.pretrain.load_only_backbone);
         assert!(!cfg.pretrain.freeze_backbone);
     }
-}
-
-/// 解析 Ultralytics 标准 `data.yaml`（path/train/val/names 四键）：
-/// 返回 (数据集根, 训练图目录, 验证图目录, 类别名)。names 支持
-/// `['A', 'B']` 与 `[A, B]` 两种写法。解析失败/缺键报数据错误——
-/// 显式失败优于静默错位。
-pub fn parse_data_yaml(
-    path: &std::path::Path,
-) -> AvResult<(std::path::PathBuf, String, String, Vec<String>)> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| AvError::data(format!("读 data.yaml 失败 {}: {e}", path.display())))?;
-    let mut kv: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (k, v) = line
-            .split_once(':')
-            .ok_or_else(|| AvError::data(format!("data.yaml 行缺少冒号: {line}")))?;
-        kv.insert(k.trim().to_string(), v.trim().to_string());
-    }
-    let need = |k: &str| -> AvResult<String> {
-        kv.get(k)
-            .filter(|v| !v.is_empty())
-            .cloned()
-            .ok_or_else(|| AvError::data(format!("data.yaml 缺少字段: {k}")))
-    };
-    let root = std::path::PathBuf::from(need("path")?);
-    let train = need("train")?;
-    let val = need("val")?;
-    let names_raw = need("names")?;
-    let names: Vec<String> = names_raw
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .split(',')
-        .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if names.is_empty() {
-        return Err(AvError::data("data.yaml names 为空"));
-    }
-    // 相对 path 时 train/val 相对 root 解析；绝对（含盘符）原样保留
-    let join = |p: &str| -> std::path::PathBuf {
-        let pp = std::path::Path::new(p);
-        if pp.is_absolute() {
-            pp.to_path_buf()
-        } else {
-            root.join(pp)
-        }
-    };
-    Ok((root, train, val, names))
 }

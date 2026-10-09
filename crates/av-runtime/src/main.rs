@@ -7,11 +7,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+// 仅 preflight/训练路径与单测消费；no-torch 非测试构建不需要（否则 unused 报错）
+#[cfg(any(feature = "torch", test))]
 use av_core::config::{DataPipeline, RunConfig, TaskCfg};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "av", version, about = "AegisVision：Rust 原生多任务检测框架")]
+#[command(
+    name = "av-runtime",
+    version,
+    about = "AegisVision：Rust 原生多任务检测框架"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -187,6 +193,27 @@ fn main() -> Result<()> {
             &overrides,
             dry_run,
         ),
+        Command::Infer {
+            weights,
+            config,
+            input,
+            conf,
+            iou,
+            slice,
+            slice_window,
+            slice_overlap,
+            save_viz,
+        } => cmd_infer(
+            &weights,
+            config.as_deref(),
+            &input,
+            conf,
+            iou,
+            slice,
+            slice_window,
+            slice_overlap,
+            save_viz.as_deref(),
+        ),
         Command::Pack { src, out } => {
             let (count, bytes) =
                 av_runtime::avpack::pack_dir(&src, &out).map_err(anyhow::Error::from)?;
@@ -207,7 +234,7 @@ fn main() -> Result<()> {
             out,
         } => cmd_export(&weights, &format, out.as_deref()),
         other => bail!(
-            "{}：尚未实现（按 PLAN §8 路线图排期）\n  下一步：当前可用子命令 av init / av train / av infer / av eval（av train --dry-run 可先校验配置）",
+            "{}：尚未实现（按 PLAN §8 路线图排期）\n  下一步：当前可用子命令 av-runtime init / train / infer / eval（train --dry-run 可先校验配置）",
             milestone_of(&other)
         ),
     }
@@ -215,19 +242,20 @@ fn main() -> Result<()> {
 
 fn milestone_of(cmd: &Command) -> &'static str {
     match cmd {
-        Command::Init { .. } => "av init",
-        Command::Pack { .. } => "av pack（已接通：.avpack 容器打包）",
-        Command::Eval { .. } => "av eval（v0.1 合成冒烟已接通）",
-        Command::Export { .. } => "av export（safetensors 已接通）",
-        Command::Distill { .. } => "av distill（M9）",
-        Command::Nas { .. } => "av nas（M9）",
-        Command::Panel { .. } => "av panel（已接通：runs 浏览 + 指标视图）",
-        Command::Train { .. } => "av train",
-        Command::Infer { .. } => "av infer",
+        Command::Init { .. } => "av-runtime init",
+        Command::Pack { .. } => "av-runtime pack（已接通：.avpack 容器打包）",
+        Command::Eval { .. } => "av-runtime eval（v0.1 合成冒烟已接通）",
+        Command::Export { .. } => "av-runtime export（safetensors 已接通）",
+        Command::Distill { .. } => "av-runtime distill（M9）",
+        Command::Nas { .. } => "av-runtime nas（M9）",
+        Command::Panel { .. } => "av-runtime panel（已接通：runs 浏览 + 指标视图）",
+        Command::Train { .. } => "av-runtime train",
+        Command::Infer { .. } => "av-runtime infer",
     }
 }
 
 #[cfg(feature = "torch")]
+#[allow(clippy::too_many_arguments)]
 fn cmd_train(
     config_path: Option<&Path>,
     data: Option<&Path>,
@@ -383,6 +411,7 @@ fn synthesize_config(
 }
 
 #[cfg(not(feature = "torch"))]
+#[allow(clippy::too_many_arguments)]
 fn cmd_train(
     _config_path: Option<&Path>,
     _data: Option<&Path>,
@@ -416,11 +445,6 @@ fn run_train(cfg: &av_core::config::RunConfig, resume: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "torch"))]
-fn run_train(_cfg: &av_core::config::RunConfig, _resume: bool) -> Result<()> {
-    bail!("本二进制未启用 torch feature（--features torch），无法训练；可用 --dry-run 校验配置")
-}
-
 #[cfg(feature = "torch")]
 #[allow(clippy::too_many_arguments)]
 fn cmd_infer(
@@ -434,8 +458,10 @@ fn cmd_infer(
     slice_overlap: f32,
     save_viz: Option<&Path>,
 ) -> Result<()> {
-    let _ = (conf, iou); // v0.1 引擎使用内置默认值；参数生效按 M2 批推理接口
-    let cfg = resolve_config_for_weights(weights, config)?;
+    let mut cfg = resolve_config_for_weights(weights, config)?;
+    // CLI 旗标覆盖快照里的 [infer] 阈值（此前 v0.1 直接丢弃这两个参数）
+    cfg.infer.conf = conf;
+    cfg.infer.iou = iou;
     let result = if slice {
         av_runtime::engine::infer_sliced(&cfg, weights, input, slice_window, slice_overlap)
             .map_err(anyhow::Error::from)?
@@ -633,6 +659,7 @@ fn save_viz_image(input: &Path, result: &serde_json::Value, dir: &Path) -> Resul
 }
 
 #[cfg(not(feature = "torch"))]
+#[allow(clippy::too_many_arguments)]
 fn cmd_infer(
     _weights: &Path,
     _config: Option<&std::path::Path>,
@@ -710,6 +737,7 @@ fn cmd_eval(_weights: &Path, _report: Option<&std::path::Path>) -> Result<()> {
     bail!("本二进制未启用 torch feature（--features torch），无法评测")
 }
 
+#[cfg(feature = "torch")]
 fn load_config(config_path: &Path) -> Result<av_core::config::RunConfig> {
     if !config_path.exists() {
         bail!(
@@ -721,6 +749,7 @@ fn load_config(config_path: &Path) -> Result<av_core::config::RunConfig> {
         .with_context(|| format!("读取配置 {}", config_path.display()))
 }
 
+#[cfg(feature = "torch")]
 fn apply_overrides(cfg: &mut av_core::config::RunConfig, overrides: &[String]) -> Result<()> {
     for ov in overrides {
         let (k, v) = ov.split_once('=').with_context(|| {
@@ -743,6 +772,7 @@ fn apply_overrides(cfg: &mut av_core::config::RunConfig, overrides: &[String]) -
     Ok(())
 }
 
+#[cfg(feature = "torch")]
 fn print_run_plan(cfg: &av_core::config::RunConfig) {
     let run_id = cfg.effective_run_id();
     let tasks = cfg
@@ -1174,6 +1204,7 @@ fn auto_class_count(task: InitTask, root: &Path) -> Option<usize> {
 
 /// 训练前数据侧预检（CLI 层）：目录存在性 + 类数一致性，
 /// 把原本藏在「整集预解码之后/模型构建期」的失败提前到毫秒级、并给出下一步。
+#[cfg(any(feature = "torch", test))]
 fn preflight_data_check(cfg: &RunConfig) -> Result<()> {
     if cfg.data.pipeline != DataPipeline::Dir {
         return Ok(()); // synthetic / avpack（M2）不在此检查

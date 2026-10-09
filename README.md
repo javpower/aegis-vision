@@ -20,13 +20,15 @@
 ## ⚡ 一条命令训练
 
 ```bash
-# 数据集 = Ultralytics 目录约定或 data.yaml，类数自动探测
-av-runtime train --data datasets/glass_logo/data.yaml --imgsz 1280 --epochs 100
+# 开箱即跑：合成数据冒烟（无需数据集）
+av-runtime train -c configs/quick_detect.toml
+# 真实数据 = Ultralytics 目录约定或 data.yaml，类数自动探测
+av-runtime train --data <数据集目录|data.yaml> --imgsz 1280 --epochs 100
 ```
 
 自动装配：csp-elan 骨干（YOLOv8 同构）+ 官方预训练导入 + mosaic/flip/HSV 增强 +
 **AMP 混合精度 + 内容贴片缓存 + 双缓冲预取** + EMA + 按 fitness 保存 best.ckpt。
-复杂场景（OBB/分割/关键点/自定义骨干）用 TOML 配置文件，字段见 `av init` 生成模板。
+复杂场景（OBB/分割/关键点/自定义骨干）用 TOML 配置文件，字段见 `av-runtime init` 生成模板。
 
 ## 📊 实测：对标 Ultralytics YOLO26n
 
@@ -41,7 +43,7 @@ av-runtime train --data datasets/glass_logo/data.yaml --imgsz 1280 --epochs 100
 > 无 Python 运行时、模型权重与训练过程全程可审计；精度与速度已进入同一量级。
 
 更多真实数据基线（coco128 检测 / ImageNette 分类 / coco8-seg / coco8-pose /
-dota8 OBB / 骨干×预训练七臂对照）见 [runs/COMPARISON.md](runs/COMPARISON.md)。
+dota8 OBB / 骨干×预训练七臂对照）见 [docs/USAGE.md §5](docs/USAGE.md)。
 
 ## 📦 作为库嵌入（应用内在线训练）
 
@@ -80,7 +82,7 @@ avb train   --data <目录|data.yaml> --epochs 100 --device gpu
 avb predict --weights runs-avb/<name> --input img.jpg --save-viz out/ --json res.json
 ```
 
-后端选型建议：生产训练/推理用主后端 `av`（tch/libtorch，最快）；受限环境
+后端选型建议：生产训练/推理用主后端 `av-runtime`（tch/libtorch，最快）；受限环境
 （无 libtorch、纯 Rust 构建）用 `avb`（wgpu/ndarray，wgpu 实测约为 tch 的
 1/3 吞吐）。详见 [crates.io/crates/aegisvision-burn](https://crates.io/crates/aegisvision-burn)。
 
@@ -126,8 +128,8 @@ C#/Java/C++/JS/Android 的 ONNX Runtime 直接消费；预处理（/255、归一
 CPU libtorch）；GPU 一条命令自动配置。
 
 ```powershell
-.\scripts\setup-env.ps1                 # Windows（Linux: ./scripts/setup-env.sh）
-cargo build --release -p av-runtime     # 产出 target\release\av-runtime.exe
+.\scripts\setup-env.ps1                       # Windows（Linux: ./scripts/setup-env.sh）
+cargo build --release -p aegisvision-runtime  # 产出 target\release\av-runtime.exe
 
 av-runtime train --data <数据集或 data.yaml> --imgsz 640   # 一条命令训练
 av-runtime infer -w runs/<id>/best.ckpt --input sample.jpg --save-viz viz
@@ -137,9 +139,8 @@ av-runtime eval   -w runs/<id>/best.ckpt --report report.json
 ## 📚 文档
 
 - [docs/USAGE.md](docs/USAGE.md) —— CLI 全命令、五任务数据格式、GPU 配置、
-  基准详表、骨干×任务矩阵、已知问题档案
-- [runs/COMPARISON.md](runs/COMPARISON.md) —— 骨干×预训练七臂对照研究
-- [runs/M2-BURN-BENCHMARK.md](runs/M2-BURN-BENCHMARK.md) —— burn-wgpu 双后端基准
+  基准详表（coco128/ImageNette/coco8-seg/coco8-pose/dota8 + 增强对照）、
+  骨干×任务矩阵、已知问题档案
 
 ## 🎯 诚实边界
 

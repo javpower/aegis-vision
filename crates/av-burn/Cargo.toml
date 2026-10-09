@@ -9,6 +9,8 @@ authors.workspace = true
 readme = "README.md"
 keywords = ["deep-learning", "yolo", "segmentation", "burn", "wgpu"]
 categories = ["science", "multimedia::images", "command-line-utilities"]
+# 内部开发进度日志，不进发布包
+exclude = ["PROGRESS.md"]
 
 [features]
 # wgpu = GPU 后端（默认已含 burn-fusion 融合 + autotune）；默认仅 ndarray，
