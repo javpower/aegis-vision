@@ -13,6 +13,10 @@ on:
   push:
     tags: ["v*"]
 
+# 挂产物到 GitHub Release 需要 contents 写权限（默认 GITHUB_TOKEN 只读）
+permissions:
+  contents: write
+
 jobs:
   cpu:
     strategy:
@@ -62,6 +66,7 @@ jobs:
 
   gpu-windows:
     runs-on: windows-latest
+    continue-on-error: true  # CUDA 构建失败不阻塞 CPU 产物发布（单独排查）
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
