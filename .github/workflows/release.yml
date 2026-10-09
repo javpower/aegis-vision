@@ -33,6 +33,8 @@ jobs:
             target: aarch64-apple-darwin
             archive: tar.gz
     runs-on: ${{ matrix.os }}
+    # macOS arm64 的 libtorch 供给（LIBTORCH_USE_PYTORCH）仍不稳定 → 单独失败不阻塞发布
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     defaults:
       run:
         shell: bash
@@ -93,8 +95,7 @@ jobs:
   gpu-windows:
     runs-on: windows-latest
     continue-on-error: true  # CUDA 构建失败不阻塞 CPU 产物发布（单独排查）
-    steps:
-      - uses: actions/checkout@v4
+    steps:      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Download CUDA libtorch (cu128, 与 setup-env.ps1 同源同版本)
         shell: pwsh

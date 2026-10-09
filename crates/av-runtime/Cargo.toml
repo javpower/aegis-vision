@@ -47,3 +47,9 @@ tokio = { workspace = true, features = ["io-util"] }
 
 [lib]
 name = "av_runtime"
+
+# CLI 二进制名固定 av-runtime（crate 改名 aegisvision-runtime 后保持文档/
+# 下载产物/脚本引用一致；默认会随包名漂移成 aegisvision-runtime）
+[[bin]]
+name = "av-runtime"
+path = "src/main.rs"
