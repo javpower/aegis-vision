@@ -33,13 +33,23 @@ jobs:
             target: aarch64-apple-darwin
             archive: tar.gz
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - name: Build (CPU libtorch auto-download)
-        run: cargo build --release -p av-runtime --target ${{ matrix.target }}
+        run: |
+          set -o pipefail
+          cargo build --release -p av-runtime --target ${{ matrix.target }} 2>&1 | tee build.log
+      - name: Report build failure (错误尾部写入注解供匿名读取)
+        if: failure()
+        run: |
+          grep -aE "^error(\[|:)" build.log | head -25 | while IFS= read -r l; do echo "::error::$l"; done
+          echo "::error::TAIL $(tail -c 1200 build.log | tr '\n\r' ' ')"
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         run: |
@@ -78,7 +88,16 @@ jobs:
           # 解压根目录名 = libtorch（LIBTORCH 指向解压后的 libtorch 根）
           "LIBTORCH=$PWD\libtorch" | Out-File -Append $env:GITHUB_ENV
       - name: Build (CUDA)
-        run: cargo build --release -p av-runtime
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release -p av-runtime 2>&1 | tee build-gpu.log
+      - name: Report build failure (错误尾部写入注解供匿名读取)
+        if: failure()
+        shell: bash
+        run: |
+          grep -aE "^error(\[|:)" build-gpu.log | head -25 | while IFS= read -r l; do echo "::error::$l"; done
+          echo "::error::TAIL $(tail -c 1200 build-gpu.log | tr '\n\r' ' ')"
       - name: Package
         shell: pwsh
         run: |
