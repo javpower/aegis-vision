@@ -41,6 +41,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # macOS arm64：torch-sys 无预编译 libtorch 可下载（tch-rs #629），
+      # 官方解法 = 从 pip 安装的 torch 提取（LIBTORCH_USE_PYTORCH）
+      - name: Install PyTorch (macOS arm64 libtorch source)
+        if: runner.os == 'macOS'
+        run: python3 -m pip install --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu || python3 -m pip install torch
+      - name: Use LIBTORCH_USE_PYTORCH (macOS)
+        if: runner.os == 'macOS'
+        run: echo "LIBTORCH_USE_PYTORCH=1" >> "$GITHUB_ENV"
       - name: Build (CPU libtorch auto-download)
         run: |
           set -o pipefail
@@ -57,18 +65,24 @@ jobs:
         run: |
           DIR="aegisvision-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$DIR"
-          cp "target/${{ matrix.target }}/release/av-runtime" "$DIR/"
-          cp README.md LICENSE-MIT LICENSE-APACHE "$DIR/"
+          cp "target/${{ matrix.target }}/release/av-runtime" "$DIR/" || { echo "::error::binary missing: $(ls target/${{ matrix.target }}/release/ 2>&1 | head -5)"; exit 1; }
+          cp README.md LICENSE-MIT LICENSE-APACHE "$DIR/" || { echo "::error::docs missing: $(ls)"; exit 1; }
           tar czf "$DIR.tar.gz" "$DIR"
       - name: Package (windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $dir = "aegisvision-${{ github.ref_name }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/av-runtime.exe" $dir
-          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $dir
-          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          $ErrorActionPreference = 'Stop'
+          try {
+            $dir = "aegisvision-${{ github.ref_name }}-${{ matrix.target }}"
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            Copy-Item "target/${{ matrix.target }}/release/av-runtime.exe" $dir
+            Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $dir
+            Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          } catch {
+            Write-Output "::error::Package failed: $($_.Exception.Message)"
+            exit 1
+          }
       - uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -105,15 +119,21 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $dir = "aegisvision-${{ github.ref_name }}-x86_64-windows-cuda"
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          Copy-Item "target/release/av-runtime.exe" $dir
-          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $dir
-          @'
-          GPU 运行环境：下载 cu128 libtorch 并将 lib 目录加入 PATH
-          （scripts/setup-env.ps1 -Device cuda 自动完成），无需 CUDA Toolkit。
-          '@ | Out-File -Encoding utf8 "$dir\GPU-README.txt"
-          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          $ErrorActionPreference = 'Stop'
+          try {
+            $dir = "aegisvision-${{ github.ref_name }}-x86_64-windows-cuda"
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            Copy-Item "target/release/av-runtime.exe" $dir
+            Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $dir
+            @'
+            GPU 运行环境：下载 cu128 libtorch 并将 lib 目录加入 PATH
+            （scripts/setup-env.ps1 -Device cuda 自动完成），无需 CUDA Toolkit。
+            '@ | Out-File -Encoding utf8 "$dir\GPU-README.txt"
+            Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          } catch {
+            Write-Output "::error::Package failed: $($_.Exception.Message)"
+            exit 1
+          }
       - uses: softprops/action-gh-release@v2
         with:
           files: "*.zip"
