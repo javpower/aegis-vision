@@ -44,7 +44,7 @@ jobs:
       - name: Build (CPU libtorch auto-download)
         run: |
           set -o pipefail
-          cargo build --release -p av-runtime --target ${{ matrix.target }} 2>&1 | tee build.log
+          cargo build --release -p aegisvision-runtime --target ${{ matrix.target }} 2>&1 | tee build.log
       - name: Report build failure (错误尾部写入注解供匿名读取)
         if: failure()
         run: |
@@ -93,7 +93,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo build --release -p av-runtime 2>&1 | tee build-gpu.log
+          cargo build --release -p aegisvision-runtime 2>&1 | tee build-gpu.log
       - name: Report build failure (错误尾部写入注解供匿名读取)
         if: failure()
         shell: bash
