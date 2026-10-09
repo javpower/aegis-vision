@@ -48,8 +48,10 @@ jobs:
       - name: Report build failure (错误尾部写入注解供匿名读取)
         if: failure()
         run: |
-          grep -aE "^error(\[|:)" build.log | head -25 | while IFS= read -r l; do echo "::error::$l"; done
-          echo "::error::TAIL $(tail -c 1200 build.log | tr '\n\r' ' ')"
+          echo "::error::BUILD FAILED, build.log tail:"
+          tail -c 2400 build.log | tr '\n\r' '  ' | fold -w 200 | while IFS= read -r l; do echo "::error::$l"; done || true
+          grep -a "panicked at" build.log | tail -3 | while IFS= read -r l; do echo "::error::$l"; done || true
+          grep -aE "^error" build.log | head -10 | while IFS= read -r l; do echo "::error::$l"; done || true
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         run: |
@@ -96,8 +98,10 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          grep -aE "^error(\[|:)" build-gpu.log | head -25 | while IFS= read -r l; do echo "::error::$l"; done
-          echo "::error::TAIL $(tail -c 1200 build-gpu.log | tr '\n\r' ' ')"
+          echo "::error::BUILD FAILED, build-gpu.log tail:"
+          tail -c 2400 build-gpu.log | tr '\n\r' '  ' | fold -w 200 | while IFS= read -r l; do echo "::error::$l"; done || true
+          grep -a "panicked at" build-gpu.log | tail -3 | while IFS= read -r l; do echo "::error::$l"; done || true
+          grep -aE "^error" build-gpu.log | head -10 | while IFS= read -r l; do echo "::error::$l"; done || true
       - name: Package
         shell: pwsh
         run: |
