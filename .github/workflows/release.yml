@@ -95,7 +95,8 @@ jobs:
   gpu-windows:
     runs-on: windows-latest
     continue-on-error: true  # CUDA 构建失败不阻塞 CPU 产物发布（单独排查）
-    steps:      - uses: actions/checkout@v4
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Download CUDA libtorch (cu128, 与 setup-env.ps1 同源同版本)
         shell: pwsh
