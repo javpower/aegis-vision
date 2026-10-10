@@ -61,7 +61,10 @@ pub struct KpTarget {
     pub labels: Vec<u32>,
 }
 
-/// 贪心 NMS：按分数降序保留，抑制与已保留框 IoU 超过阈值的候选（纯 Rust，PLAN §4.2）。
+/// 贪心 NMS + 分数加权融合（Ultralytics `non_max_suppression` 同语义：按分数
+/// 降序、仅同类互相抑制，类间从不互斥），被抑制框按分数加权**融进**保留框
+/// 而非丢弃——小目标上同一物体的多个偏移预测（IoU 低于阈值的不完全重叠
+/// 重复框）融合后框更紧、重复 FP 消失；无重叠时与普通 NMS 行为一致。
 pub fn nms(mut dets: Vec<Detection>, iou_thr: f32) -> Vec<Detection> {
     dets.sort_by(|a, b| {
         b.score
@@ -69,10 +72,22 @@ pub fn nms(mut dets: Vec<Detection>, iou_thr: f32) -> Vec<Detection> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut kept: Vec<Detection> = Vec::new();
-    for d in dets {
-        if kept.iter().all(|k| k.bbox.iou(&d.bbox) <= iou_thr) {
-            kept.push(d);
+    'candidate: for d in dets {
+        for k in &mut kept {
+            if k.class_id == d.class_id && k.bbox.iou(&d.bbox) > iou_thr {
+                // 分数加权融合（只融合几何；score/class 沿用保留框）
+                let w = k.score / (k.score + d.score).max(1e-9);
+                let m = |a: f32, b: f32| a * w + b * (1.0 - w);
+                k.bbox = Aabb::new(
+                    m(k.bbox.x1, d.bbox.x1),
+                    m(k.bbox.y1, d.bbox.y1),
+                    m(k.bbox.x2, d.bbox.x2),
+                    m(k.bbox.y2, d.bbox.y2),
+                );
+                continue 'candidate;
+            }
         }
+        kept.push(d);
     }
     kept
 }
@@ -120,5 +135,28 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert!((kept[0].score - 0.9).abs() < 1e-6);
         assert!((kept[1].score - 0.5).abs() < 1e-6);
+    }
+
+    /// 类感知：同位置不同类别的框不互相抑制（Ultralytics max_wh 偏移等价），
+    /// 同类高重叠才被抑制。
+    #[test]
+    fn nms_is_class_aware() {
+        let base = |x1: f32, score: f32, class_id: u32| Detection {
+            bbox: Aabb::new(x1, 0.0, x1 + 10.0, 10.0),
+            score,
+            class_id,
+            angle: None,
+            keypoints: None,
+        };
+        // c0 高分框与 c1 高分框完全重叠 → 都保留；c0 低分重复框被同类抑制
+        let dets = vec![
+            base(0.0, 0.9, 0),
+            base(0.0, 0.8, 1),
+            base(1.0, 0.7, 0),
+        ];
+        let kept = nms(dets, 0.5);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].class_id, 0);
+        assert_eq!(kept[1].class_id, 1);
     }
 }

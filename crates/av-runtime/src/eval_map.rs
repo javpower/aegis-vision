@@ -41,6 +41,11 @@ pub struct MapReport {
     pub map50_95: f32,
     /// IoU=0.50 单档 AP 的类别均值（mAP50）。
     pub map50: f32,
+    /// Ultralytics parity 的 precision：逐类在 IoU=0.5 档的 PR 曲线上取
+    /// max-F1 点的 precision，对存在 gt 的类别求平均（`metrics/precision(B)`）。
+    pub precision: f32,
+    /// 同 [`MapReport::precision`] 的 recall（`metrics/recall(B)`）。
+    pub recall: f32,
     /// 参与平均的 gt 类别数。
     pub num_classes: usize,
     /// 已记录的图片数。
@@ -96,6 +101,8 @@ impl CocoEvaluator {
         let report = MapReport {
             map50_95: 0.0,
             map50: 0.0,
+            precision: 0.0,
+            recall: 0.0,
             num_classes: classes.len(),
             num_images: self.images.len(),
             num_gts,
@@ -109,31 +116,39 @@ impl CocoEvaluator {
         // det×gt IoU 矩阵），10 个 IoU 档位复用同一份 IoU——旧实现每档重算
         // 全部 IoU，评测是 10 倍重复计算。保序 collect 后仍按类 id 升序、
         // 档位序累加，f64 求和顺序与串行逐位一致。
-        let per_class: Vec<[f64; 10]> = classes
+        let per_class: Vec<([f64; 10], (f64, f64))> = classes
             .par_iter()
             .map(|&c| {
                 let ctx = self.class_context(c);
+                let (prec, rec) = class_pr_curve_at(&ctx, IOU_THRESHOLDS[0]);
+                let pr = pr_at_max_f1(&prec, &rec);
                 let mut aps = [0.0f64; 10];
                 for (ti, &thr) in IOU_THRESHOLDS.iter().enumerate() {
                     aps[ti] = class_ap_at(&ctx, thr);
                 }
-                aps
+                (aps, pr)
             })
             .collect();
         let mut sum_all = 0.0f64; // Σ AP over (class, 10 thresholds)
         let mut sum_50 = 0.0f64; // Σ AP at IoU=0.50
-        for aps in &per_class {
+        let mut sum_p = 0.0f64; // Σ per-class precision@max-F1
+        let mut sum_r = 0.0f64; // Σ per-class recall@max-F1
+        for (aps, (p, r)) in &per_class {
             for (ti, &ap) in aps.iter().enumerate() {
                 sum_all += ap;
                 if ti == 0 {
                     sum_50 += ap;
                 }
             }
+            sum_p += p;
+            sum_r += r;
         }
         let n = classes.len() as f64;
         MapReport {
             map50_95: (sum_all / (10.0 * n)) as f32,
             map50: (sum_50 / n) as f32,
+            precision: (sum_p / n) as f32,
+            recall: (sum_r / n) as f32,
             ..report
         }
     }
@@ -192,9 +207,13 @@ struct ClassContext {
 
 /// 在给定 IoU 阈值下对缓存上下文做贪心匹配 → TP/FP 序列 → 101 点插值 AP。
 fn class_ap_at(ctx: &ClassContext, thr: f64) -> f64 {
-    if ctx.n_gt == 0 {
-        return 0.0;
-    }
+    let (prec, rec) = class_pr_curve_at(ctx, thr);
+    ap_101(&rec, &prec)
+}
+
+/// 单类在给定 IoU 阈值下的累积 PR 序列（按 score 降序逐检出的累积
+/// precision/recall，未做包络平滑——Ultralytics `ap_per_class` 同语义）。
+fn class_pr_curve_at(ctx: &ClassContext, thr: f64) -> (Vec<f64>, Vec<f64>) {
     let mut gt_matched: Vec<Vec<bool>> =
         ctx.gt_boxes.iter().map(|g| vec![false; g.len()]).collect();
     let mut rec = Vec::with_capacity(ctx.dets_img.len());
@@ -220,7 +239,22 @@ fn class_ap_at(ctx: &ClassContext, thr: f64) -> f64 {
         rec.push(tp as f64 / ctx.n_gt as f64);
         prec.push(tp as f64 / (tp + fp) as f64);
     }
-    ap_101(&rec, &prec)
+    (prec, rec)
+}
+
+/// PR 序列上 F1 最大点的 (precision, recall)。Ultralytics 报告的
+/// `metrics/precision(B)` / `metrics/recall(B)` 即各自类别曲线该点的
+/// 类均值（此处 argmax 不做 smooth 预处理，同分取更早点，确定性一致）。
+fn pr_at_max_f1(prec: &[f64], rec: &[f64]) -> (f64, f64) {
+    let mut best = (0.0f64, 0.0f64, 0.0f64); // (f1, p, r)
+    for i in 0..prec.len() {
+        let (p, r) = (prec[i], rec[i]);
+        let f1 = if p + r > 0.0 { 2.0 * p * r / (p + r) } else { 0.0 };
+        if f1 > best.0 {
+            best = (f1, p, r);
+        }
+    }
+    (best.1, best.2)
 }
 
 /// 101 点插值 AP：对 r ∈ {0.00, 0.01, …, 1.00} 取 recall ≥ r 的最大 precision，
@@ -359,5 +393,37 @@ mod tests {
         let rep = ev.finalize();
         // tp=1, fp=1：rec=[1,1]，prec=[1,0.5] → 包络 [1,1] → 全部档 AP=1.0
         assert!((rep.map50 - 1.0).abs() < 1e-3, "mAP50={}", rep.map50);
+    }
+
+    /// P/R 取 max-F1 点（Ultralytics parity）：精确命中 + 一个低分 FP。
+    /// PR 曲线：prec=[1, 0.5]，rec=[1, 1]；F1=[1, 2/3] → max-F1 点 P=1, R=1。
+    #[test]
+    fn precision_recall_at_max_f1() {
+        let mut ev = CocoEvaluator::new();
+        ev.update(
+            1,
+            &[
+                det(0.0, 0.0, 10.0, 10.0, 0.9, 0),  // TP（精确）
+                det(50.0, 50.0, 60.0, 60.0, 0.8, 0), // FP
+            ],
+            &[GtBox::new(Aabb::new(0.0, 0.0, 10.0, 10.0), 0)],
+        );
+        let rep = ev.finalize();
+        assert!((rep.precision - 1.0).abs() < 1e-3, "P={}", rep.precision);
+        assert!((rep.recall - 1.0).abs() < 1e-3, "R={}", rep.recall);
+
+        // 2 个 gt 只命中 1 个：prec=[1]，rec=[0.5]，F1=2/3 → P=1, R=0.5
+        let mut ev = CocoEvaluator::new();
+        ev.update(
+            1,
+            &[det(0.0, 0.0, 10.0, 10.0, 0.9, 0)],
+            &[
+                GtBox::new(Aabb::new(0.0, 0.0, 10.0, 10.0), 0),
+                GtBox::new(Aabb::new(30.0, 30.0, 40.0, 40.0), 0),
+            ],
+        );
+        let rep = ev.finalize();
+        assert!((rep.precision - 1.0).abs() < 1e-3, "P={}", rep.precision);
+        assert!((rep.recall - 0.5).abs() < 1e-3, "R={}", rep.recall);
     }
 }

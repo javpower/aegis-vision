@@ -50,7 +50,10 @@ pub struct PosCell {
     pub gt: usize,
     /// 对齐指标 t = s_cls^α × IoU^β。
     pub metric: f32,
-    /// 归一化权重 = t / 该 gt 的最大 t（YOLOv8 norm_align_metric）。
+    /// 归一化权重 = (t × IoU) / 该 gt 候选内的 max(t × IoU)。
+    /// Ultralytics `norm_align_metric` 同构：对齐指标再乘候选自身预测 IoU——
+    /// 定位差的候选在 cls 软标签与 box/DFL 损失权重中被进一步降权。
+    /// 本数据集受控对照 ±0.3 中性，语义对齐保留。
     pub weight: f32,
 }
 
@@ -147,10 +150,16 @@ pub fn assign_single_image(
                 .then(a.1.cmp(&b.1))
         });
         cand.truncate(k);
-        let max_m = cand.first().map(|(m, _)| *m).unwrap_or(0.0);
+        // 归一化基准与权重：Ultralytics norm_align_metric——对齐指标再乘候选
+        // 自身 IoU 后按该 gt 候选内最大值归一
+        let max_w = cand
+            .iter()
+            .map(|&(m, c)| m * iou_xyxy(pred_boxes[c], *gt))
+            .fold(0.0f32, f32::max);
         for &(m, c) in &cand {
-            let w = if max_m > 1e-12 {
-                (m / max_m).clamp(0.0, 1.0)
+            let iou = iou_xyxy(pred_boxes[c], *gt);
+            let w = if max_w > 1e-12 {
+                (m * iou / max_w).clamp(0.0, 1.0)
             } else {
                 1.0
             };
@@ -261,10 +270,11 @@ mod tests {
         assert!(approx(b.weight, t2 / t1, 1e-5));
         let e = out[5].expect("c5 应入选");
         assert!(approx(e.metric, t5, 1e-10));
-        assert!(approx(e.weight, t5 / t1, 1e-6));
+        // norm_align_metric：权重 = (t × IoU) / max(t × IoU)，c5 的 IoU=0.25 二次计入
+        assert!(approx(e.weight, t5 * 0.25 / t1, 1e-6));
         let f = out[6].expect("c6 应入选");
         assert!(approx(f.metric, t6, 1e-10));
-        assert!(approx(f.weight, t6 / t1, 1e-6));
+        assert!(approx(f.weight, t6 * 0.25 / t1, 1e-6));
     }
 
     #[test]

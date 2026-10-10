@@ -2018,7 +2018,9 @@ pub fn eval(cfg: &RunConfig, weights: &Path) -> AvResult<serde_json::Value> {
                     Ok(serde_json::json!({
                         "task": "detect",
                         "mean_iou": evm.miou,
+                        "precision": evm.precision,
                         "recall@0.5": evm.r50,
+                        "recall": evm.recall,
                         "map50": evm.map50,
                         "map50_95": evm.map50_95,
                     }))
@@ -2935,6 +2937,7 @@ fn train_detect_yolo(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<
     let mut final_loss = 0f32;
     let mut miou = 0f32;
     let mut r50 = 0f32;
+    let mut precision = 0f32;
     // BN train/eval 装配（resnet18 骨干生效；冻结骨干时恒 eval）
     let bn_train = bn_train_mode(cfg);
     // AV_LOSS_TIMING=1 时按 1/20 采样打印 loss/step 耗时（性能归因诊断用）
@@ -3155,10 +3158,10 @@ fn train_detect_yolo(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<
             let evm = eval_detect_samples(m, &val, device, amp, cfg.eval.conf, cfg.eval.iou)?;
             ema.restore(&vs, &ema_saved);
             model.set_train(bn_train); // 恢复训练态
-            (miou, r50) = (evm.miou, evm.r50);
+            (miou, r50, precision) = (evm.miou, evm.r50, evm.precision);
             println!(
-                "[detect-yolo] run={run_id} epoch={epoch}/{} loss={final_loss:.4} mIoU={miou:.3} R@0.5={r50:.3} mAP50={:.3} mAP50:95={:.3}",
-                cfg.train.epochs, evm.map50, evm.map50_95
+                "[detect-yolo] run={run_id} epoch={epoch}/{} loss={final_loss:.4} mIoU={miou:.3} P={:.3} R={:.3} mAP50={:.3} mAP50:95={:.3}",
+                cfg.train.epochs, evm.precision, evm.recall, evm.map50, evm.map50_95
             );
             let fitness = 0.9 * evm.map50_95 + 0.1 * evm.map50;
             if fitness > best_fitness {
@@ -3166,13 +3169,14 @@ fn train_detect_yolo(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<
                 best_state = Some(ema.snapshot_cpu());
             }
         }
-        log_epoch_metrics(
+        log_epoch_metrics_with_extra(
             run_dir,
             epoch,
             final_loss,
             "mean_iou",
             miou,
             Some(("recall@0.5", r50)),
+            Some(("precision@0.5", precision)),
         );
     }
 
@@ -3191,11 +3195,14 @@ fn train_detect_yolo(cfg: &RunConfig, run_id: &str, run_dir: &Path) -> AvResult<
     })
 }
 
-/// 检测评测指标束：冒烟指标（best-IoU 均值 / R@0.5）+ COCO 风格 mAP。
+/// 检测评测指标束：冒烟指标（best-IoU 均值 / R@0.5）+ COCO 风格 mAP +
+/// Ultralytics parity 的 P/R（逐类 max-F1 点，实例级语义）。
 #[derive(Debug, Clone)]
 struct DetectEvalMetrics {
     miou: f32,
     r50: f32,
+    precision: f32,
+    recall: f32,
     map50: f32,
     map50_95: f32,
     // 诊断字段：当前调用方暂未消费，保留给后续日志/报告扩展
@@ -3279,6 +3286,8 @@ fn eval_detect_samples(
     Ok(DetectEvalMetrics {
         miou: best_ious.iter().sum::<f32>() / n as f32,
         r50: matched_cnt as f32 / n as f32,
+        precision: map.precision,
+        recall: map.recall,
         map50: map.map50,
         map50_95: map.map50_95,
         dets_per_img: total_dets as f32 / n as f32,
